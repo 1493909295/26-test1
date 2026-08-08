@@ -744,11 +744,11 @@ class CloudEdgeEnv(AECEnv):
         total_gpu = sum(host.gpu_capacity_num for host in dc.host_list)
         # 计算总负载情况
         running_cpu = sum(
-            host.running_queue.get_total_cpu_demand()
+            float(host.used_cpu)
             for host in dc.host_list
         )
         running_gpu = sum(
-            host.running_queue.get_total_gpu_demand()
+            float(host.used_gpu)
             for host in dc.host_list
         )
         # 计算资源剩余情况
@@ -784,8 +784,8 @@ class CloudEdgeEnv(AECEnv):
     #  逻辑与_encode_dc_features基本相同
     def _encode_host_features(self, host: Host) -> List[float]:
         host.calculate_load()
-        running_cpu = host.running_queue.get_total_cpu_demand()
-        running_gpu = host.running_queue.get_total_gpu_demand()
+        running_cpu = float(host.used_cpu)
+        running_gpu = float(host.used_gpu)
         available_cpu = max(host.cpu_num - running_cpu, 0.0)
         available_gpu = max(host.gpu_capacity_num - running_gpu, 0.0)
         waiting_jobs = len(host.waiting_queue)

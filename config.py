@@ -31,20 +31,21 @@ TARGET_ENTROPY_RATIO = 0.8
 MAX_GRAD_NORM = 5.0
 Policy_Updata_Interval = 1
 Target_Update_Interval = 1
-DEVICE = None
+DEVICE = "cuda:0"
 
 
 
 
 
 # 训练基本参数
-Episodes = 500         # 训练轮次
+Episodes = 1000         # 训练轮次
 ReplyBuffer_Capacity = 200000           # 经验池容量
 Batch_Size = 256            # 采样批量
 Seed = 42           # 宇宙的终极答案
 Random_warmup_step = 5000           # 前期随机预热启动
 Learning_Starts = 1000          # 至少积累多少个普通动作后再开始更新网络
-Updates_Per_Step = 1            # 每条经验最多执行多少次网络更新
+Train_Every = 4                 # 收集多少经验训一次网络
+Updates_Per_Train = 4            # 每条经验最多执行多少次网络更新
 Log_interval = 1            # 每多少episode打印一次统计信息
 Checkpoint_Interval = 100        # 每多少个episode保存一次带编号的checkpoint
 Checkpoint_Dir = "model/MASAC/checkpoints"

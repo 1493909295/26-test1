@@ -381,13 +381,58 @@ class DiscreteMASAC:
     # 根据配置选择 pytorch 设备
     @staticmethod
     def _resolve_device(configured_device: Optional[str],) -> torch.device:
-        if configured_device is not None:
-            return torch.device(
-                configured_device
+        # if configured_device is not None:
+        #     return torch.device(
+        #         configured_device
+        #     )
+        # if torch.cuda.is_available():
+        #     return torch.device("cuda")
+        # return torch.device("cpu")
+
+        # 没有显式指定设备时，默认选择第一张GPU。
+        device_name = (
+            "cuda:0"
+            if configured_device is None
+            else str(configured_device)
+        )
+
+        # 禁止设置为cpu，防止意外使用CPU训练。
+        if not device_name.startswith("cuda"):
+            raise ValueError(
+                f"当前项目要求只使用GPU训练，"
+                f"但配置的设备是：{device_name}"
             )
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        return torch.device("cpu")
+
+        # 检查当前PyTorch是否能够访问CUDA。
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA不可用，程序拒绝退回CPU训练。\n"
+                "请检查：\n"
+                "1. 是否安装了NVIDIA显卡驱动；\n"
+                "2. 当前环境是否安装了CUDA版PyTorch；\n"
+                "3. 运行程序时是否使用了正确的Conda环境。"
+            )
+
+        # 构造PyTorch设备对象。
+        device = torch.device(device_name)
+
+        # cuda没有显式编号时，默认使用第0张GPU。
+        gpu_index = (
+            0
+            if device.index is None
+            else int(device.index)
+        )
+
+        # 检查GPU编号是否存在。
+        gpu_count = torch.cuda.device_count()
+
+        if gpu_index >= gpu_count:
+            raise RuntimeError(
+                f"指定了GPU编号 {gpu_index}，"
+                f"但PyTorch只检测到 {gpu_count} 张GPU。"
+            )
+
+        return device
 
     # 把 ReplayBatch 中的 NumPy 数组转换成张量
     def _batch_to_tensors(self, batch: ReplayBatch,) -> TensorBatch:

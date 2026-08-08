@@ -26,6 +26,9 @@ class Host:
         self.cpu_load = 0.0
         self.gpu_load = 0.0
 
+        self.used_cpu: float = 0.0
+        self.used_gpu: float = 0.0
+
         self.waiting_queue = JobList()
         self.running_queue = JobList()
         self.completed_queue = JobList()
@@ -37,6 +40,8 @@ class Host:
         self.completed_queue.clear()
         self.cpu_load = 0.0
         self.gpu_load = 0.0
+        self.cpu_load = 0.0
+        self.used_gpu = 0.0
 
     # 更新host状态
     def update_hardware_capacity(self, cpu_num: int, gpu_capacity_num: int):
@@ -47,25 +52,26 @@ class Host:
     # 负载计算
     def calculate_load(self):
         if self.cpu_num > 0:
-            total_cpu_run = self.running_queue.get_total_cpu_demand()
-            self.cpu_load = min(total_cpu_run / self.cpu_num, 1.0)
+            # total_cpu_run = self.running_queue.get_total_cpu_demand()
+            self.cpu_load = min(max(self.used_cpu / self.cpu_num, 0.0), 1.0)
         else:
             self.cpu_load = 0.0
 
         if self.gpu_capacity_num > 0:
-            total_gpu_run = self.running_queue.get_total_gpu_demand()
-            self.gpu_load = min(total_gpu_run / self.gpu_capacity_num, 1.0)
+            # total_gpu_run = self.running_queue.get_total_gpu_demand()
+            self.cpu_load = min(max(self.used_gpu / self.gpu_capacity_num, 0.0), 1.0)
         else:
             self.gpu_load = 0.0
 
-        return self.cpu_load, self.gpu_load
+        return (self.cpu_load, self.gpu_load)
 
     # 任务卸载合法性检查
     def can_accommodate(self, job) -> bool:
-        current_cpu_used = self.running_queue.get_total_cpu_demand()
-        current_gpu_used = self.running_queue.get_total_gpu_demand()
-        if (current_cpu_used + job.cpu_request > self.cpu_num) or \
-                (current_gpu_used + job.gpu_request > self.gpu_capacity_num):
+        job_cpu = float(job.cpu_request)
+        job_gpu = float(job.gpu_request)
+        if (self.used_cpu + job_cpu > float(self.cpu_num)):
+            return False
+        if (self.used_gpu + job_gpu > float(self.gpu_capacity_num)):
             return False
         return True
 
@@ -84,6 +90,8 @@ class Host:
             return False
         job.mark_as_started(current_time)
         self.running_queue.push(job)
+        self.used_cpu += float(job.cpu_request)
+        self.used_gpu += float(job.gpu_request)
         self.calculate_load()  # 联动计算负载
         # print(f"成功，主机{self.host_id}接收了任务{job.job_id}")
         return True
@@ -91,8 +99,13 @@ class Host:
     # 根据任务id移出运行队列
     def remove_from_running_queue(self, job_id: str):
         removed_job = self.running_queue.remove_by_id(job_id)
-        if removed_job:
-            self.calculate_load()
+        if removed_job is None:
+            return  None
+        self.used_cpu -= float(removed_job.cpu_request)
+        self.used_gpu -= float(removed_job.gpu_request)
+        self.used_cpu = max(self.used_cpu, 0.0,)
+        self.used_gpu = max(self.used_gpu, 0.0,)
+        self.calculate_load()
         return removed_job
 
     # 加入完成队列
@@ -164,18 +177,18 @@ class DataCenter:
 
         for host in self.host_list:
             host.calculate_load()
-            total_cpu_capacity += host.cpu_num
-            total_gpu_capacity += host.gpu_capacity_num
-            total_cpu_used += host.running_queue.get_total_cpu_demand()
-            total_gpu_used += host.running_queue.get_total_gpu_demand()
+            total_cpu_capacity += float(host.cpu_num)
+            total_gpu_capacity += float(host.gpu_capacity_num)
+            total_cpu_used += float(host.used_cpu)
+            total_gpu_used += float(host.used_gpu)
 
-        if total_cpu_capacity > 0:
-            self.dc_cpu_load = total_cpu_used / total_cpu_capacity
+        if total_cpu_capacity > 0.0:
+            self.dc_cpu_load = min(max(total_cpu_used / total_cpu_capacity, 0.0), 1.0)
         else:
             self.dc_cpu_load = 0.0
 
-        if total_gpu_capacity > 0:
-            self.dc_gpu_load = total_gpu_used / total_gpu_capacity
+        if total_gpu_capacity > 0.0:
+            self.dc_gpu_load = min(max(total_gpu_used / total_gpu_capacity, 0.0), 1.0)
         else:
             self.dc_gpu_load = 0.0
 

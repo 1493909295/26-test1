@@ -6,6 +6,7 @@ import random
 import sys
 
 import time
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -28,8 +29,10 @@ class TrainConfig:
     batch_size: int = conf.Batch_Size
     random_warmup_steps: int = conf.Random_warmup_step
     learning_starts: int = conf.Learning_Starts
-    updates_per_step: int = conf.Updates_Per_Step
+    # updates_per_step: int = conf.Updates_Per_Step
     # max_decisions_per_episode: int = 100_000
+    train_every: int = conf.Train_Every
+    updates_per_train: int = conf.Updates_Per_Train
     log_interval: int = conf.Log_interval
     checkpoint_interval: int = conf.Checkpoint_Interval
     seed: int = conf.Seed
@@ -473,16 +476,21 @@ def train(
             # 记录episode开始的时间
             episode_wall_start = time.perf_counter()
             ###################################################################
+            decision: Optional[DecisionSnapshot] = None
 
             # 只要 PettingZoo 的活跃智能体列表不为空，就继续循环
             while env.agents:
 
                 # 如果智能体状态标记是死（应该不存在情况才对），把它从 AEC 环境中清理掉，然后跳过本轮训练逻辑
                 if collector.drain_one_dead_agent():
+                    decision = None
                     continue
 
-                # 获取当前动作前的智能体、任务、局部观测、全局状态和掩码的快照
-                decision = collector.capture_decision()
+                # 获取当前决策状态
+                if decision is None:
+                    decision = collector.capture_decision()
+
+
 
                 # 处理超时任务
                 if decision.forced_action is not None:
@@ -512,8 +520,9 @@ def train(
                 action_type = infer_action_type(env=env, agent_id=decision.agent_id, action=action)
 
                 # 执行动作、推进事件队列并构造一条经验放入经验池
-                transition = collector.execute_and_collect(decision=decision, action=action)
+                transition, next_decision = collector.execute_and_collect(decision=decision, action=action)
                 replay_buffer.add(transition)
+                decision = next_decision
 
                 # 记录这条经验的奖励和动作类型
                 stats.record_transition(
@@ -531,12 +540,15 @@ def train(
                 # 同时满足以下条件才允许更新网络：
                 # 1. 普通动作总数已经达到 learning_starts；
                 # 2. ReplayBuffer 中普通经验足够采样一个 batch。
-                ready_to_update = (global_normal_action_steps >= int(train_config.learning_starts) and
-                                   replay_buffer.can_sample(batch_size=int(train_config.batch_size),include_forced_actions=False))
+                ready_to_update = (
+                                    action_source != "forced" and
+                                    global_normal_action_steps >= int(train_config.learning_starts) and
+                                    global_normal_action_steps % int(train_config.train_every) == 0 and
+                                    replay_buffer.can_sample(batch_size=int(train_config.batch_size),include_forced_actions=False))
 
                 # 网络更新
                 if ready_to_update:
-                    for _ in range(int(train_config.updates_per_step)):
+                    for _ in range(int(train_config.updates_per_train)):
                         # 从 ReplayBuffer 采样并执行一次完整 SAC 更新
                         update_info = masac.update(replay_buffer=replay_buffer, batch_size=int(train_config.batch_size))
                         stats.record_update(update_info)
@@ -618,7 +630,9 @@ def main() -> None:
         batch_size=conf.Batch_Size,
         random_warmup_steps=conf.Random_warmup_step,
         learning_starts=conf.Learning_Starts,
-        updates_per_step=conf.Updates_Per_Step,
+        # updates_per_step=conf.Updates_Per_Step,
+        train_every=conf.Train_Every,
+        updates_per_train=conf.Updates_Per_Train,
         log_interval=conf.Log_interval,
         checkpoint_interval=conf.Checkpoint_Interval,
         seed=conf.Seed,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Protocol, Sequence
+from typing import Any, Dict, Mapping, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
@@ -137,34 +137,83 @@ class TransitionCollector:
         self.episode_transition_count = 0
 
     # 获取决策状态快照
-    def capture_decision(self) -> DecisionSnapshot:
-        self._require_reset()
+    # def capture_decision(self) -> DecisionSnapshot:
+    #     self._require_reset()
+    #     agent_id = self._get_live_selected_agent()
+    #     job_id = str(self.env.current_job_id)
+    #     observation = self.env.observe(agent_id)
+    #
+    #     # 把局部观测转成独立 float32 数组，避免对同一块内存的引用
+    #     local_obs = np.asarray(observation["observation"], dtype=np.float32).copy()
+    #
+    #     # 把动作掩码转成独立 int8 数组
+    #     action_mask = np.asarray(observation["action_mask"],dtype=np.int8).copy()
+    #
+    #     # 获取同一决策时刻的集中式全局状态
+    #     global_state = np.asarray(self.env.state(), dtype=np.float32).copy()
+    #
+    #     return DecisionSnapshot(
+    #         agent_id=agent_id,
+    #         agent_index=int(self.env.agent_name_mapping[agent_id]),
+    #         job_id=job_id,
+    #         env_time=float(self.env.current_time),
+    #         local_obs=local_obs,
+    #         action_mask=action_mask,
+    #         global_state=global_state,
+    #         forced_action=self._get_forced_action(job_id),
+    #     )
+    # 执行一次动作并生成完整的经验
+
+    # 获取当前环境所对应的决策状态快照
+    def _build_current_decision_snapshot(self) -> DecisionSnapshot:
+        """
+            根据“环境当前时刻”的状态构造一个 DecisionSnapshot。
+
+            这个函数既可以：
+            1. 在 episode 第一个决策点使用；
+            2. 也可以在执行 action 后，直接构造下一决策点 next_decision。
+
+            这样 state_(t+1) 只需要计算一次：
+                transition_t.next_state
+            和
+                decision_(t+1).state
+            可以直接复用同一时刻得到的数据，
+            不需要下一轮训练循环再次调用 env.state() / env.observe()。
+            """
+
         agent_id = self._get_live_selected_agent()
         job_id = str(self.env.current_job_id)
         observation = self.env.observe(agent_id)
 
-        # 把局部观测转成独立 float32 数组，避免对同一块内存的引用
         local_obs = np.asarray(observation["observation"], dtype=np.float32).copy()
+        action_mask = np.asarray(observation["action_mask"], dtype=np.int8,).copy()
+        global_state = np.asarray(self.env.state(), dtype=np.float32,).copy()
 
-        # 把动作掩码转成独立 int8 数组
-        action_mask = np.asarray(observation["action_mask"],dtype=np.int8).copy()
-
-        # 获取同一决策时刻的集中式全局状态
-        global_state = np.asarray(self.env.state(), dtype=np.float32).copy()
-
+        # 把当前环境状态完整封装成决策快照
         return DecisionSnapshot(
             agent_id=agent_id,
-            agent_index=int(self.env.agent_name_mapping[agent_id]),
+            # 将字符串形式的数据中心 ID 转换成网络使用的整数 ID。
+            agent_index=int(
+                self.env.agent_name_mapping[agent_id]
+            ),
             job_id=job_id,
+            # 当前仿真时间。
             env_time=float(self.env.current_time),
             local_obs=local_obs,
             action_mask=action_mask,
             global_state=global_state,
+            # 如果当前任务由于超时等原因必须执行指定动作，
+            # 则这里记录 forced_action；
+            # 普通任务返回 None，由 Actor 决策。
             forced_action=self._get_forced_action(job_id),
         )
 
-    # 执行一次动作并生成完整的经验
-    def execute_and_collect(self, decision: DecisionSnapshot, action: int,) -> Transition:
+    def capture_decision(self) -> DecisionSnapshot:
+        self._require_reset()
+        return self._build_current_decision_snapshot()
+    # 这里相当于把原来的 capture_decision() 拆成 _build_current_decision_snapshot()->capture_decision(),这样后面 execute_and_collect() 也可以调用同一个函数
+
+    def execute_and_collect(self, decision: DecisionSnapshot, action: int,) -> Tuple[Transition, Optional[DecisionSnapshot]]:
 
         # 例行检查
         self._require_reset()
@@ -184,19 +233,23 @@ class TransitionCollector:
 
         episode_done = self._is_episode_done()
         if episode_done:
+            next_decision: Optional[DecisionSnapshot] = None
             next_agent_id: Optional[str] = None
             next_agent_index = -1
             next_job_id: Optional[str] = None
             next_local_obs = np.zeros(int(self.env.local_obs_dim), dtype=np.float32)
             next_action_mask = np.zeros(int(self.env.action_dim), dtype=np.int8)
+            next_global_state = np.asarray(self.env.state(), dtype=np.float32).copy()
 
         else:
-            next_agent_id = self._get_live_selected_agent()
-            next_job_id = str(self.env.current_job_id)
-            next_agent_index = int(self.env.agent_name_mapping[next_agent_id])
+            next_decision = self._build_current_decision_snapshot()
+            next_agent_id = next_decision.agent_id
+            next_job_id = next_decision.job_id
+            next_agent_index = next_decision.agent_index
             next_observation = self.env.observe(next_agent_id)
-            next_local_obs = np.asarray(next_observation["observation"], np.float32).copy()
-            next_action_mask = np.asarray(next_observation["action_mask"], np.int8).copy()
+            next_local_obs = next_decision.local_obs.copy()
+            next_action_mask = next_decision.action_mask.copy()
+            next_global_state = next_decision.global_state.copy()
 
         transition = Transition(
             agent_id=decision.agent_id,
@@ -221,7 +274,7 @@ class TransitionCollector:
         )
         self.total_transition_count += 1
         self.episode_transition_count += 1
-        return transition
+        return transition, next_decision
 
     # 按 PettingZoo AEC 约定清理一个已经终止的智能体
     def drain_one_dead_agent(self) -> bool:
