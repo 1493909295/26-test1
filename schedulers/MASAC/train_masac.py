@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
 import torch
+from datetime import datetime
 # 找根目录
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # 找环境代码
@@ -302,6 +303,20 @@ def load_checkpoint_if_needed(
         global_normal_action_steps,
         best_episode_return,
     )
+# 写训练日志用的
+def build_run_log_path(base_log_path: str) -> Path:
+    base_path = Path(base_log_path)
+    run_start_time = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
+    log_file_name = (
+        f"{base_path.stem}_"
+        f"{run_start_time}"
+        f"{base_path.suffix}"
+    )
+    return base_path.parent / log_file_name
+
+
 
 # 把一个 episode 的统计信息追加到 CSV 文件
 def append_csv_log(csv_path: Path, row: Dict[str, Any],) -> None:
@@ -489,10 +504,11 @@ def train(
 
     # 把保存路径转换成 Path
     checkpoint_dir = Path(train_config.checkpoint_dir)
-    log_csv_path = Path(train_config.log_csv_path)
+    log_csv_path = build_run_log_path(train_config.log_csv_path)
 
     # 创建 checkpoint 目录
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    log_csv_path.parent.mkdir(parents=True, exist_ok=True,)
 
     try:
         # 从 start_episode 训练到 num_episodes，包含最后一个 episode。
