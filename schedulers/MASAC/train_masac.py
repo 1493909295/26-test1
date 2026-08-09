@@ -583,6 +583,21 @@ def train(
                 global_decision_steps += 1
                 if action_source != "forced":
                     global_normal_action_steps += 1
+                    if (
+                            global_normal_action_steps
+                            == int(train_config.random_warmup_steps)
+                    ):
+                        print(
+                            "\n"
+                            "============================================================\n"
+                            "✅ 随机动作预热结束\n"
+                            f"普通动作步数: {global_normal_action_steps}\n"
+                            f"当前 Episode: {episode}\n"
+                            f"ReplayBuffer 大小: {len(replay_buffer)}\n"
+                            f"MASAC 更新次数: {masac.update_step}\n"
+                            "从下一条普通动作开始使用 Actor 策略进行动作采样。\n"
+                            "============================================================\n"
+                        )
 
                 # 同时满足以下条件才允许更新网络：
                 # 1. 普通动作总数已经达到 learning_starts；
