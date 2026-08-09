@@ -232,6 +232,7 @@ class CloudEdgeEnv(AECEnv):
             )
             for agent_id in self.possible_agents
         }
+
         # critic 的全局状态空间
         self.global_state_dim = (
                 self.job_feat_dim
@@ -246,6 +247,12 @@ class CloudEdgeEnv(AECEnv):
             dtype=np.float32,
         )
         self.global_state_space = self.state_space
+
+        # 缓存当前状态，性能优化用的
+        self._cached_global_state = np.zeros(
+            self.global_state_dim,
+            dtype=np.float32,
+        )
 
         # 第一套动作掩码，修复 host 维度使用最大host数可能造成的问题
         self.action_mask_spaces = {
@@ -324,10 +331,12 @@ class CloudEdgeEnv(AECEnv):
         return self.action_spaces[agent]
 
     # MASAC centralized critic 使用的全局状态接口
-    def state(self):
-        if hasattr(self, "_get_global_state"):
-            return self._get_global_state()
-        return np.zeros(self.global_state_dim, dtype=np.float32)
+    # def state(self):
+    #     if hasattr(self, "_get_global_state"):
+    #         return self._get_global_state()
+    #     return np.zeros(self.global_state_dim, dtype=np.float32)
+    def state(self) -> np.ndarray:
+        return self._cached_global_state.copy()
 
     # 每轮新训练重启环境
     def reset(self,seed: Optional[int] = None, options: Optional[dict] = None):
@@ -441,13 +450,15 @@ class CloudEdgeEnv(AECEnv):
                 self.terminations[agent_id] = True
             self.agent_selection = self.possible_agents[0]
 
-        global_state = self._get_global_state()
+        # global_state = self._get_global_state()
+        global_state = np.asarray(self._get_global_state(), dtype=np.float32)
+        self._cached_global_state = global_state.copy()
 
         self.infos = {
             agent_id: {
                 "agent_index": self.agent_name_mapping[agent_id],
                 "dc_id": agent_id,
-                "global_state": global_state,
+                "global_state": self._cached_global_state,
                 "action_mask": self._get_action_mask(agent_id),
             }
             for agent_id in self.possible_agents
@@ -673,7 +684,10 @@ class CloudEdgeEnv(AECEnv):
                 self._terminate_episode()
 
         # 更新 infos
-        global_state = self._get_global_state()
+        # global_state = self._get_global_state()
+        global_state = np.asarray(self._get_global_state(), dtype=np.float32)
+        self._cached_global_state = global_state.copy()
+
         for agent_id in self.possible_agents:
             # episode 结束后不应再提供普通合法动作，终止智能体 mask 全置零。
             if (
@@ -690,7 +704,7 @@ class CloudEdgeEnv(AECEnv):
             self.infos[agent_id] = {
                 "agent_index": self.agent_name_mapping[agent_id],
                 "dc_id": agent_id,
-                "global_state": global_state,
+                "global_state": self._cached_global_state,
                 "action_mask": updated_action_mask,
             }
 

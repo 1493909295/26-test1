@@ -241,12 +241,19 @@ class DiscreteMASAC:
         # Critic 更新完成后，更新步数加 1
         self.update_step += 1
 
+        nan_value = torch.full(
+            (),
+            float("nan"),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
         # 先给 Actor 和 alpha 统计值设置默认值
         # 当本次未到更新间隔时，这些值会保持 NaN
-        actor_loss_value = float("nan")
-        alpha_loss_value = float("nan")
-        entropy_value = float("nan")
-        target_entropy_value = float("nan")
+        actor_loss_value = nan_value
+        alpha_loss_value = nan_value
+        entropy_value = nan_value
+        target_entropy_value = nan_value
 
         # 到达策略更新间隔时，更新 Actor 和 alpha
         if (self.update_step % int(self.config.policy_update_interval) == 0):
@@ -280,7 +287,7 @@ class DiscreteMASAC:
             "mean_target_q": critic_info["mean_target_q"],
             "actor_loss": actor_loss_value,
             "alpha_loss": alpha_loss_value,
-            "alpha": float(self.alpha.detach().item()),
+            "alpha": self.alpha.detach(),
             "policy_entropy": entropy_value,
             "target_entropy": target_entropy_value,
         }
@@ -625,13 +632,21 @@ class DiscreteMASAC:
         # 根据梯度更新在线双 Critic 参数。
         self.critic_optimizer.step()
 
+        # return {
+        #     "critic_loss": float(critic_loss.detach().item()),
+        #     "q1_loss": float(q1_loss.detach().item()),
+        #     "q2_loss": float(q2_loss.detach().item()),
+        #     "mean_q1": float(current_q1.detach().mean().item()),
+        #     "mean_q2": float(current_q2.detach().mean().item()),
+        #     "mean_target_q": float(target_q.detach().mean().item()),
+        # }
         return {
-            "critic_loss": float(critic_loss.detach().item()),
-            "q1_loss": float(q1_loss.detach().item()),
-            "q2_loss": float(q2_loss.detach().item()),
-            "mean_q1": float(current_q1.detach().mean().item()),
-            "mean_q2": float(current_q2.detach().mean().item()),
-            "mean_target_q": float(target_q.detach().mean().item()),
+            "critic_loss": critic_loss.detach(),
+            "q1_loss": q1_loss.detach(),
+            "q2_loss": q2_loss.detach(),
+            "mean_q1": (current_q1.detach().mean()),
+            "mean_q2": (current_q2.detach().mean()),
+            "mean_target_q": (target_q.detach().mean()),
         }
 
     # 更新actor
@@ -690,11 +705,15 @@ class DiscreteMASAC:
         # 计算当前策略熵：-sum_a pi log pi。
         policy_entropy = -(action_probs * action_log_probs).sum(dim=-1)
 
+        # return {
+        #     "actor_loss": float(actor_loss.detach().item()),
+        #     "policy_entropy": float(
+        #         policy_entropy.detach().mean().item()
+        #     ),
+        # }
         return {
-            "actor_loss": float(actor_loss.detach().item()),
-            "policy_entropy": float(
-                policy_entropy.detach().mean().item()
-            ),
+            "actor_loss": (actor_loss.detach()),
+            "policy_entropy": (policy_entropy.detach().mean()),
         }
 
     # 更新温度系数alpha
@@ -753,9 +772,13 @@ class DiscreteMASAC:
             )
 
         # 返回日志值。
+        # return {
+        #     "alpha_loss": float(alpha_loss.detach().item()),
+        #     "target_entropy": float(
+        #         target_entropy.detach().mean().item()
+        #     ),
+        # }
         return {
-            "alpha_loss": float(alpha_loss.detach().item()),
-            "target_entropy": float(
-                target_entropy.detach().mean().item()
-            ),
+            "alpha_loss": (alpha_loss.detach()),
+            "target_entropy": (target_entropy.detach().mean()),
         }

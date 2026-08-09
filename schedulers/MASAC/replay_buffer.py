@@ -193,6 +193,18 @@ class ReplayBuffer:
             (capacity,),
             dtype=np.bool_,
         )
+        # 这三条用于性能优化
+        self._trainable_indices = np.full(
+            (capacity,),
+            -1,
+            dtype=np.int64,
+        )
+        self._trainable_positions = np.full(
+            (capacity,),
+            -1,
+            dtype=np.int64,
+        )
+        self._num_trainable = 0
 
         self.env_times = np.zeros(
             (capacity,),
@@ -218,20 +230,40 @@ class ReplayBuffer:
     def position(self) -> int:
         return self._position
 
+    # 维护索引关系
+    def _add_trainable_index(self, buffer_index: int,) -> None:
+        buffer_index = int(buffer_index)
+        trainable_position = self._num_trainable
+        self._trainable_indices[trainable_position] = buffer_index
+        self._trainable_positions[buffer_index] = trainable_position
+        self._num_trainable += 1
+
+    def _remove_trainable_index(self,buffer_index: int,) -> None:
+        buffer_index = int(buffer_index)
+        remove_position = int(self._trainable_positions[buffer_index])
+        if remove_position == -1:
+            return
+        last_position = self._num_trainable - 1
+        last_buffer_index = int(self._trainable_indices[last_position])
+        self._trainable_indices[remove_position] = last_buffer_index
+        self._trainable_positions[last_buffer_index] = remove_position
+        self._trainable_indices[last_position] = -1
+        self._trainable_positions[buffer_index] = -1
+        self._num_trainable -= 1
+
+
     # 返回当前保存的环境强制动作经验数量
     @property
     def num_forced_actions(self) -> int:
         return int(
-            np.count_nonzero(
-                self.is_forced_action[: self._size]
-            )
+            self._size - self._num_trainable
         )
 
     # 返回当前保存的普通 Actor 动作经验数量
     @property
     def num_trainable_actions(self) -> int:
         return int(
-            self._size - self.num_forced_actions
+            self._num_trainable
         )
 
     # 保存一条 Transition
@@ -256,6 +288,11 @@ class ReplayBuffer:
         done = bool(transition.done)
         next_agent_index = int(transition.next_agent_index)
         index = self._position
+
+        if self._size == self.capacity:
+            self._remove_trainable_index(
+                index
+            )
 
         # 将经过检查的数据写入对应数组
         self.agent_indices[index] = agent_index
@@ -287,6 +324,9 @@ class ReplayBuffer:
             else str(transition.next_job_id)
         )
 
+        if not is_forced_action:
+            self._add_trainable_index(index)
+
         # 写入后向后移一位
         self._position = (
             self._position + 1
@@ -305,40 +345,64 @@ class ReplayBuffer:
         batch_size = int(batch_size)
         if batch_size <= 0:
             return False
+        if include_forced_actions:
+            available_count = self._size
+        else:
+            available_count = (
+                self._num_trainable
+            )
         return self.num_trainable_actions >= batch_size
 
     # 随机采样一个ReplayBatch
-    def sample(
-            self,
-            batch_size: int,
-            include_forced_actions: bool = False,
-            replace: bool = False,
-    ) -> ReplayBatch:
+    def sample(self,batch_size: int,include_forced_actions: bool = False,replace: bool = False,) -> ReplayBatch:
+
+        # # 生成全部有效槽位下标
+        # candidate_indices = np.arange(self._size,dtype=np.int64,)
+        #
+        # # 默认排除强制动作经验
+        # if not include_forced_actions:
+        #     forced_flags = self.is_forced_action[
+        #         candidate_indices
+        #     ]
+        #     candidate_indices = candidate_indices[
+        #         ~forced_flags
+        #     ]
+        #
+        # # 当前满足条件的经验数量
+        # available_count = int(candidate_indices.shape[0])
+        #
+        # # 随机选择经验槽位
+        # sampled_indices = self.rng.choice(
+        #     candidate_indices,
+        #     size=batch_size,
+        #     replace=bool(replace),
+        # )
 
         batch_size = int(batch_size)
-
-        # 生成全部有效槽位下标
-        candidate_indices = np.arange(self._size,dtype=np.int64,)
-
-        # 默认排除强制动作经验
-        if not include_forced_actions:
-            forced_flags = self.is_forced_action[
-                candidate_indices
-            ]
-            candidate_indices = candidate_indices[
-                ~forced_flags
-            ]
-
-        # 当前满足条件的经验数量
-        available_count = int(candidate_indices.shape[0])
-
-        # 随机选择经验槽位
-        sampled_indices = self.rng.choice(
-            candidate_indices,
-            size=batch_size,
-            replace=bool(replace),
+        replace = bool(replace)
+        if include_forced_actions:
+            available_count = self._size
+            sampled_indices = self.rng.choice(
+                available_count,
+                size=batch_size,
+                replace=replace,
+            )
+        else:
+            available_count = (self._num_trainable)
+            sampled_positions = self.rng.choice(
+                available_count,
+                size=batch_size,
+                replace=replace,
+            )
+            sampled_indices = (
+                self._trainable_indices[
+                    sampled_positions
+                ]
+            )
+        sampled_indices = np.asarray(
+            sampled_indices,
+            dtype=np.int64,
         )
-
         # 统一转换成 int64 数组
         sampled_indices = np.asarray(
             sampled_indices,
@@ -387,6 +451,9 @@ class ReplayBuffer:
         self._position = 0
         self._size = 0
         self.total_added = 0
+        self._num_trainable = 0
+        self._trainable_indices.fill(-1)
+        self._trainable_positions.fill(-1)
         self.agent_indices.fill(-1)
         self.local_obs.fill(0.0)
         self.global_states.fill(0.0)

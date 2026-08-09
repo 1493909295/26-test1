@@ -187,7 +187,7 @@ class TransitionCollector:
 
         local_obs = np.asarray(observation["observation"], dtype=np.float32).copy()
         action_mask = np.asarray(observation["action_mask"], dtype=np.int8,).copy()
-        global_state = np.asarray(self.env.state(), dtype=np.float32,).copy()
+        global_state = np.asarray(self.env.state(), dtype=np.float32,)
 
         # 把当前环境状态完整封装成决策快照
         return DecisionSnapshot(
@@ -229,7 +229,7 @@ class TransitionCollector:
         truncated = bool(self.env.truncations.get(decision.agent_id, False))
 
         # 获取动作执行后的全局状态
-        next_global_state = np.asarray(self.env.state(), dtype=np.float32).copy()
+        # next_global_state = np.asarray(self.env.state(), dtype=np.float32).copy()
 
         episode_done = self._is_episode_done()
         if episode_done:
@@ -239,14 +239,14 @@ class TransitionCollector:
             next_job_id: Optional[str] = None
             next_local_obs = np.zeros(int(self.env.local_obs_dim), dtype=np.float32)
             next_action_mask = np.zeros(int(self.env.action_dim), dtype=np.int8)
-            next_global_state = np.asarray(self.env.state(), dtype=np.float32).copy()
+            next_global_state = np.asarray(self.env.state(), dtype=np.float32)
 
         else:
             next_decision = self._build_current_decision_snapshot()
             next_agent_id = next_decision.agent_id
             next_job_id = next_decision.job_id
             next_agent_index = next_decision.agent_index
-            next_observation = self.env.observe(next_agent_id)
+            # next_observation = self.env.observe(next_agent_id)
             next_local_obs = next_decision.local_obs.copy()
             next_action_mask = next_decision.action_mask.copy()
             next_global_state = next_decision.global_state.copy()

@@ -9,7 +9,7 @@ import time
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
 import torch
 # 找根目录
@@ -113,6 +113,53 @@ class EpisodeStatistics:
         return float(
             self.update_metric_sums[metric_name] / count
         )
+
+UPDATE_TENSOR_METRIC_NAMES = (
+        "critic_loss",
+        "q1_loss",
+        "q2_loss",
+        "mean_q1",
+        "mean_q2",
+        "mean_target_q",
+        "actor_loss",
+        "alpha_loss",
+        "alpha",
+        "policy_entropy",
+        "target_entropy",
+    )
+
+# 批量记录连续若干次 MASAC.update() 的训练指标，避免每次 update 内部执行大量 cuda_tensor.item()
+def record_update_block(stats: EpisodeStatistics, update_infos: list[ Dict[str, Union[float, torch.Tensor]]],) -> None:
+    if not update_infos:
+        return
+
+    update_rows = []
+
+    for update_info in update_infos:
+        metric_row = torch.stack([update_info[metric_name]
+                for metric_name
+                in UPDATE_TENSOR_METRIC_NAMES
+            ],
+            dim=0,
+        )
+
+        update_rows.append(
+            metric_row
+        )
+        update_matrix = torch.stack(update_rows, dim=0,)
+        update_matrix_cpu = (update_matrix.detach().cpu().numpy())
+
+        for row in update_matrix_cpu:
+            cpu_update_info = {
+                metric_name: float(
+                    row[metric_index]
+                )
+                for metric_index, metric_name
+                in enumerate(
+                    UPDATE_TENSOR_METRIC_NAMES
+                )
+             }
+            stats.record_update(cpu_update_info)
 
 def set_global_random_seeds(seed: int) -> None:
     """统一设置 Python、NumPy 和 PyTorch 随机种子。"""
@@ -548,10 +595,13 @@ def train(
 
                 # 网络更新
                 if ready_to_update:
+                    update_info_block = []
                     for _ in range(int(train_config.updates_per_train)):
                         # 从 ReplayBuffer 采样并执行一次完整 SAC 更新
                         update_info = masac.update(replay_buffer=replay_buffer, batch_size=int(train_config.batch_size))
-                        stats.record_update(update_info)
+                        # stats.record_update(update_info)
+                        update_info_block.append(update_info)
+                    record_update_block(stats=stats,update_infos=update_info_block,)
 
             # 计算当前 episode 的真实运行秒数。
             wall_time_seconds = (time.perf_counter() - episode_wall_start)
