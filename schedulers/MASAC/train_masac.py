@@ -226,6 +226,17 @@ def count_completed_jobs(env: Any) -> int:
             completed_count += len(completed_queue)
     return int(completed_count)
 
+# 统计当前环境所有 Host 中剩余的 waiting job 数量
+def count_waiting_jobs(env: Any) -> int:
+    waiting_count = 0
+    for datacenter in getattr(env, "datacenters", [],):
+        for host in getattr(datacenter, "host_list", [],):
+            waiting_queue = getattr(host, "waiting_queue", None,)
+            if waiting_queue is None:
+                continue
+            waiting_count += len(waiting_queue)
+    return int(waiting_count)
+
 # 根据模型文件路径生成配套的训练器状态 JSON 路径
 def checkpoint_state_path(model_path: Path) -> Path:
     return model_path.with_suffix(".trainer.json")
@@ -369,10 +380,12 @@ def build_episode_log_row(
     )
 
     # 没有进入完成或丢弃终态的任务数量。
-    unresolved_jobs = int(
-        total_jobs - completed_jobs - dropped_jobs
-    )
-
+    unresolved_jobs = int(total_jobs - completed_jobs - dropped_jobs)
+    queued_jobs = int(getattr( env, "queued_jobs", 0,))
+    started_from_waiting_jobs = int(getattr( env, "started_from_waiting_jobs", 0,))
+    waiting_timeout_drops = int(getattr( env, "waiting_timeout_drops", 0,))
+    max_waiting_queue_length = int(getattr( env, "max_waiting_queue_length", 0,))
+    remaining_waiting_jobs = count_waiting_jobs(env)
     # 返回固定列顺序的字典。
     return {
         "episode": int(stats.episode),
@@ -392,6 +405,11 @@ def build_episode_log_row(
         "completed_jobs": completed_jobs,
         "dropped_jobs": dropped_jobs,
         "unresolved_jobs": unresolved_jobs,
+        "queued_jobs": queued_jobs,
+        "started_from_waiting_jobs": started_from_waiting_jobs,
+        "waiting_timeout_drops": waiting_timeout_drops,
+        "max_waiting_queue_length": max_waiting_queue_length,
+        "remaining_waiting_jobs": remaining_waiting_jobs,
         "simulation_end_time": float(getattr(env, "current_time", 0.0)),
         "episode_updates": int(stats.update_count),
         "global_decision_steps": int(global_decision_steps),
@@ -438,6 +456,11 @@ def print_episode_summary(row: Dict[str, Any]) -> None:
         f"decisions={int(row['decision_count']):6d} | "
         f"completed={int(row['completed_jobs']):5d} | "
         f"dropped={int(row['dropped_jobs']):5d} | "
+        f"queued={int(row['queued_jobs']):5d} | "
+        f"wait_started={int(row['started_from_waiting_jobs']):5d} | "
+        f"wait_timeout={int(row['waiting_timeout_drops']):5d} | "
+        f"max_wait={int(row['max_waiting_queue_length']):4d} | "
+        f"remain_wait={int(row['remaining_waiting_jobs']):4d} | "
         f"buffer={int(row['replay_trainable_size']):7d} | "
         f"updates={int(row['episode_updates']):5d} | "
         f"critic_loss={critic_loss_text} | "

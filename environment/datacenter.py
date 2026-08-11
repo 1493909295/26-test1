@@ -40,7 +40,7 @@ class Host:
         self.completed_queue.clear()
         self.cpu_load = 0.0
         self.gpu_load = 0.0
-        self.cpu_load = 0.0
+        self.used_cpu = 0.0
         self.used_gpu = 0.0
 
     # 更新host状态
@@ -59,7 +59,7 @@ class Host:
 
         if self.gpu_capacity_num > 0:
             # total_gpu_run = self.running_queue.get_total_gpu_demand()
-            self.cpu_load = min(max(self.used_gpu / self.gpu_capacity_num, 0.0), 1.0)
+            self.gpu_load = min(max(self.used_gpu / self.gpu_capacity_num, 0.0), 1.0)
         else:
             self.gpu_load = 0.0
 

@@ -196,6 +196,12 @@ class CloudEdgeEnv(AECEnv):
 
         self.dropped_jobs_info: List[Dict[str, Any]] = []
 
+        # 等待队列统计
+        self.queued_jobs: int = 0
+        self.started_from_waiting_jobs: int = 0
+        self.waiting_timeout_drops: int = 0
+        self.max_waiting_queue_length: int = 0
+
         # 先暂存每个智能体重做，然后再统一执行，我这里貌似不需要这样，我这里来一个任务，选个智能体做个决策，更新下奖励就行
         # self.pending_actions: Dict[str, Optional[int]] = {
         #     agent_id: None
@@ -394,6 +400,11 @@ class CloudEdgeEnv(AECEnv):
         # 记录运行中任务的位置，reset 时清空
         self.running_job_location = {}
         self.dropped_jobs_info = []
+
+        self.queued_jobs = 0
+        self.started_from_waiting_jobs = 0
+        self.waiting_timeout_drops = 0
+        self.max_waiting_queue_length = 0
 
         # 重置 PettingZoo AEC 必需状态
         self.rewards = {
@@ -624,12 +635,29 @@ class CloudEdgeEnv(AECEnv):
                     dc_id=acting_agent,
                     host_idx=int(host_idx),
                 )
-                success = execution_result != "dropped"
-                failure_reason = (
-                    "资源不足"
-                    if execution_result == "dropped"
-                    else None
-                )
+
+                success = False
+                failure_reason = None
+
+                if execution_result == "started":
+                    success = True
+                    failure_reason = None
+
+                elif execution_result == "queued":
+                    success = True
+                    failure_reason = None
+
+                elif execution_result == "dropped":
+                    # 真正丢弃时才视为本地调度失败。
+                    success = False
+                    failure_reason = "资源不足"
+
+                # success = execution_result != "dropped"
+                # failure_reason = (
+                #     "资源不足"
+                #     if execution_result == "dropped"
+                #     else None
+                # )
 
                 action_reward = self._compute_action_reward(
                     job_id=acting_job_id,
@@ -845,10 +873,25 @@ class CloudEdgeEnv(AECEnv):
 
         local_dc = self.dc_map[agent_id]
 
+        # 获取当前正在等待该智能体决策
+        current_job = None
+        if (
+                self.current_job_id is not None
+                and self.current_job_id in self.job_map
+                and self.current_agent_id == agent_id
+        ):
+            current_job = self.job_map[self.current_job_id]
+
         # 屏蔽由于 max_host_num 对齐产生的、不存在的本地 host
         for host_idx in range(self.max_host_num):
             if host_idx >= len(local_dc.host_list):
                 mask[host_idx] = 0
+                continue
+            host = local_dc.host_list[host_idx]
+            if current_job is not None:
+                if not host.can_ever_accommodate(current_job):
+                    mask[host_idx] = 0
+                    continue
 
         for edge_idx, target_dc_id in enumerate(self.edge_dc_ids):
             action_idx = self.edge_action_start + edge_idx
@@ -870,6 +913,14 @@ class CloudEdgeEnv(AECEnv):
             mask[cloud_action_idx] = 0
         elif self.graph is not None and not self.graph.has_edge(agent_id, self.cloud_id):
             mask[cloud_action_idx] = 0
+        elif current_job is not None:
+            cloud_dc = self.dc_map[self.cloud_id]
+            if len(cloud_dc.host_list) == 0:
+                mask[cloud_action_idx] = 0
+            else:
+                cloud_host = cloud_dc.host_list[0]
+                if not cloud_host.can_ever_accommodate(current_job):
+                    mask[cloud_action_idx] = 0
         return mask
 
     # 将一个 DataCenter 编码成长度为 self.dc_feat_dim 的特征向量
@@ -1326,6 +1377,11 @@ class CloudEdgeEnv(AECEnv):
         # 等待队列有人物，新来的也等待
         if not target_host.waiting_queue.is_empty():
             target_host.add_to_waiting_queue(job)
+            self.queued_jobs += 1
+            self.max_waiting_queue_length = max(
+                self.max_waiting_queue_length,
+                len(target_host.waiting_queue),
+            )
             return "queued"
 
         # 可接受
@@ -1338,10 +1394,20 @@ class CloudEdgeEnv(AECEnv):
             if started:
                 return "started"
             target_host.add_to_waiting_queue(job)
+            self.queued_jobs += 1
+            self.max_waiting_queue_length = max(
+                self.max_waiting_queue_length,
+                len(target_host.waiting_queue),
+            )
+
             return "queued"
 
         target_host.add_to_waiting_queue(job)
-
+        self.queued_jobs += 1
+        self.max_waiting_queue_length = max(
+            self.max_waiting_queue_length,
+            len(target_host.waiting_queue),
+        )
         return "queued"
         # started = self._start_job_on_host(
         #     job_id=job_id,
@@ -1384,6 +1450,7 @@ class CloudEdgeEnv(AECEnv):
                     job_id=str(dropped_job.job_id),
                     drop_reasion="等待超时",
                 )
+                self.waiting_timeout_drops += 1
                 continue
 
             if not target_host.can_accommodate(waiting_job):
@@ -1399,6 +1466,7 @@ class CloudEdgeEnv(AECEnv):
                 break
 
             removed_job = target_host.remove_from_waiting_queue()
+            self.started_from_waiting_jobs += 1
 
     # 处理任务完成事件
     def _process_job_finish_event(self, job_id: str) -> Job:
@@ -1479,11 +1547,6 @@ class CloudEdgeEnv(AECEnv):
     # 检查好一个 episode 是否结束
     def _check_episode_finished(self) -> bool:
 
-        if not self.has_reset:
-            raise RuntimeError(
-                "环境尚未 reset，不能判断 episode 是否结束。"
-            )
-
         # 当前还有任务等待边缘智能体决策
         if self.current_job_id is not None:
             return False
@@ -1495,6 +1558,13 @@ class CloudEdgeEnv(AECEnv):
         # 事件队列中仍有任务到达事件或任务完成事件
         if len(self.event_queue) > 0:
             return False
+
+        for dc in self.datacenters:
+            for host in dc.host_list:
+                if not host.running_queue.is_empty():
+                    return False
+                if not host.waiting_queue.is_empty():
+                    return False
 
         return True
 
