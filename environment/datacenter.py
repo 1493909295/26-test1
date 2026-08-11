@@ -65,13 +65,23 @@ class Host:
 
         return (self.cpu_load, self.gpu_load)
 
-    # 任务卸载合法性检查
+    # 检查总容量能不能满足资源要求
+    def can_ever_accommodate(self, job) -> bool:
+        job_cpu = float(job.cpu_request)
+        job_gpu = float(job.gpu_request)
+        if job_cpu > float(self.cpu_num):
+            return False
+        if job_gpu > float(self.gpu_capacity_num):
+            return False
+        return True
+
+    # 检查当前资源剩余量是否满足卸载要求
     def can_accommodate(self, job) -> bool:
         job_cpu = float(job.cpu_request)
         job_gpu = float(job.gpu_request)
-        if (self.used_cpu + job_cpu > float(self.cpu_num)):
+        if self.used_cpu + job_cpu > float(self.cpu_num):
             return False
-        if (self.used_gpu + job_gpu > float(self.gpu_capacity_num)):
+        if self.used_gpu + job_gpu > float(self.gpu_capacity_num):
             return False
         return True
 

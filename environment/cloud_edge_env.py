@@ -605,13 +605,32 @@ class CloudEdgeEnv(AECEnv):
 
             if action_type == "local_host":
                 host_idx = decoded_action["host_idx"]
-                success = self._execute_job_on_host(
+                # success = self._execute_job_on_host(
+                #     job_id=acting_job_id,
+                #     dc_id=acting_agent,
+                #     host_idx=int(host_idx),
+                # )
+                #
+                # failure_reason = None if success else "资源不足"
+                # action_reward = self._compute_action_reward(
+                #     job_id=acting_job_id,
+                #     action_type="local_host",
+                #     success=success,
+                #     transfer_latency=0.0,
+                #     failure_reason=failure_reason,
+                # )
+                execution_result = self._execute_job_on_host(
                     job_id=acting_job_id,
                     dc_id=acting_agent,
                     host_idx=int(host_idx),
                 )
+                success = execution_result != "dropped"
+                failure_reason = (
+                    "资源不足"
+                    if execution_result == "dropped"
+                    else None
+                )
 
-                failure_reason = None if success else "资源不足"
                 action_reward = self._compute_action_reward(
                     job_id=acting_job_id,
                     action_type="local_host",
@@ -1150,14 +1169,38 @@ class CloudEdgeEnv(AECEnv):
         )
         return arrival_event_time
 
-    # 调度动作执行给环境
-    def _execute_job_on_host(self, job_id: str, dc_id: str, host_idx: int,) -> bool:
+    # 真正启动一个任务到host上运行
+    def _start_job_on_host(self, job_id: str, dc_id: str, host_idx: int,) -> bool:
         job_id = str(job_id)
         dc_id = str(dc_id)
         host_idx = int(host_idx)
         job = self.job_map[job_id]
         target_dc = self.dc_map[dc_id]
         target_host = target_dc.host_list[host_idx]
+
+        started = target_host.add_to_running_queue(job=job, current_time=float(self.current_time),)
+
+        if not started:
+            return False
+
+        # 添加任务完成事件到队列
+        target_dc.calculate_dc_loads()
+        self.running_job_location[job_id] = {"dc_id": dc_id, "host_idx": host_idx,}
+        finish_time = (float(self.current_time) + float(job.duration))
+        heapq.heappush(self.event_queue,(finish_time, JOB_FINISH, job_id,))
+
+        return True
+
+    # 调度动作执行给环境
+    def _execute_job_on_host(self, job_id: str, dc_id: str, host_idx: int,) -> str:
+        job_id = str(job_id)
+        dc_id = str(dc_id)
+        host_idx = int(host_idx)
+
+        job = self.job_map[job_id]
+        target_dc = self.dc_map[dc_id]
+        target_host = target_dc.host_list[host_idx]
+
         drop_reasion_1 = "等待超时"
         drop_reasion_2 = "资源不足"
 
@@ -1165,31 +1208,91 @@ class CloudEdgeEnv(AECEnv):
         if self._should_drop_arrival_job(job_id):
             self._drop_arrival_job(job_id,drop_reasion_1)
             # self.running_job_location.pop(job_id, None)
-            return False
+            return "dropped"
 
         job.set_target_datacenter(dc_id)
-        started = target_host.add_to_running_queue(
-            job=job,
-            current_time=float(self.current_time),
-        )
+
+        # host总资源不够
+        if not target_host.can_ever_accommodate(job):
+            self._drop_arrival_job(job_id, drop_reasion_2,)
+            return "dropped"
+
+        # 等待队列有人物，新来的也等待
+        if not target_host.waiting_queue.is_empty():
+            target_host.add_to_waiting_queue(job)
+            return "queued"
+
+        # 可接受
+        if target_host.can_accommodate(job):
+            started = self._start_job_on_host(
+                job_id=job_id,
+                dc_id=dc_id,
+                host_idx=host_idx,
+            )
+            if started:
+                return "started"
+            target_host.add_to_waiting_queue(job)
+            return "queued"
+
+        target_host.add_to_waiting_queue(job)
+
+        return "queued"
+        # started = self._start_job_on_host(
+        #     job_id=job_id,
+        #     dc_id=dc_id,
+        #     host_idx=host_idx,
+        # )
         # 因资源不足被丢弃
-        if not started:
-            self._drop_arrival_job(job_id,drop_reasion_2)
-            # self.running_job_location.pop(job_id, None)
-            return  False
+        # if not started:
+        #     self._drop_arrival_job(job_id,drop_reasion_2)
+        #     # self.running_job_location.pop(job_id, None)
+        #     return  False
 
         # 成功卸载后更新dc负载
-        target_dc.calculate_dc_loads()
-        self.running_job_location[job_id] = {
-            "dc_id": dc_id,
-            "host_idx": host_idx,
-        }
+        # target_dc.calculate_dc_loads()
+        # self.running_job_location[job_id] = {
+        #     "dc_id": dc_id,
+        #     "host_idx": host_idx,
+        # }
+        #
+        # # 创建任务完成事件
+        # finish_time = (float(self.current_time)+ float(job.duration))
+        # heapq.heappush(self.event_queue,(finish_time,JOB_FINISH,job_id,))
+        # return True
 
-        # 创建任务完成事件
-        finish_time = (float(self.current_time)+ float(job.duration))
-        heapq.heappush(self.event_queue,(finish_time,JOB_FINISH,job_id,))
+    # Host 释放资源后，严格按照 FCFS 尝试启动 waiting_queue 中的任务
+    def _drain_host_waiting_queue(self, dc_id: str, host_idx: int,) -> None:
+        dc_id = str(dc_id)
+        host_idx = int(host_idx)
 
-        return True
+        target_dc = self.dc_map[dc_id]
+        target_host = target_dc.host_list[host_idx]
+
+        # 得用while，因为可能一次资源释放能满足多个等待队列中的任务同时上
+        while not target_host.waiting_queue.is_empty():
+            waiting_job = target_host.waiting_queue._queue[0]
+            waiting_job_id = str(waiting_job.job_id)
+            if self._should_drop_arrival_job(waiting_job_id):
+                dropped_job = target_host.remove_from_waiting_queue()
+                self._drop_arrival_job(
+                    job_id=str(dropped_job.job_id),
+                    drop_reasion="等待超时",
+                )
+                continue
+
+            if not target_host.can_accommodate(waiting_job):
+                break
+
+            started = self._start_job_on_host(
+                job_id=waiting_job_id,
+                dc_id=dc_id,
+                host_idx=host_idx,
+            )
+
+            if not started:
+                break
+
+            removed_job = target_host.remove_from_waiting_queue()
 
     # 处理任务完成事件
     def _process_job_finish_event(self, job_id: str) -> Job:
@@ -1214,6 +1317,11 @@ class CloudEdgeEnv(AECEnv):
         # 删除记录
         self.running_job_location.pop(job_id)
 
+        self._drain_host_waiting_queue(
+            dc_id=dc_id,
+            host_idx=host_idx,
+        )
+        
         return finished_job
 
     # 清除调度决策执行时的临时变量

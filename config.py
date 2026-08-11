@@ -11,8 +11,8 @@ NUM_DATACENTERS = 5          # 数据中心数量
 NUM_HOST = 50                # 全局生成的主机 (Host) 总数量
 NUM_JOBS = 1000              # 全局生成的任务 (Job) 总数量
 LAMBDA_RATE = 0.5           # LAMBDA_RATE 越大，任务到达越密集（时间间隔越短）
-CLOUD_LATENCY_RANGE = (50, 150) # 边缘节点到云数据中心的时延范围
-EDGE_LATENCY_RANGE = (5, 20)    # 边缘节点之间的时延范围
+CLOUD_LATENCY_RANGE = (5, 20) # 边缘节点到云数据中心的时延范围
+EDGE_LATENCY_RANGE = (0,5)    # 边缘节点之间的时延范围
 DROP_DEADLINE_RATE = 0.7
 ENV_KEEP_PATH = os.path.join(BASE_DIR, "./environment/env_keep")
 
