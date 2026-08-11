@@ -665,37 +665,143 @@ class CloudEdgeEnv(AECEnv):
         # 推进事件队列
         next_decision_found = False
         while self.event_queue:
-            event_time, event_type, event_job_id = heapq.heappop(self.event_queue)
-            event_time = float(event_time)
-            event_job_id = str(event_job_id)
-            self.current_time = event_time
+            current_event_time = float(self.event_queue[0][0])
+            self.current_time = current_event_time
+            pending_arrival_events = []
+            while (
+                    self.event_queue
+                    and float(self.event_queue[0][0])
+                    == current_event_time
+            ):
+                event_time, event_type, event_job_id = heapq.heappop(self.event_queue)
 
-            if event_type == JOB_FINISH:
-                self._process_job_finish_event(event_job_id)
-                continue
+                event_time = float(event_time)
+                event_job_id = str(event_job_id)
 
-            if event_type == JOB_ARRIVAL:
+                if event_type == JOB_FINISH:
+                    self._process_job_finish_event(
+                        event_job_id
+                    )
+                    continue
+
+                if event_type == JOB_ARRIVAL:
+                    pending_arrival_events.append(
+                        (
+                            event_time,
+                            event_type,
+                            event_job_id,
+                        )
+                    )
+                    continue
+
+            arrival_index = 0
+
+            while arrival_index < len(pending_arrival_events):
+                while (
+                        self.event_queue
+                        and float(self.event_queue[0][0])
+                        == current_event_time
+                ):
+                    new_event_time, new_event_type, new_event_job_id = (
+                        heapq.heappop(self.event_queue)
+                    )
+
+                    new_event_time = float(new_event_time)
+                    new_event_job_id = str(new_event_job_id)
+
+                    if new_event_type == JOB_FINISH:
+                        self._process_job_finish_event(
+                            new_event_job_id
+                        )
+                        continue
+
+                    if new_event_type == JOB_ARRIVAL:
+                        pending_arrival_events.append(
+                            (
+                                new_event_time,
+                                new_event_type,
+                                new_event_job_id,
+                            )
+                        )
+                        continue
+
+                (
+                    event_time,
+                    event_type,
+                    event_job_id,
+                ) = pending_arrival_events[arrival_index]
+
+                arrival_index += 1
+
                 arrived_job = self.job_map[event_job_id]
-                arrived_dc_id = str(arrived_job.target_datacenter)
+                arrived_dc_id = str(
+                    arrived_job.target_datacenter
+                )
 
-                # 任务到来事件来自云
                 if arrived_dc_id == self.cloud_id:
-                    cloud_dc = self.dc_map[self.cloud_id]
                     self._execute_job_on_host(
                         job_id=event_job_id,
                         dc_id=self.cloud_id,
                         host_idx=0,
                     )
+
+                    # Cloud arrival 不需要暂停 AEC 环境，
+                    # 继续处理同一时间点剩余事件。
                     continue
 
-                # 任务到来事件来自边
                 if arrived_dc_id in self.possible_agents:
+                    # 该任务需要交给对应边缘智能体做一次调度决策。
                     self.current_job_id = event_job_id
                     self.current_dc_id = arrived_dc_id
                     self.current_agent_id = arrived_dc_id
                     self.agent_selection = arrived_dc_id
+
                     next_decision_found = True
+
+                    for remaining_event in (
+                            pending_arrival_events[arrival_index:]
+                    ):
+                        heapq.heappush(
+                            self.event_queue,
+                            remaining_event,
+                        )
+
                     break
+            if next_decision_found:
+                break
+
+            #
+            # event_time, event_type, event_job_id = heapq.heappop(self.event_queue)
+            # event_time = float(event_time)
+            # event_job_id = str(event_job_id)
+            # self.current_time = event_time
+
+            # if event_type == JOB_FINISH:
+            #     self._process_job_finish_event(event_job_id)
+            #     continue
+
+            # if event_type == JOB_ARRIVAL:
+            #     arrived_job = self.job_map[event_job_id]
+            #     arrived_dc_id = str(arrived_job.target_datacenter)
+            #
+            #     # 任务到来事件来自云
+            #     if arrived_dc_id == self.cloud_id:
+            #         cloud_dc = self.dc_map[self.cloud_id]
+            #         self._execute_job_on_host(
+            #             job_id=event_job_id,
+            #             dc_id=self.cloud_id,
+            #             host_idx=0,
+            #         )
+            #         continue
+            #
+            #     # 任务到来事件来自边
+            #     if arrived_dc_id in self.possible_agents:
+            #         self.current_job_id = event_job_id
+            #         self.current_dc_id = arrived_dc_id
+            #         self.current_agent_id = arrived_dc_id
+            #         self.agent_selection = arrived_dc_id
+            #         next_decision_found = True
+            #         break
 
         # episode 结束处理
         if not next_decision_found:
@@ -1321,7 +1427,7 @@ class CloudEdgeEnv(AECEnv):
             dc_id=dc_id,
             host_idx=host_idx,
         )
-        
+
         return finished_job
 
     # 清除调度决策执行时的临时变量
