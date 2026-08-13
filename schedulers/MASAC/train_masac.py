@@ -95,6 +95,14 @@ class EpisodeStatistics:
         elif action_type == "drop":
             self.drop_action_count += 1
 
+    # 记录由于 Job 后续完成/超时产生的延迟 reward
+    def record_reward_correction(self, agent_id: str, reward_delta: float,) -> None:
+        agent_id = str(agent_id)
+        reward_delta = float(reward_delta)
+        self.episode_return += (reward_delta)
+        self.per_agent_returns[agent_id] = (self.per_agent_returns.get(agent_id, 0.0,) + reward_delta)
+
+
     # 记录一次 MASAC.update() 返回的训练指标
     def record_update(self, update_info: Dict[str, float]) -> None:
         self.update_count += 1
@@ -147,20 +155,20 @@ def record_update_block(stats: EpisodeStatistics, update_infos: list[ Dict[str, 
         update_rows.append(
             metric_row
         )
-        update_matrix = torch.stack(update_rows, dim=0,)
-        update_matrix_cpu = (update_matrix.detach().cpu().numpy())
+    update_matrix = torch.stack(update_rows, dim=0,)
+    update_matrix_cpu = (update_matrix.detach().cpu().numpy())
 
-        for row in update_matrix_cpu:
-            cpu_update_info = {
-                metric_name: float(
-                    row[metric_index]
-                )
-                for metric_index, metric_name
-                in enumerate(
-                    UPDATE_TENSOR_METRIC_NAMES
-                )
-             }
-            stats.record_update(cpu_update_info)
+    for row in update_matrix_cpu:
+        cpu_update_info = {
+            metric_name: float(
+                row[metric_index]
+            )
+            for metric_index, metric_name
+            in enumerate(
+                UPDATE_TENSOR_METRIC_NAMES
+            )
+         }
+        stats.record_update(cpu_update_info)
 
 def set_global_random_seeds(seed: int) -> None:
     """统一设置 Python、NumPy 和 PyTorch 随机种子。"""
@@ -617,6 +625,30 @@ def train(
                     action_type=action_type,
                     action_source=action_source,
                 )
+                # 消费 env.step() 期间产生的延迟任务结果奖励
+                reward_corrections = (
+                    env.pop_reward_corrections()
+                )
+
+                for correction in reward_corrections:
+                    correction_job_id = str(correction["job_id"])
+                    reward_delta = float(correction["reward_delta"])
+
+                    # 把奖励修正到这个 Job 最新一次调度经验。
+                    correction_agent_id = (
+                        replay_buffer.apply_reward_correction(
+                            job_id=correction_job_id,
+                            reward_delta=reward_delta,
+                        )
+                    )
+
+                    # 如果对应 experience 仍然存在于 ReplayBuffer，
+                    # 同时修正当前 episode 日志中的 return。
+                    if correction_agent_id is not None:
+                        stats.record_reward_correction(
+                            agent_id=correction_agent_id,
+                            reward_delta=reward_delta,
+                        )
 
                 # 增加计数
                 global_decision_steps += 1

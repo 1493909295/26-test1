@@ -323,9 +323,17 @@ class CloudEdgeEnv(AECEnv):
         # 环境重置标记
         self.has_reset = False
 
-        self.timeout_drop_penalty = 3.0
-        self.resource_drop_penalty = 2.0
-
+        self.timeout_drop_penalty = float(conf.TIMEOUT_DROP_PENALTY)
+        self.resource_drop_penalty = float(conf.RESOURCE_DROP_PENALTY)
+        self.task_completion_reward = float(conf.TASK_COMPLETION_REWARD)
+        self.waiting_time_cost_weight = float(conf.WAITING_TIME_COST_WEIGHT)
+        self.execution_time_cost_weight = float(conf.EXECUTION_TIME_COST_WEIGHT)
+        self.edge_forward_base_penalty = float(conf.EDGE_FORWARD_BASE_PENALTY)
+        self.edge_latency_cost_weight = float(conf.EDGE_LATENCY_COST_WEIGHT)
+        self.cloud_latency_cost_weight = float(conf.CLOUD_LATENCY_COST_WEIGHT)
+        # 等待被处理的奖励修正事件列表
+        self.pending_reward_corrections: List[Dict[str, Any]] = []
+        
     # PettingZoo 标准接口，返回指定 agent 的观测空间。
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent):
@@ -405,6 +413,7 @@ class CloudEdgeEnv(AECEnv):
         self.started_from_waiting_jobs = 0
         self.waiting_timeout_drops = 0
         self.max_waiting_queue_length = 0
+        self.pending_reward_corrections = []
 
         # 重置 PettingZoo AEC 必需状态
         self.rewards = {
@@ -767,11 +776,37 @@ class CloudEdgeEnv(AECEnv):
                 )
 
                 if arrived_dc_id == self.cloud_id:
-                    self._execute_job_on_host(
-                        job_id=event_job_id,
-                        dc_id=self.cloud_id,
-                        host_idx=0,
+                    cloud_arrival_timeout = (
+                        self._should_drop_arrival_job(
+                            event_job_id
+                        )
                     )
+                    cloud_result = (
+                        self._execute_job_on_host(
+                            job_id=event_job_id,
+                            dc_id=self.cloud_id,
+                            host_idx=0,
+                        )
+                    )
+                    if cloud_result == "dropped":
+
+                        if cloud_arrival_timeout:
+                            reward_delta = -float(
+                                self.timeout_drop_penalty
+                            )
+                            reason = "cloud_arrival_timeout"
+
+                        else:
+                            reward_delta = -float(
+                                self.resource_drop_penalty
+                            )
+                            reason = "cloud_resource_failure"
+
+                        self._record_reward_correction(
+                            job_id=event_job_id,
+                            reward_delta=reward_delta,
+                            reason=reason,
+                        )
 
                     # Cloud arrival 不需要暂停 AEC 环境，
                     # 继续处理同一时间点剩余事件。
@@ -1181,14 +1216,41 @@ class CloudEdgeEnv(AECEnv):
         self.max_queue_len = max(float(len(self.base_jobs)), 1.0)
 
         # 统计拓扑图中最大的链路时延
-        latencies = []
+        # latencies = []
+        all_latencies = []
+        edge_latencies = []
+        cloud_latencies = []
 
         # 如果基础拓扑图存在，就遍历图中的所有边。
         if self.base_graph is not None:
-            for _, _, data in self.base_graph.edges(data=True):
-                latencies.append(float(data.get("weight", 0.0)))
-        self.max_latency = max(max(latencies) if latencies else 1.0, eps)
+            for src_dc_id, dst_dc_id, data in (self.base_graph.edges(data=True)):
+                latency = float(data.get("weight", 0.0))
+                all_latencies.append(latency)
+                # 任意一端为 cloud，就把该链路视作 Edge <-> Cloud 链路。
+                if (str(src_dc_id) == self.cloud_id or str(dst_dc_id) == self.cloud_id):
+                    cloud_latencies.append(latency)
+                else:
+                    # 两端都不是 Cloud，就属于 Edge <-> Edge 链路。
+                    edge_latencies.append(latency)
 
+        self.max_latency = max(
+            max(all_latencies)
+            if all_latencies
+            else 1.0,
+            eps,
+        )
+        self.max_edge_latency = max(
+            max(edge_latencies)
+            if edge_latencies
+            else 1.0,
+            eps,
+        )
+        self.max_cloud_latency = max(
+            max(cloud_latencies)
+            if cloud_latencies
+            else 1.0,
+            eps,
+        )
     # 安全除法，避免 scale 为 0
     def _safe_div(self, value: float, scale: float) -> float:
         return float(value) / max(float(scale), self.norm_eps)
@@ -1444,6 +1506,7 @@ class CloudEdgeEnv(AECEnv):
         while not target_host.waiting_queue.is_empty():
             waiting_job = target_host.waiting_queue._queue[0]
             waiting_job_id = str(waiting_job.job_id)
+
             if self._should_drop_arrival_job(waiting_job_id):
                 dropped_job = target_host.remove_from_waiting_queue()
                 self._drop_arrival_job(
@@ -1451,6 +1514,13 @@ class CloudEdgeEnv(AECEnv):
                     drop_reasion="等待超时",
                 )
                 self.waiting_timeout_drops += 1
+                self._record_reward_correction(
+                    job_id=str(dropped_job.job_id),
+                    reward_delta=-float(
+                        self.timeout_drop_penalty
+                    ),
+                    reason="waiting_timeout",
+                )
                 continue
 
             if not target_host.can_accommodate(waiting_job):
@@ -1485,6 +1555,29 @@ class CloudEdgeEnv(AECEnv):
             current_time=float(self.current_time),
         )
 
+        # Job 真正开始执行之前实际等待了多久。
+        actual_waiting_time = (finished_job.get_waiting_time())
+        if actual_waiting_time is None:
+            actual_waiting_time = 0.0
+        actual_waiting_time = max(float(actual_waiting_time), 0.0,)
+
+        allowed_waiting_time = max(self.drop_deadline_ratio * float(finished_job.duration),self.norm_eps,)
+
+        waiting_ratio = self._normalize(value=actual_waiting_time, scale=allowed_waiting_time,)
+
+        completion_reward = (
+                self.task_completion_reward
+                -
+                self.waiting_time_cost_weight
+                * waiting_ratio
+        )
+
+        self._record_reward_correction(
+            job_id=job_id,
+            reward_delta=completion_reward,
+            reason="completed",
+        )
+
         # 更新负载
         target_dc.calculate_dc_loads()
 
@@ -1497,6 +1590,23 @@ class CloudEdgeEnv(AECEnv):
         )
 
         return finished_job
+
+    # 暂存一个与特定 Job 绑定的延迟奖励修正
+    def _record_reward_correction(self, job_id: str, reward_delta: float, reason: str,) -> None:
+        self.pending_reward_corrections.append(
+            {
+                "job_id": str(job_id),
+                "reward_delta": float(reward_delta),
+                "reason": str(reason),
+            }
+        )
+
+    # 取走 env.step() 推进事件期间产生的全部延迟奖励
+    def pop_reward_corrections(self,) -> List[Dict[str, Any]]:
+        corrections = list(self.pending_reward_corrections)
+        self.pending_reward_corrections.clear()
+        return corrections
+
 
     # 清除调度决策执行时的临时变量
     def _clear_current_decision(self) -> None:
@@ -1513,6 +1623,7 @@ class CloudEdgeEnv(AECEnv):
             transfer_latency: float = 0.0,
             failure_reason: Optional[str] = None,
     ) -> float:
+
         job_id = str(job_id)
         action_type = str(action_type)
         job = self.job_map[job_id]
@@ -1526,23 +1637,37 @@ class CloudEdgeEnv(AECEnv):
             if failure_reason == "资源不足":
                 return -float(self.resource_drop_penalty)
 
+        # job执行成本
+        duration_cost = self._normalize(value=float(job.duration), scale=float(self.max_job_duration),)
+
         # 本地执行
         if action_type == "local_host":
-            duration_cost = self._normalize(
-                value=float(job.duration),
-                scale=float(self.max_job_duration),
-            )
-
-            return -float(duration_cost)
+            return -float(self.execution_time_cost_weight * duration_cost)
 
         # 卸载到其他 edge 或 cloud
-        if action_type in {"edge_dc", "cloud"}:
+        # if action_type in {"edge_dc", "cloud"}:
+        #     transfer_latency = float(transfer_latency)
+        #     latency_cost = self._normalize(
+        #         value=transfer_latency,
+        #         scale=float(self.max_latency),
+        #     )
+        #     return -float(latency_cost)
+
+        # 边边转发
+        if action_type == "edge_dc":
             transfer_latency = float(transfer_latency)
-            latency_cost = self._normalize(
-                value=transfer_latency,
-                scale=float(self.max_latency),
-            )
-            return -float(latency_cost)
+
+            edge_latency_cost = self._normalize(value=transfer_latency, scale=float(self.max_edge_latency),)
+
+            return -float(self.edge_forward_base_penalty + self.edge_latency_cost_weight * edge_latency_cost)
+
+        # 云边转发
+        if action_type == "cloud":
+            transfer_latency = float(transfer_latency)
+
+            cloud_latency_cost = self._normalize(value=transfer_latency, scale=float(self.max_cloud_latency),)
+
+            return -float(self.execution_time_cost_weight * duration_cost + self.cloud_latency_cost_weight * cloud_latency_cost)
 
     # 检查好一个 episode 是否结束
     def _check_episode_finished(self) -> bool:

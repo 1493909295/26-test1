@@ -221,6 +221,7 @@ class ReplayBuffer:
         self.job_ids: list[Optional[str]] = [None] * capacity
         self.next_agent_ids: list[Optional[str]] = [None] * capacity
         self.next_job_ids: list[Optional[str]] = [None] * capacity
+        self.latest_job_transition_index: Dict[str, int,] = {}
 
     def __len__(self) -> int:
         return self._size
@@ -289,10 +290,29 @@ class ReplayBuffer:
         next_agent_index = int(transition.next_agent_index)
         index = self._position
 
+        # 如果当前槽位即将覆盖旧经验，
+        # 先清理旧 Job 对该槽位的映射。
         if self._size == self.capacity:
             self._remove_trainable_index(
                 index
             )
+
+            old_job_id = self.job_ids[index]
+
+            if old_job_id is not None:
+                old_job_id = str(
+                    old_job_id
+                )
+            if (
+                    self.latest_job_transition_index.get(
+                        old_job_id
+                    )
+                    == index
+            ):
+                self.latest_job_transition_index.pop(
+                    old_job_id,
+                    None,
+                )
 
         # 将经过检查的数据写入对应数组
         self.agent_indices[index] = agent_index
@@ -313,6 +333,7 @@ class ReplayBuffer:
         self.next_env_times[index] = next_env_time
         self.agent_ids[index] = str(transition.agent_id)
         self.job_ids[index] = str(transition.job_id)
+        self.latest_job_transition_index[str(transition.job_id)] = index
         self.next_agent_ids[index] = (
             None
             if transition.next_agent_id is None
@@ -339,6 +360,30 @@ class ReplayBuffer:
         )
 
         self.total_added += 1
+
+    # 把一个延迟出现的任务结果奖励，修正到该 Job 最后一次调度 Transition 上。
+    def apply_reward_correction(self, job_id: str, reward_delta: float,) -> Optional[str]:
+        job_id = str(job_id)
+        reward_delta = float(reward_delta)
+
+        # O(1) 找到这个 Job 最新经验的位置。
+        buffer_index = (self.latest_job_transition_index.get(job_id))
+
+        # 经验可能已经被 ReplayBuffer 覆盖。
+        if buffer_index is None:
+            return None
+
+        buffer_index = int(buffer_index)
+
+        # 真正修正 SAC 将来采样到的 reward
+        self.rewards[buffer_index] = np.float32(float(self.rewards[buffer_index]) + reward_delta)
+
+        agent_id = self.agent_ids[buffer_index]
+
+        if agent_id is None:
+            return None
+
+        return str(agent_id)
 
     # 判断当前是否有足够经验采样一个 batch
     def can_sample(self, batch_size: int, include_forced_actions: bool = False,) -> bool:
@@ -474,6 +519,7 @@ class ReplayBuffer:
         self.job_ids = [None] * self.capacity
         self.next_agent_ids = [None] * self.capacity
         self.next_job_ids = [None] * self.capacity
+        self.latest_job_transition_index.clear()
 
 
 

@@ -12,7 +12,7 @@ NUM_HOST = 50                # 全局生成的主机 (Host) 总数量
 NUM_JOBS = 1000              # 全局生成的任务 (Job) 总数量
 LAMBDA_RATE = 0.5           # LAMBDA_RATE 越大，任务到达越密集（时间间隔越短）
 CLOUD_LATENCY_RANGE = (5, 20) # 边缘节点到云数据中心的时延范围
-EDGE_LATENCY_RANGE = (0,5)    # 边缘节点之间的时延范围
+EDGE_LATENCY_RANGE = (2,5)    # 边缘节点之间的时延范围
 DROP_DEADLINE_RATE = 0.7
 ENV_KEEP_PATH = os.path.join(BASE_DIR, "./environment/env_keep")
 
@@ -53,5 +53,17 @@ Log_csv_Path = "result/MASAC/train_log.csv"
 Old_Env_Path = None         #可选的旧环境文件路径,为 None 时，CloudEdgeEnv 会按自己的默认逻辑生成新环境
 Resume_Checkpoint = None         #可选的断点模型路径,为 None 表示从头训练。
 Vary_Episode_Seed: bool = True          # 是否在每个 episode 使用不同但可复现的 seed
+
+
+
+# 奖励参数（先这样写着吧，目前没什么好办法
+TASK_COMPLETION_REWARD = 2.5            # 一个任务真正完成获得
+WAITING_TIME_COST_WEIGHT = 0.5          # 等待惩罚
+EXECUTION_TIME_COST_WEIGHT = 1.0        # 任务长短的权重，越大越容易接受小任务
+EDGE_FORWARD_BASE_PENALTY = 0.25        # 转发固定成本
+EDGE_LATENCY_COST_WEIGHT = 1.0          # 边边时延惩罚
+CLOUD_LATENCY_COST_WEIGHT = 1.0         # 云边时延惩罚
+TIMEOUT_DROP_PENALTY = 2.5              # 超时惩罚
+RESOURCE_DROP_PENALTY = 2.0             # 资源不足惩罚，其实已经不会触发了，因为后面搞了掩码
 
 
