@@ -21,9 +21,9 @@ class MASACConfig:
     alpha_lr: float = 3e-4
     actor_hidden_dim: int = 256
     critic_hidden_dim: int = 256
-    initial_alpha: float = 0.2      # alpha 初始值必须大于 0
+    initial_alpha: float = 0.1      # alpha 初始值必须大于 0
     # 目标熵比例
-    target_entropy_ratio: float = 0.98      # 目标熵比例建议在 [0,1]
+    target_entropy_ratio: float = 0.2      # 目标熵比例建议在 [0,1]
     # 梯度裁剪上限，None表示不裁剪
     max_grad_norm: Optional[float] = 10.0       # 梯度裁剪上限如果存在，必须大于 0
     policy_update_interval: int = 1     # 更新间隔必须是正整数
