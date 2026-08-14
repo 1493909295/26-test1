@@ -330,6 +330,7 @@ class CloudEdgeEnv(AECEnv):
         self.execution_time_cost_weight = float(conf.EXECUTION_TIME_COST_WEIGHT)
         self.edge_forward_base_penalty = float(conf.EDGE_FORWARD_BASE_PENALTY)
         self.edge_latency_cost_weight = float(conf.EDGE_LATENCY_COST_WEIGHT)
+        self.edge_deadline_risk_cost_weight = float(conf.EDGE_DEADLINE_RISK_COST_WEIGHT)
         self.cloud_latency_cost_weight = float(conf.CLOUD_LATENCY_COST_WEIGHT)
         # 等待被处理的奖励修正事件列表
         self.pending_reward_corrections: List[Dict[str, Any]] = []
@@ -903,6 +904,13 @@ class CloudEdgeEnv(AECEnv):
 
     # 掩码掉因为要对齐host数量导致的部分host可能不合法行为
     def _get_action_mask(self, agent_id: str) -> np.ndarray:
+        ####        掩码机制主要屏蔽以下场景的动作选择       ####
+        ####    1.因为对齐host数量产生的不存在的本地host
+        ####    2.自己对应的边缘DC
+        ####    3.不存在的目标DC或者与目标DC不存在链路（这种情况不会发生）
+        ####    4.确定本次迁移会引起超时丢弃的动作
+        ####    5.host最大资源量不满足任务需求的动作
+
         #默认所有动作合法
         mask = np.ones(self.action_dim, dtype=np.int8)
 
@@ -940,6 +948,14 @@ class CloudEdgeEnv(AECEnv):
                 continue
             if self.graph is not None and not self.graph.has_edge(agent_id, target_dc_id):
                 mask[action_idx] = 0
+            # 检查本次调度是否会引起确定性的超时丢弃
+            if current_job is not None:
+                elapsed_waiting_time = max(float(self.current_time) - float(current_job.arrive_time),0.0,)
+                allowed_waiting_time = (self.drop_deadline_ratio * float(current_job.duration))
+                transfer_latency = float(self.graph[agent_id][target_dc_id].get("weight", 0.0,))
+                if (elapsed_waiting_time + transfer_latency > allowed_waiting_time):
+                    mask[action_idx] = 0
+                    continue
 
         # 最后一个动作是卸载到云
         cloud_action_idx = self.cloud_action_index
@@ -1656,10 +1672,21 @@ class CloudEdgeEnv(AECEnv):
         # 边边转发
         if action_type == "edge_dc":
             transfer_latency = float(transfer_latency)
-
             edge_latency_cost = self._normalize(value=transfer_latency, scale=float(self.max_edge_latency),)
-
-            return -float(self.edge_forward_base_penalty + self.edge_latency_cost_weight * edge_latency_cost)
+            # 允许等待的总时间
+            allowed_waiting_time = max(self.drop_deadline_ratio * float(job.duration), self.norm_eps,)
+            # 当前已经等了多久
+            elapsed_waiting_time = max(float(self.current_time) - float(job.arrive_time), 0.0,)
+            # 还剩多久
+            remaining_waiting_budget = max(allowed_waiting_time - elapsed_waiting_time, self.norm_eps,)
+            # 本次转发消耗的预算比例
+            edge_deadline_risk_cost = self._normalize(value=transfer_latency, scale=remaining_waiting_budget,)
+            return -float(
+                self.edge_forward_base_penalty
+                + self.edge_latency_cost_weight * edge_latency_cost
+                + self.edge_deadline_risk_cost_weight * edge_deadline_risk_cost
+            )
+            # return -float(self.edge_forward_base_penalty + self.edge_latency_cost_weight * edge_latency_cost)
 
         # 云边转发
         if action_type == "cloud":
