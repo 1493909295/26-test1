@@ -38,7 +38,7 @@ DEVICE = "cuda:0"
 
 
 # 训练基本参数
-Episodes = 1000         # 训练轮次
+Episodes = 2000         # 训练轮次
 ReplyBuffer_Capacity = 200000           # 经验池容量
 Batch_Size = 256            # 采样批量
 Seed = 42           # 宇宙的终极答案
@@ -60,6 +60,7 @@ Vary_Episode_Seed: bool = True          # 是否在每个 episode 使用不同�
 TASK_COMPLETION_REWARD = 2.5            # 一个任务真正完成获得
 WAITING_TIME_COST_WEIGHT = 0.5          # 等待惩罚
 EXECUTION_TIME_COST_WEIGHT = 1.0        # 任务长短的权重，越大越容易接受小任务
+QUEUE_ADMISSION_COST_WEIGHT = 0.25      # 排队风险参数，帮助模型认识到进入等待队列和立即执行是不同的
 EDGE_FORWARD_BASE_PENALTY = 0.25        # 转发固定成本
 EDGE_LATENCY_COST_WEIGHT = 1.0          # 边边时延惩罚
 CLOUD_LATENCY_COST_WEIGHT = 1.0         # 云边时延惩罚

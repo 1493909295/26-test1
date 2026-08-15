@@ -328,6 +328,7 @@ class CloudEdgeEnv(AECEnv):
         self.task_completion_reward = float(conf.TASK_COMPLETION_REWARD)
         self.waiting_time_cost_weight = float(conf.WAITING_TIME_COST_WEIGHT)
         self.execution_time_cost_weight = float(conf.EXECUTION_TIME_COST_WEIGHT)
+        self.queue_admission_cost_weight = float(conf.QUEUE_ADMISSION_COST_WEIGHT)
         self.edge_forward_base_penalty = float(conf.EDGE_FORWARD_BASE_PENALTY)
         self.edge_latency_cost_weight = float(conf.EDGE_LATENCY_COST_WEIGHT)
         self.edge_deadline_risk_cost_weight = float(conf.EDGE_DEADLINE_RISK_COST_WEIGHT)
@@ -648,6 +649,8 @@ class CloudEdgeEnv(AECEnv):
 
                 success = False
                 failure_reason = None
+                # 默认没有进入等待队列。
+                queue_length_after_action = 0
 
                 if execution_result == "started":
                     success = True
@@ -656,6 +659,9 @@ class CloudEdgeEnv(AECEnv):
                 elif execution_result == "queued":
                     success = True
                     failure_reason = None
+                    target_dc = self.dc_map[acting_agent]
+                    target_host = target_dc.host_list[int(host_idx)]
+                    queue_length_after_action = len(target_host.waiting_queue)
 
                 elif execution_result == "dropped":
                     # 真正丢弃时才视为本地调度失败。
@@ -675,6 +681,7 @@ class CloudEdgeEnv(AECEnv):
                     success=success,
                     transfer_latency=0.0,
                     failure_reason=failure_reason,
+                    queue_length_after_action=queue_length_after_action,
                 )
 
             elif action_type in {"edge_dc", "cloud"}:
@@ -910,10 +917,10 @@ class CloudEdgeEnv(AECEnv):
         ####    3.不存在的目标DC或者与目标DC不存在链路（这种情况不会发生）
         ####    4.确定本次迁移会引起超时丢弃的动作
         ####    5.host最大资源量不满足任务需求的动作
+        ### 掩码机制不应该再扩大了，过分的掩码只是在掩盖问题，没办法真正意义上改进模型学习能力
 
         #默认所有动作合法
         mask = np.ones(self.action_dim, dtype=np.int8)
-
         local_dc = self.dc_map[agent_id]
 
         # 获取当前正在等待该智能体决策
@@ -1418,6 +1425,20 @@ class CloudEdgeEnv(AECEnv):
         if not started:
             return False
 
+        actual_waiting_time = job.get_waiting_time()
+        if actual_waiting_time is None:
+            actual_waiting_time = 0.0
+        actual_waiting_time = max(float(actual_waiting_time), 0.0,)
+        allowed_waiting_time = max(self.drop_deadline_ratio * float(job.duration),self.norm_eps,)
+        waiting_ratio = self._normalize(value=actual_waiting_time, scale=allowed_waiting_time,)
+        if waiting_ratio > 0.0:
+            self._record_reward_correction(
+                job_id=job_id,
+                reward_delta=-float(self.waiting_time_cost_weight * waiting_ratio),
+                reason="job_start_waiting_cost",
+            )
+
+
         # 添加任务完成事件到队列
         target_dc.calculate_dc_loads()
         self.running_job_location[job_id] = {"dc_id": dc_id, "host_idx": host_idx,}
@@ -1581,12 +1602,7 @@ class CloudEdgeEnv(AECEnv):
 
         waiting_ratio = self._normalize(value=actual_waiting_time, scale=allowed_waiting_time,)
 
-        completion_reward = (
-                self.task_completion_reward
-                -
-                self.waiting_time_cost_weight
-                * waiting_ratio
-        )
+        completion_reward = (self.task_completion_reward)
 
         self._record_reward_correction(
             job_id=job_id,
@@ -1638,6 +1654,7 @@ class CloudEdgeEnv(AECEnv):
             success: bool,
             transfer_latency: float = 0.0,
             failure_reason: Optional[str] = None,
+            queue_length_after_action: int = 0,
     ) -> float:
 
         job_id = str(job_id)
@@ -1658,7 +1675,25 @@ class CloudEdgeEnv(AECEnv):
 
         # 本地执行
         if action_type == "local_host":
-            return -float(self.execution_time_cost_weight * duration_cost)
+            local_cost = (self.execution_time_cost_weight * duration_cost)
+
+            # 本地host执行，但是进入了等待队列
+            if int(queue_length_after_action) > 0:
+                queue_length = float(queue_length_after_action)
+                # 评估等待队列拥挤程度，用queue_length + 1是为了让结果处于[0,1)
+                queue_congestion_ratio = (queue_length / (queue_length + 1.0))
+                current_waiting_time = max(float(self.current_time) - float(job.arrive_time),0.0,)
+                allowed_waiting_time = max(self.drop_deadline_ratio * float(job.duration),self.norm_eps,)
+                deadline_consumed_ratio = self._normalize(value=current_waiting_time, scale=allowed_waiting_time,)
+                # 综合排队风险
+                queue_admission_risk = (
+                        0.5 * queue_congestion_ratio +
+                        0.5 * deadline_consumed_ratio
+                )
+                local_cost += (self.queue_admission_cost_weight * queue_admission_risk)
+
+
+            return -float(local_cost)
 
         # 卸载到其他 edge 或 cloud
         # if action_type in {"edge_dc", "cloud"}:
