@@ -68,5 +68,6 @@ CLOUD_LATENCY_COST_WEIGHT = 1.0         # 云边时延惩罚
 EDGE_DEADLINE_RISK_COST_WEIGHT = 1.0    # Edge 转发行为对任务剩余 deadline 的侵蚀
 TIMEOUT_DROP_PENALTY = 4.0              # 超时惩罚
 RESOURCE_DROP_PENALTY = 2.0             # 资源不足惩罚，其实已经不会触发了，因为后面搞了掩码
+COMPLETION_CREDIT_DECAY = 0.8           # 调度链奖励衰减参数
 
 

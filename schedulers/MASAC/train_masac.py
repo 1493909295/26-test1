@@ -42,6 +42,7 @@ class TrainConfig:
     old_env_path: Optional[str] = conf.Old_Env_Path
     resume_checkpoint: Optional[str] = conf.Resume_Checkpoint
     vary_episode_seed: bool = conf.Vary_Episode_Seed
+    completion_credit_decay: float = conf.COMPLETION_CREDIT_DECAY
 
 # 统计一个 episode 运行期间的统计信息
 @dataclass
@@ -554,7 +555,7 @@ def train(
 
             # 重启环境
             env.reset(seed=episode_seed)
-
+            replay_buffer.reset_episode_job_tracking()
             # 为每个智能体创建奖励累计字典
             per_agent_returns = {}
             for agent_id in env.possible_agents:
@@ -633,6 +634,51 @@ def train(
                 for correction in reward_corrections:
                     correction_job_id = str(correction["job_id"])
                     reward_delta = float(correction["reward_delta"])
+
+                    correction_reason = str(correction.get("reason", "",))
+
+                    if correction_reason == "completed":
+                        applied_credits = (
+                            replay_buffer.apply_discounted_completion_reward(
+                                job_id=correction_job_id,
+                                reward_delta=reward_delta,
+                                credit_decay=float(
+                                    train_config.completion_credit_decay
+                                ),
+                            )
+                        )
+                        if not applied_credits:
+                            correction_agent_id = (
+                                replay_buffer.apply_reward_correction(
+                                    job_id=correction_job_id,
+                                    reward_delta=reward_delta,
+                                )
+                            )
+                            if correction_agent_id is not None:
+                                stats.record_reward_correction(
+                                    agent_id=correction_agent_id,
+                                    reward_delta=reward_delta,
+                                )
+                            continue
+                        for (correction_agent_id, completion_credit,) in applied_credits:
+                            stats.record_reward_correction(
+                                agent_id=correction_agent_id,
+                                reward_delta=completion_credit,
+                            )
+                        continue
+
+                    correction_agent_id = (
+                        replay_buffer.apply_reward_correction(
+                            job_id=correction_job_id,
+                            reward_delta=reward_delta,
+                        )
+                    )
+
+                    if correction_agent_id is not None:
+                        stats.record_reward_correction(
+                            agent_id=correction_agent_id,
+                            reward_delta=reward_delta,
+                        )
 
                     # 把奖励修正到这个 Job 最新一次调度经验。
                     correction_agent_id = (

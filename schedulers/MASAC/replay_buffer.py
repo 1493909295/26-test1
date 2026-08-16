@@ -222,9 +222,18 @@ class ReplayBuffer:
         self.next_agent_ids: list[Optional[str]] = [None] * capacity
         self.next_job_ids: list[Optional[str]] = [None] * capacity
         self.latest_job_transition_index: Dict[str, int,] = {}
+        # 记录调度链用于奖励分配
+        self.job_transition_indices: Dict[str, list[int]] = {}
 
     def __len__(self) -> int:
         return self._size
+
+    # 重置当前 episode 的任务级信用分配索引
+    def reset_episode_job_tracking(self) -> None:
+        self.job_transition_indices.clear()
+        self.latest_job_transition_index.clear()
+
+
 
     # 返回下一条经验将写入的槽位
     @property
@@ -300,15 +309,24 @@ class ReplayBuffer:
             old_job_id = self.job_ids[index]
 
             if old_job_id is not None:
-                old_job_id = str(
-                    old_job_id
-                )
-            if (
-                    self.latest_job_transition_index.get(
-                        old_job_id
-                    )
-                    == index
-            ):
+                old_job_id = str(old_job_id)
+                old_job_chain = self.job_transition_indices.get(old_job_id)
+
+                if old_job_chain is not None:
+                    try:
+                        old_job_chain.remove(index)
+                    except ValueError:
+                        # 当前 index 已经不在映射中时无需处理。
+                        pass
+
+                        # 该 Job 已经没有任何仍被跟踪的 Transition，
+                        # 删除空映射，避免字典不断积累空列表。
+                    if len(old_job_chain) == 0:
+                        self.job_transition_indices.pop(
+                            old_job_id,
+                            None,
+                        )
+            if (self.latest_job_transition_index.get(old_job_id) == index):
                 self.latest_job_transition_index.pop(
                     old_job_id,
                     None,
@@ -331,9 +349,13 @@ class ReplayBuffer:
         self.is_forced_action[index] = is_forced_action
         self.env_times[index] = env_time
         self.next_env_times[index] = next_env_time
+
         self.agent_ids[index] = str(transition.agent_id)
-        self.job_ids[index] = str(transition.job_id)
+        current_job_id = str(transition.job_id)
+        self.job_ids[index] = current_job_id
         self.latest_job_transition_index[str(transition.job_id)] = index
+        self.job_transition_indices.setdefault(current_job_id, [],).append(index)
+
         self.next_agent_ids[index] = (
             None
             if transition.next_agent_id is None
@@ -384,6 +406,63 @@ class ReplayBuffer:
             return None
 
         return str(agent_id)
+
+    # 反向折扣奖励分配机制
+    def apply_discounted_completion_reward(self, job_id: str, reward_delta: float, credit_decay: float,) -> list[tuple[str, float]]:
+        job_id = str(job_id)
+        reward_delta = float(reward_delta)
+        credit_decay = float(credit_decay)
+
+        # 找出当前 Job 的完整调度链。
+        candidate_indices = list(self.job_transition_indices.get(job_id,[],))
+        if not candidate_indices:
+            return []
+        valid_indices: list[int] = []
+
+        # 验证任务链
+        for buffer_index in candidate_indices:
+            buffer_index = int(buffer_index)
+            if self.job_ids[buffer_index] != job_id:
+                continue
+            if bool(self.is_forced_action[buffer_index]):
+                continue
+            if self.agent_ids[buffer_index] is None:
+                continue
+            valid_indices.append(buffer_index)
+        if not valid_indices:
+            return []
+
+        chain_length = len(valid_indices)
+        # 反向折扣权重
+        raw_weights = np.asarray(
+            [
+                credit_decay ** (
+                        chain_length - 1 - transition_position
+                )
+                for transition_position in range(chain_length)
+            ],
+            dtype=np.float64,
+        )
+        weight_sum = float(
+            raw_weights.sum()
+        )
+        # 归一化
+        normalized_weights = (raw_weights / weight_sum)
+        applied_credits: list[tuple[str, float]] = []
+
+        # 修改 ReplayBuffer reward
+        for buffer_index, normalized_weight in zip(valid_indices, normalized_weights,):
+            completion_credit = (reward_delta * float(normalized_weight))
+            self.rewards[buffer_index] = np.float32(float(self.rewards[buffer_index])  + completion_credit)
+            agent_id = str(self.agent_ids[buffer_index])
+            applied_credits.append((agent_id, completion_credit,))
+
+        self.job_transition_indices.pop(job_id, None,)
+        self.latest_job_transition_index.pop(job_id, None,)
+
+        return applied_credits
+
+
 
     # 判断当前是否有足够经验采样一个 batch
     def can_sample(self, batch_size: int, include_forced_actions: bool = False,) -> bool:
@@ -520,7 +599,7 @@ class ReplayBuffer:
         self.next_agent_ids = [None] * self.capacity
         self.next_job_ids = [None] * self.capacity
         self.latest_job_transition_index.clear()
-
+        self.job_transition_indices.clear()
 
 
 
