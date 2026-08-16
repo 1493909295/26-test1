@@ -13,7 +13,8 @@ NUM_JOBS = 1000              # 全局生成的任务 (Job) 总数量
 LAMBDA_RATE = 0.5           # LAMBDA_RATE 越大，任务到达越密集（时间间隔越短）
 CLOUD_LATENCY_RANGE = (5, 20) # 边缘节点到云数据中心的时延范围
 EDGE_LATENCY_RANGE = (2,5)    # 边缘节点之间的时延范围
-DROP_DEADLINE_RATE = 3.0
+DROP_DEADLINE_RATE = 3.0      # 丢弃任务超时倍数
+QUEUE_LENGTH_SCALE = 10.0      # 队列长度归一化使用参数（根据训练后最大等待队列的一半）
 ENV_KEEP_PATH = os.path.join(BASE_DIR, "./environment/env_keep")
 
 # 模型基本参数

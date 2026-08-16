@@ -31,7 +31,7 @@ class CloudEdgeEnv(AECEnv):
 
     JOB_FEAT_DIM = 4
     DC_FEAT_DIM = 8
-    HOST_FEAT_DIM = 8
+    HOST_FEAT_DIM = 9
 
     def __init__(
         self,
@@ -201,6 +201,7 @@ class CloudEdgeEnv(AECEnv):
         self.started_from_waiting_jobs: int = 0
         self.waiting_timeout_drops: int = 0
         self.max_waiting_queue_length: int = 0
+        self.queue_length_scale = float(conf.QUEUE_LENGTH_SCALE)
 
         # 先暂存每个智能体重做，然后再统一执行，我这里貌似不需要这样，我这里来一个任务，选个智能体做个决策，更新下奖励就行
         # self.pending_actions: Dict[str, Optional[int]] = {
@@ -1005,6 +1006,8 @@ class CloudEdgeEnv(AECEnv):
         # 计算队列情况
         waiting_jobs = sum(len(host.waiting_queue) for host in dc.host_list)
         running_jobs = sum(len(host.running_queue) for host in dc.host_list)
+        dc_queue_length_scale = (self.queue_length_scale * max(len(dc.host_list),1,))
+
 
         # return [
         #     float(total_cpu),
@@ -1024,8 +1027,10 @@ class CloudEdgeEnv(AECEnv):
             float(np.clip(dc.dc_gpu_load, 0.0, 1.0)),
             self._normalize(available_cpu, self.max_dc_cpu),
             self._normalize(available_gpu, self.max_dc_gpu),
-            self._normalize(waiting_jobs, self.max_queue_len),
-            self._normalize(running_jobs, self.max_queue_len),
+            # 整个本地 DC 的 Waiting Queue 拥塞程度
+            self._saturating_ratio(value=float(waiting_jobs), scale=dc_queue_length_scale,),
+            # 整个本地 DC 的 Running Queue 拥塞程度
+            self._saturating_ratio(value=float(running_jobs), scale=dc_queue_length_scale,),
         ]
 
     #  将一个 Host 编码成长度为 self.host_feat_dim 的特征向量
@@ -1037,7 +1042,13 @@ class CloudEdgeEnv(AECEnv):
         available_cpu = max(host.cpu_num - running_cpu, 0.0)
         available_gpu = max(host.gpu_capacity_num - running_gpu, 0.0)
         waiting_jobs = len(host.waiting_queue)
+        waiting_workload = float(host.waiting_queue.get_total_duration())
         running_jobs = len(host.running_queue)
+        waiting_queue_congestion = (self._saturating_ratio(value=float(waiting_jobs), scale=self.queue_length_scale,))
+        running_queue_congestion = (self._saturating_ratio(value=float(running_jobs), scale=self.queue_length_scale,))
+        waiting_workload_ratio = (self._saturating_ratio(value=waiting_workload, scale=self.queue_workload_scale,))
+
+
         # return [
         #     float(host.cpu_num),
         #     float(host.gpu_capacity_num),
@@ -1049,21 +1060,29 @@ class CloudEdgeEnv(AECEnv):
         #     float(running_jobs),
         # ]
         return [
-            self._normalize(host.cpu_num, self.max_host_cpu),
+            self._normalize(host.cpu_num, self.max_host_cpu),# CPU 总容量
             self._normalize(host.gpu_capacity_num, self.max_host_gpu),
-            float(np.clip(host.cpu_load, 0.0, 1.0)),
+            float(np.clip(host.cpu_load, 0.0, 1.0)),# CPU 当前负载
             float(np.clip(host.gpu_load, 0.0, 1.0)),
-            self._normalize(available_cpu, self.max_host_cpu),
+            self._normalize(available_cpu, self.max_host_cpu),# CPU 当前可用比例
             self._normalize(available_gpu, self.max_host_gpu),
-            self._normalize(waiting_jobs, self.max_queue_len),
-            self._normalize(running_jobs, self.max_queue_len),
+            waiting_queue_congestion,# Waiting Queue 拥塞程度
+            waiting_workload_ratio,# Waiting Queue 总工作量
+            running_queue_congestion,# 当前 Running Queue 拥塞程度
         ]
 
     # 把当前等待调度的任务编码成长度为 self.job_feat_dim 的特征向量
     def _encode_job_features(self, job: Optional[Job]) -> List[float]:
         if job is None:
             return [0.0] * self.job_feat_dim
+        # 当前 Job 已经等待了多久
         waiting_time = max(self.current_time - float(job.arrive_time), 0.0)
+        # 当前 Job 最多允许等待多久
+        allowed_waiting_time = max(self.drop_deadline_ratio  * float(job.duration), self.norm_eps,)
+        # 当前 Job 已经消耗了多少等待预算
+        deadline_consumed_ratio = self._normalize(value=waiting_time, scale=allowed_waiting_time,)
+
+
         # return [
         #     float(job.cpu_request),
         #     float(job.gpu_request),
@@ -1075,7 +1094,7 @@ class CloudEdgeEnv(AECEnv):
             self._normalize(job.cpu_request, self.max_job_cpu),
             self._normalize(job.gpu_request, self.max_job_gpu),
             self._normalize(job.duration, self.max_job_duration),
-            self._normalize(waiting_time, self.max_arrive_time),
+            deadline_consumed_ratio,
         ]
 
     def _encode_local_link_features(self, agent_id: str) -> List[float]:
@@ -1235,8 +1254,23 @@ class CloudEdgeEnv(AECEnv):
             eps,
         )
 
-        # 队列长度上限暂时用任务总数代替，队列长度肯定是比这个短的，而且短的多，就怕任务总数太大了
-        self.max_queue_len = max(float(len(self.base_jobs)), 1.0)
+        # Waiting Queue Workload 的归一化参考尺度
+        job_durations = np.asarray(
+            [
+                float(job.duration)
+                for job in self.base_jobs
+            ],
+            dtype=np.float64,
+        )
+        self.queue_workload_scale = max(
+            float(
+                np.percentile(
+                    job_durations,
+                    75.0,       # 这里可能是个坑，留着以后填
+                )
+            ),
+            self.norm_eps,
+        )
 
         # 统计拓扑图中最大的链路时延
         # latencies = []
@@ -1281,6 +1315,12 @@ class CloudEdgeEnv(AECEnv):
     # 执行归一化
     def _normalize(self, value: float, scale: float) -> float:
         return float(np.clip(float(value) / max(float(scale), self.norm_eps), 0.0, 1.0))
+
+    # 等待队列专用归一化
+    def _saturating_ratio(self, value: float, scale: float,) -> float:
+        value = max(float(value), 0.0,)
+        scale = max(float(scale), self.norm_eps,)
+        return float(value / (value + scale))
 
     # 构造单个边缘智能体的局部观测
     def _get_local_observation(self, agent_id: str) -> np.ndarray:
