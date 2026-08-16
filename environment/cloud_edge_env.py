@@ -877,6 +877,8 @@ class CloudEdgeEnv(AECEnv):
 
         # episode 结束处理
         if not next_decision_found:
+            if len(self.event_queue) == 0:
+                self._drain_remaining_jobs_at_episode_tail()
             if self._check_episode_finished():
                 self._terminate_episode()
 
@@ -1662,6 +1664,170 @@ class CloudEdgeEnv(AECEnv):
         )
 
         return finished_job
+
+    # 修复训练一半报错的bug
+    def _drain_remaining_jobs_at_episode_tail(self) -> None:
+        # 只有在当前已经没有 Actor 决策时才能进行 Episode 尾部收尾。
+        if self.current_job_id is not None:
+            return
+
+        if self.current_agent_id is not None:
+            return
+
+        if self.current_dc_id is not None:
+            return
+
+        while True:
+
+            ####################################################################
+            # 第一步：
+            # 如果某个 Host 当前没有正在运行的任务，
+            # 但是 waiting_queue 中还有任务，
+            # 主动按照已有 FCFS 规则尝试启动这些任务。
+            ####################################################################
+            for dc in self.datacenters:
+                for host_idx, host in enumerate(dc.host_list):
+
+                    if host.waiting_queue.is_empty():
+                        continue
+
+                    # 正在运行任务的 Host 不需要主动 drain。
+                    #
+                    # 正常情况下，该运行任务对应的 JOB_FINISH 事件
+                    # 应该已经存在于 event_queue，
+                    # 等它完成后 _process_job_finish_event()
+                    # 会自动调用 _drain_host_waiting_queue()。
+                    if not host.running_queue.is_empty():
+                        continue
+
+                    self._drain_host_waiting_queue(
+                        dc_id=str(dc.dc_id),
+                        host_idx=int(host_idx),
+                    )
+
+            ####################################################################
+            # 第二步：
+            # 上面的 drain 可能启动等待任务，
+            # _start_job_on_host() 会为它们创建新的 JOB_FINISH 事件。
+            #
+            # Episode 尾部已经不存在新的调度决策，因此这里继续消费这些
+            # JOB_FINISH 事件即可。
+            ####################################################################
+            if self.event_queue:
+
+                event_time, event_type, event_job_id = heapq.heappop(
+                    self.event_queue
+                )
+
+                event_time = float(event_time)
+                event_job_id = str(event_job_id)
+
+                self.current_time = event_time
+
+                # Episode 尾部理论上只应该剩下 JOB_FINISH。
+                #
+                # 如果出现 JOB_ARRIVAL，说明调用这个收尾函数的时机有问题，
+                # 不能静默吞掉事件，否则会遗漏 Actor 决策。
+                if event_type != JOB_FINISH:
+                    raise RuntimeError(
+                        "Episode 尾部收尾阶段发现非 JOB_FINISH 事件："
+                        f"time={event_time}, "
+                        f"type={event_type}, "
+                        f"job_id={event_job_id}"
+                    )
+
+                self._process_job_finish_event(
+                    event_job_id
+                )
+
+                # _process_job_finish_event() 可能：
+                # 1. 启动新的 waiting job；
+                # 2. 创建新的 JOB_FINISH；
+                # 因此重新进入循环。
+                continue
+
+            ####################################################################
+            # 第三步：
+            # event_queue 已空，检查是否还有任务残留。
+            ####################################################################
+            remaining_running_jobs = 0
+            remaining_waiting_jobs = 0
+
+            blocked_waiting_details = []
+
+            for dc in self.datacenters:
+                for host_idx, host in enumerate(dc.host_list):
+
+                    running_count = len(host.running_queue)
+                    waiting_count = len(host.waiting_queue)
+
+                    remaining_running_jobs += running_count
+                    remaining_waiting_jobs += waiting_count
+
+                    if waiting_count > 0:
+                        head_job = host.waiting_queue._queue[0]
+
+                        blocked_waiting_details.append(
+                            {
+                                "dc_id": str(dc.dc_id),
+                                "host_idx": int(host_idx),
+                                "host_id": str(host.host_id),
+                                "waiting_count": int(waiting_count),
+                                "running_count": int(running_count),
+                                "head_job_id": str(head_job.job_id),
+                                "used_cpu": float(host.used_cpu),
+                                "cpu_capacity": float(host.cpu_num),
+                                "used_gpu": float(host.used_gpu),
+                                "gpu_capacity": float(
+                                    host.gpu_capacity_num
+                                ),
+                            }
+                        )
+
+            ####################################################################
+            # 没有任何 running / waiting job：
+            # Episode 中的后台任务已经全部处理完，可以正常结束。
+            ####################################################################
+            if (
+                    remaining_running_jobs == 0
+                    and remaining_waiting_jobs == 0
+            ):
+                return
+
+            ####################################################################
+            # event_queue 已空却还有 running job：
+            # 说明 running job 的 JOB_FINISH 事件丢失。
+            #
+            # 这属于严重环境不变量错误，不能直接把 Episode 标为完成。
+            ####################################################################
+            if remaining_running_jobs > 0:
+                raise RuntimeError(
+                    "环境进入非法状态：event_queue 已空，"
+                    "但仍存在 running job。"
+                    f"running_jobs={remaining_running_jobs}, "
+                    f"waiting_jobs={remaining_waiting_jobs}"
+                )
+
+            ####################################################################
+            # 到这里意味着：
+            #
+            # event_queue == 空
+            # running_queue == 空
+            # waiting_queue != 空
+            #
+            # 对于一个空闲 Host 来说，等待队首如果满足 can_ever_accommodate，
+            # _drain_host_waiting_queue() 理应能够启动它。
+            #
+            # 因此如果还残留 waiting job，说明存在其他环境逻辑错误，
+            # 不允许继续静默运行。
+            ####################################################################
+            raise RuntimeError(
+                "环境无法继续推进："
+                "event_queue、running_queue 均为空，"
+                "但 waiting_queue 仍有任务。"
+                f"waiting_jobs={remaining_waiting_jobs}, "
+                f"details={blocked_waiting_details}"
+            )
 
     # 暂存一个与特定 Job 绑定的延迟奖励修正
     def _record_reward_correction(self, job_id: str, reward_delta: float, reason: str,) -> None:
