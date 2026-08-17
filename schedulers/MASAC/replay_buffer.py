@@ -236,6 +236,7 @@ class ReplayBuffer:
     def reset_episode_job_tracking(self) -> None:
         self.job_transition_indices.clear()
         self.latest_job_transition_index.clear()
+        self.pending_edge_transition_index.clear()
 
 
 
@@ -743,6 +744,10 @@ class ReplayBuffer:
         self.next_job_ids = [None] * self.capacity
         self.latest_job_transition_index.clear()
         self.job_transition_indices.clear()
+        self.action_types = [None] * self.capacity
+        self.latest_job_transition_index.clear()
+        self.job_transition_indices.clear()
+        self.pending_edge_transition_index.clear()
 
 
 

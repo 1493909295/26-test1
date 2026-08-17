@@ -23,6 +23,12 @@ from schedulers.MASAC.transition_collector import (DecisionSnapshot, TransitionC
 from environment.cloud_edge_env import CloudEdgeEnv
 import config as conf
 
+TERMINAL_FAILURE_REASONS = frozenset({
+    "waiting_timeout",
+    "cloud_arrival_timeout",
+    "cloud_resource_failure",
+})
+
 @dataclass(frozen=True)
 class TrainConfig:
     num_episodes: int = conf.Episodes
@@ -627,6 +633,22 @@ def train(
                     action_type=action_type,
                     action_source=action_source,
                 )
+
+                if (
+                        action_source == "forced"
+                        and action_type == "drop"
+                        and float(transition.reward) < 0.0
+                ):
+                    replay_buffer.apply_discounted_terminal_reward(
+                        job_id=str(transition.job_id),
+                        reward_delta=float(transition.reward),
+                        credit_decay=float(
+                            train_config.failure_credit_decay
+                        ),
+                        finalize_pending_edge=True,
+                    )
+
+
                 # 消费 env.step() 期间产生的延迟任务结果奖励
                 reward_corrections = (
                     env.pop_reward_corrections()
@@ -704,18 +726,6 @@ def train(
 
                         continue
 
-                    correction_agent_id = (
-                        replay_buffer.apply_reward_correction(
-                            job_id=correction_job_id,
-                            reward_delta=reward_delta,
-                        )
-                    )
-
-                    if correction_agent_id is not None:
-                        stats.record_reward_correction(
-                            agent_id=correction_agent_id,
-                            reward_delta=reward_delta,
-                        )
 
                     # 把奖励修正到这个 Job 最新一次调度经验。
                     correction_agent_id = (
