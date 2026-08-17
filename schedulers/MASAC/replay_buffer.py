@@ -206,6 +206,7 @@ class ReplayBuffer:
             dtype=np.int64,
         )
         self._num_trainable = 0
+        self._num_forced_actions = 0
 
         self.env_times = np.zeros(
             (capacity,),
@@ -248,6 +249,8 @@ class ReplayBuffer:
     # 维护索引关系
     def _add_trainable_index(self, buffer_index: int,) -> None:
         buffer_index = int(buffer_index)
+        if int(self._trainable_positions[buffer_index]) != -1:
+            return
         trainable_position = self._num_trainable
         self._trainable_indices[trainable_position] = buffer_index
         self._trainable_positions[buffer_index] = trainable_position
@@ -267,76 +270,105 @@ class ReplayBuffer:
         self._num_trainable -= 1
 
     # 回填 Edge 后继状态
-    def _resolve_pending_edge_with_same_job_successor(self, job_id: str, successor: TransitionLike,) -> None:
+    def _resolve_pending_edge_with_same_job_successor(
+            self,
+            job_id: str,
+            successor: TransitionLike,
+    ) -> bool:
+
         job_id = str(job_id)
-        pending_index = self.pending_edge_transition_index.get(job_id)
+
+        pending_index = self.pending_edge_transition_index.get(
+            job_id
+        )
+
+        # 当前 Job 没有等待回填的 Edge transition。
         if pending_index is None:
-            return
+            return False
 
         pending_index = int(pending_index)
 
-        # 防止环形 ReplayBuffer 覆盖后误修改其他 Job。
+        # ============================================================
+        # 防御检查 1：
+        # ReplayBuffer 是环形结构。
+        # 如果 pending_index 对应的槽位已经被其他 Job 覆盖，
+        # 就必须删除失效映射，绝不能修改别的 Job 的经验。
+        # ============================================================
         if self.job_ids[pending_index] != job_id:
             self.pending_edge_transition_index.pop(
                 job_id,
                 None,
             )
-            return
+            return False
 
-        # successor 必须仍然属于同一个 Job。
+        # ============================================================
+        # 防御检查 2：
+        # Edge transition 的 next_state 必须来自“同一个 Job”
+        # 真正到达目标 Edge 后形成的下一次决策状态。
+        #
+        # 不允许把环境时间线上另一个 Job 的状态作为 next_state。
+        # ============================================================
         if str(successor.job_id) != job_id:
-            # ======================== 核心 ========================
-            # previous Edge Transition 的 next state，
-            # 不再使用环境时间线上某个无关 Job 的状态，
-            # 而是使用同一 Job 真正到达目标 Edge 后的状态。
-            self.next_agent_indices[pending_index] = int(
-                successor.agent_index
+            return False
+
+        # ============================================================
+        # 核心修改：
+        # 使用同一 Job 在目标 Edge 上的决策状态，
+        # 回填上一条 Edge transition 的真实 next_state。
+        # ============================================================
+
+        self.next_agent_indices[pending_index] = int(
+            successor.agent_index
+        )
+
+        self.next_local_obs[pending_index] = np.asarray(
+            successor.local_obs,
+            dtype=np.float32,
+        )
+
+        self.next_global_states[pending_index] = np.asarray(
+            successor.global_state,
+            dtype=np.float32,
+        )
+
+        self.next_action_masks[pending_index] = np.asarray(
+            successor.action_mask,
+            dtype=np.int8,
+        )
+
+        self.next_agent_ids[pending_index] = str(
+            successor.agent_id
+        )
+
+        self.next_job_ids[pending_index] = job_id
+
+        self.next_env_times[pending_index] = float(
+            successor.env_time
+        )
+
+        # 当前 Edge transition 的后继仍然是正常决策状态，
+        # 所以不能被视为 terminal。
+        self.terminated[pending_index] = False
+        self.truncated[pending_index] = False
+        self.done[pending_index] = False
+
+        # Edge transition 现在已经拥有真实后继状态，
+        # 可以正式加入 SAC 可训练经验集合。
+        if (
+                not bool(self.is_forced_action[pending_index])
+                and int(self._trainable_positions[pending_index]) == -1
+        ):
+            self._add_trainable_index(
+                pending_index
             )
 
-            self.next_local_obs[pending_index] = np.asarray(
-                successor.local_obs,
-                dtype=np.float32,
-            )
+        # 当前 pending Edge 已经成功解析。
+        self.pending_edge_transition_index.pop(
+            job_id,
+            None,
+        )
 
-            self.next_global_states[pending_index] = np.asarray(
-                successor.global_state,
-                dtype=np.float32,
-            )
-
-            self.next_action_masks[pending_index] = np.asarray(
-                successor.action_mask,
-                dtype=np.int8,
-            )
-
-            self.next_agent_ids[pending_index] = str(
-                successor.agent_id
-            )
-
-            self.next_job_ids[pending_index] = job_id
-
-            self.next_env_times[pending_index] = float(
-                successor.env_time
-            )
-
-            # Edge Transition 现在存在真实的同 Job 后继状态，
-            # 因此继续正常 bootstrap。
-            self.done[pending_index] = False
-            # ====================================================
-
-            # 当前 Edge experience 已经完整，可以参加 SAC 训练。
-            if (
-                    not bool(self.is_forced_action[pending_index])
-                    and int(self._trainable_positions[pending_index]) == -1
-            ):
-                self._add_trainable_index(
-                    pending_index
-                )
-
-            # 这一条 pending Edge 已经解析完成。
-            self.pending_edge_transition_index.pop(
-                job_id,
-                None,
-            )
+        return True
 
     # 当 Edge 转发后的 Job 在产生下一次正常 Actor 决策前已经直接失败时，把 pending Edge Transition 标记成终态
     def _finalize_pending_edge_as_terminal(self,job_id: str,) -> None:
@@ -387,7 +419,7 @@ class ReplayBuffer:
     @property
     def num_forced_actions(self) -> int:
         return int(
-            self._size - self._num_trainable
+            self._num_forced_actions
         )
 
     # 返回当前保存的普通 Actor 动作经验数量
@@ -395,6 +427,34 @@ class ReplayBuffer:
     def num_trainable_actions(self) -> int:
         return int(
             self._num_trainable
+        )
+
+    # 当前所有尚未进入 trainable 集合的 transition 数量
+    @property
+    def num_untrainable_actions(self) -> int:
+        return int(
+            self._size
+            - self._num_trainable
+        )
+
+    # 非 forced、但仍不能训练的 transition 数量
+    @property
+    def num_nonforced_untrainable_actions(self,) -> int:
+        return max(
+            int(
+                self.num_untrainable_actions
+                - self.num_forced_actions
+            ),
+            0,
+        )
+
+    # 当前仍等待同 Job 后继状态回填的 Edge transition 数量
+    @property
+    def num_pending_edge_actions(self,) -> int:
+        return int(
+            len(
+                self.pending_edge_transition_index
+            )
         )
 
     # 保存一条 Transition
@@ -424,11 +484,18 @@ class ReplayBuffer:
         # 如果当前槽位即将覆盖旧经验，
         # 先清理旧 Job 对该槽位的映射。
         if self._size == self.capacity:
-            self._remove_trainable_index(
-                index
-            )
+            self._remove_trainable_index(index)
 
-            old_job_id = self.job_ids[index]
+            if bool(
+                    self.is_forced_action[
+                        index
+                    ]
+            ):
+                self._num_forced_actions -= 1
+
+            old_job_id = self.job_ids[
+                index
+            ]
 
             if old_job_id is not None:
                 old_job_id = str(old_job_id)
@@ -493,6 +560,8 @@ class ReplayBuffer:
         self.latest_job_transition_index[str(transition.job_id)] = index
         self.job_transition_indices.setdefault(current_job_id, [],).append(index)
 
+        self.action_types[index] = current_action_type
+
         self.next_agent_ids[index] = (
             None
             if transition.next_agent_id is None
@@ -549,60 +618,176 @@ class ReplayBuffer:
         return str(agent_id)
 
     # 反向折扣奖励分配机制
-    def apply_discounted_terminal_reward(self, job_id: str, reward_delta: float, credit_decay: float,finalize_pending_edge: bool = False,) -> list[tuple[str, float]]:
+    def apply_discounted_terminal_reward(
+            self,
+            job_id: str,
+            reward_delta: float,
+            credit_decay: float,
+    ) -> list[tuple[str, float]]:
+
         job_id = str(job_id)
         reward_delta = float(reward_delta)
         credit_decay = float(credit_decay)
 
-        if finalize_pending_edge:
-            self._finalize_pending_edge_as_terminal(job_id=job_id)
+        # ============================================================
+        # 核心：
+        # 只要进入 terminal reward 分配函数，
+        # 就说明当前 Job 生命周期已经结束。
+        #
+        # 正常情况下：
+        # Edge transition 应该早已通过同 Job successor 完成回填，
+        # 此处不会找到 pending Edge。
+        #
+        # 如果此时仍存在 pending Edge，
+        # 说明任务在产生下一次普通 Actor 决策前就终止了。
+        # 这条 Edge transition 必须：
+        #   1. 标记 done=True；
+        #   2. 禁止 bootstrap；
+        #   3. 加入 trainable replay。
+        #
+        # 这样无论成功还是失败，都不会留下永久悬挂的 Edge experience。
+        # ============================================================
+        self._finalize_pending_edge_as_terminal(
+            job_id=job_id
+        )
 
         # 找出当前 Job 的完整调度链。
-        candidate_indices = list(self.job_transition_indices.get(job_id,[],))
+        candidate_indices = list(
+            self.job_transition_indices.get(
+                job_id,
+                [],
+            )
+        )
+
         if not candidate_indices:
+            # 当前 Job 已经 terminal，
+            # 即使没有普通 Actor transition，也必须清理任务级索引。
+            self.job_transition_indices.pop(
+                job_id,
+                None,
+            )
+            self.latest_job_transition_index.pop(
+                job_id,
+                None,
+            )
+
             return []
+
         valid_indices: list[int] = []
 
-        # 验证任务链
         for buffer_index in candidate_indices:
+
             buffer_index = int(buffer_index)
+
             if self.job_ids[buffer_index] != job_id:
                 continue
-            if bool(self.is_forced_action[buffer_index]):
+
+            # forced action 不由 Actor 选择，
+            # 不直接拿来训练 Actor/Critic。
+            if bool(
+                    self.is_forced_action[buffer_index]
+            ):
                 continue
+
             if self.agent_ids[buffer_index] is None:
                 continue
-            valid_indices.append(buffer_index)
+
+            valid_indices.append(
+                buffer_index
+            )
+
         if not valid_indices:
+            # 即使整个 Job 只有 forced transition，
+            # terminal 后也不能继续保留任务级映射。
+            self.job_transition_indices.pop(
+                job_id,
+                None,
+            )
+
+            self.latest_job_transition_index.pop(
+                job_id,
+                None,
+            )
+
             return []
 
-        chain_length = len(valid_indices)
-        # 反向折扣权重
+        chain_length = len(
+            valid_indices
+        )
+
         raw_weights = np.asarray(
             [
                 credit_decay ** (
                         chain_length - 1 - position
                 )
-                for position in range(chain_length)
+                for position in range(
+                chain_length
+            )
             ],
             dtype=np.float64,
         )
-        # 归一化
-        normalized_weights = (raw_weights / float(raw_weights.sum()))
 
-        applied_credits: list[tuple[str, float]] = []
+        normalized_weights = (
+                raw_weights
+                / float(raw_weights.sum())
+        )
 
-        # 修改 ReplayBuffer reward
-        for buffer_index, weight in zip(valid_indices, normalized_weights,):
-            terminal_credit = (reward_delta * float(weight))
-            # completion_credit = (reward_delta * float(normalized_weight))
-            self.rewards[buffer_index] = np.float32(float(self.rewards[buffer_index])  + terminal_credit)
-            # agent_id = str(self.agent_ids[buffer_index])
-            applied_credits.append((str(self.agent_ids[buffer_index]), terminal_credit,))
+        applied_credits: list[
+            tuple[str, float]
+        ] = []
 
-        self.job_transition_indices.pop(job_id, None,)
-        self.latest_job_transition_index.pop(job_id, None,)
-        self.pending_edge_transition_index.pop(job_id, None,)
+        for (
+                buffer_index,
+                weight,
+        ) in zip(
+            valid_indices,
+            normalized_weights,
+        ):
+            terminal_credit = (
+                    reward_delta
+                    * float(weight)
+            )
+
+            self.rewards[
+                buffer_index
+            ] = np.float32(
+                float(
+                    self.rewards[
+                        buffer_index
+                    ]
+                )
+                + terminal_credit
+            )
+
+            applied_credits.append(
+                (
+                    str(
+                        self.agent_ids[
+                            buffer_index
+                        ]
+                    ),
+                    terminal_credit,
+                )
+            )
+
+        # Job 生命周期已经结束，
+        # 删除本 Job 的临时追踪结构。
+        self.job_transition_indices.pop(
+            job_id,
+            None,
+        )
+
+        self.latest_job_transition_index.pop(
+            job_id,
+            None,
+        )
+
+        # pending Edge 已在函数开头处理，
+        # 理论上这里应该不存在。
+        self.pending_edge_transition_index.pop(
+            job_id,
+            None,
+        )
 
         return applied_credits
 
@@ -616,10 +801,9 @@ class ReplayBuffer:
         if include_forced_actions:
             available_count = self._size
         else:
-            available_count = (
-                self._num_trainable
-            )
-        return self.num_trainable_actions >= batch_size
+            available_count = self._num_trainable
+
+        return int(available_count) >= batch_size
 
     # 随机采样一个ReplayBatch
     def sample(self,batch_size: int,include_forced_actions: bool = False,replace: bool = False,) -> ReplayBatch:
@@ -720,6 +904,7 @@ class ReplayBuffer:
         self._size = 0
         self.total_added = 0
         self._num_trainable = 0
+        self._num_forced_actions = 0
         self._trainable_indices.fill(-1)
         self._trainable_positions.fill(-1)
         self.agent_indices.fill(-1)

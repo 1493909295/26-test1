@@ -640,12 +640,15 @@ def train(
                         and float(transition.reward) < 0.0
                 ):
                     replay_buffer.apply_discounted_terminal_reward(
-                        job_id=str(transition.job_id),
-                        reward_delta=float(transition.reward),
+                        job_id=str(
+                            transition.job_id
+                        ),
+                        reward_delta=float(
+                            transition.reward
+                        ),
                         credit_decay=float(
                             train_config.failure_credit_decay
                         ),
-                        finalize_pending_edge=True,
                     )
 
 
@@ -665,10 +668,12 @@ def train(
                             replay_buffer.apply_discounted_terminal_reward(
                                 job_id=correction_job_id,
                                 reward_delta=reward_delta,
-                                credit_decay=float(train_config.completion_credit_decay),
-                                finalize_pending_edge=False,
+                                credit_decay=float(
+                                    train_config.completion_credit_decay
+                                ),
                             )
                         )
+
                         if not applied_credits:
                             correction_agent_id = (
                                 replay_buffer.apply_reward_correction(
@@ -696,7 +701,6 @@ def train(
                                 credit_decay=float(
                                     train_config.failure_credit_decay
                                 ),
-                                finalize_pending_edge=True,
                             )
                         )
                         if not applied_penalties:
