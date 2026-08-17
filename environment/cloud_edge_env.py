@@ -191,7 +191,8 @@ class CloudEdgeEnv(AECEnv):
         self.running_job_location = {}
 
         # 丢弃机制
-        self.drop_deadline_ratio = conf.DROP_DEADLINE_RATE
+        self.sla_deadline_ratio = float(conf.SLA_DEADLINE_RATIO)
+        self.drop_deadline_ratio = float(conf.DROP_DEADLINE_RATIO)
         self.drop_action = DROP_ACTION
 
         self.dropped_jobs_info: List[Dict[str, Any]] = []
@@ -327,13 +328,17 @@ class CloudEdgeEnv(AECEnv):
         self.timeout_drop_penalty = float(conf.TIMEOUT_DROP_PENALTY)
         self.resource_drop_penalty = float(conf.RESOURCE_DROP_PENALTY)
         self.task_completion_reward = float(conf.TASK_COMPLETION_REWARD)
-        self.waiting_time_cost_weight = float(conf.WAITING_TIME_COST_WEIGHT)
-        self.execution_time_cost_weight = float(conf.EXECUTION_TIME_COST_WEIGHT)
+        self.completion_time_cost_weight = float(conf.COMPLETION_TIME_COST_WEIGHT)
+        self.sla_violation_cost_weight = float(conf.SLA_VIOLATION_COST_WEIGHT)
+
+        # self.waiting_time_cost_weight = float(conf.WAITING_TIME_COST_WEIGHT)
+        # self.execution_time_cost_weight = float(conf.EXECUTION_TIME_COST_WEIGHT)
         self.queue_admission_cost_weight = float(conf.QUEUE_ADMISSION_COST_WEIGHT)
         self.edge_forward_base_penalty = float(conf.EDGE_FORWARD_BASE_PENALTY)
         self.edge_latency_cost_weight = float(conf.EDGE_LATENCY_COST_WEIGHT)
-        self.edge_deadline_risk_cost_weight = float(conf.EDGE_DEADLINE_RISK_COST_WEIGHT)
+        # self.edge_deadline_risk_cost_weight = float(conf.EDGE_DEADLINE_RISK_COST_WEIGHT)
         self.cloud_latency_cost_weight = float(conf.CLOUD_LATENCY_COST_WEIGHT)
+        self.sla_risk_cost_weight = float(conf.SLA_RISK_COST_WEIGHT)
         # 等待被处理的奖励修正事件列表
         self.pending_reward_corrections: List[Dict[str, Any]] = []
         
@@ -960,18 +965,18 @@ class CloudEdgeEnv(AECEnv):
                 mask[action_idx] = 0
             # 检查本次调度是否会引起确定性的超时丢弃
             if current_job is not None:
-                elapsed_waiting_time = max(float(self.current_time) - float(current_job.arrive_time),0.0,)
-                allowed_waiting_time = (self.drop_deadline_ratio * float(current_job.duration))
-                transfer_latency = float(self.graph[agent_id][target_dc_id].get("weight", 0.0,))
-                if (elapsed_waiting_time + transfer_latency > allowed_waiting_time):
+                transfer_latency = float(self.graph[agent_id][target_dc_id].get( "weight", 0.0,))
+                predicted_completion_time = (self._predict_completion_time_if_start_now(job=current_job, extra_latency=transfer_latency,))
+                drop_limit = (self._get_drop_completion_limit(current_job))
+                if predicted_completion_time > drop_limit:
                     mask[action_idx] = 0
                     continue
-
         # 最后一个动作是卸载到云
         cloud_action_idx = self.cloud_action_index
 
         if self.cloud_id not in self.dc_map:
             mask[cloud_action_idx] = 0
+
         elif self.graph is not None and not self.graph.has_edge(agent_id, self.cloud_id):
             mask[cloud_action_idx] = 0
         elif current_job is not None:
@@ -982,6 +987,13 @@ class CloudEdgeEnv(AECEnv):
                 cloud_host = cloud_dc.host_list[0]
                 if not cloud_host.can_ever_accommodate(current_job):
                     mask[cloud_action_idx] = 0
+                else:
+                    # Cloud 也必须遵守与 Edge 完全相同的最大完成时间约束。
+                    transfer_latency = float(self.graph[agent_id][self.cloud_id].get("weight", 0.0,))
+                    predicted_completion_time = (self._predict_completion_time_if_start_now(job=current_job, extra_latency=transfer_latency,))
+                    drop_limit = (self._get_drop_completion_limit(current_job))
+                    if predicted_completion_time > drop_limit:
+                        mask[cloud_action_idx] = 0
         return mask
 
     # 将一个 DataCenter 编码成长度为 self.dc_feat_dim 的特征向量
@@ -1382,16 +1394,52 @@ class CloudEdgeEnv(AECEnv):
 
         return obs_array
 
+####################### 一些时间辅助函数 ###############
+    # 返回任务满足 SLA 所允许的最大端到端完成时间
+    def _get_sla_completion_limit(self, job: Job) -> float:
+        return (self.sla_deadline_ratio  * float(job.duration))
+
+    # 返回任务允许存在于系统中的最大端到端完成时间
+    def _get_drop_completion_limit(self, job: Job) -> float:
+        return (self.drop_deadline_ratio * float(job.duration))
+
+    # 返回任务从最初到达到当前时刻已经消耗的时间
+    def _get_elapsed_service_time(self, job: Job) -> float:
+        return max(float(self.current_time) - float(job.arrive_time), 0.0,)
+
+    # 返回预计周转时间
+    def _predict_completion_time_if_start_now(self, job: Job, extra_latency: float = 0.0,) -> float:
+        elapsed_time = self._get_elapsed_service_time(job)
+        return (elapsed_time + max(float(extra_latency), 0.0) + float(job.duration))
+
+    # 计算归一化 SLA 违约严重程度
+    def _calculate_sla_violation_degree(self, job: Job, completion_time: float,) -> float:
+        completion_time = max(float(completion_time), 0.0,)
+        sla_limit = self._get_sla_completion_limit(job)
+        drop_limit = self._get_drop_completion_limit(job)
+        violation_window = max(drop_limit - sla_limit, self.norm_eps,)
+
+        violation_degree = (completion_time - sla_limit) / violation_window
+
+        return float(np.clip(violation_degree, 0.0, 1.0,))
+
+    # 归一化真实任务完成时间
+    def _calculate_completion_time_cost(self, completion_time: float,) -> float:
+        global_completion_scale = max(self.drop_deadline_ratio * float(self.max_job_duration), self.norm_eps,)
+        completion_time_cost = (max(float(completion_time), 0.0) / global_completion_scale)
+
+        return float(np.clip(completion_time_cost, 0.0, 1.0,))
+
+
+
     # 任务是否丢弃判断
     def _should_drop_arrival_job(self, job_id: str) -> bool:
         job_id = str(job_id)
         job = self.job_map[job_id]
-        waiting_time = max(
-            float(self.current_time) - float(job.arrive_time),
-            0.0,
-        )
-        drop_threshold = self.drop_deadline_ratio * float(job.duration)
-        return waiting_time > drop_threshold
+        predicted_completion_time = (
+            self._predict_completion_time_if_start_now(job=job, extra_latency=0.0,))
+        drop_limit = (self._get_drop_completion_limit(job))
+        return (predicted_completion_time > drop_limit)
 
     # 任务丢弃记录
     def _drop_arrival_job(self, job_id: str,drop_reasion: str) -> None:

@@ -1,6 +1,6 @@
 {
-  "next_episode": 94,
-  "global_decision_steps": 94511,
-  "global_normal_action_steps": 94511,
-  "best_episode_return": 1561.191806748839
+  "next_episode": 372,
+  "global_decision_steps": 384732,
+  "global_normal_action_steps": 384732,
+  "best_episode_return": 1676.4270451433592
 }
