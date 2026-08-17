@@ -1,8 +1,7 @@
 import pandas as pd
 import numpy as np
 import random
-# import matplotlib
-# import seaborn as sns
+import math
 from environment.job import JobList
 import networkx as nx
 # import matplotlib.pyplot as plt
@@ -15,6 +14,7 @@ import networkx as nx
 # plt.rcParams['axes.unicode_minus'] = False  # 正常显示负号···
 
 class Host:
+    RESOURCE_EPS = 1e-9
 
     def __init__(self, host_id,  gpu_capacity_num, cpu_num):
 
@@ -32,6 +32,67 @@ class Host:
         self.waiting_queue = JobList()
         self.running_queue = JobList()
         self.completed_queue = JobList()
+
+    # 用于修复浮点计算精度误差带来的恶性训练暂停bug
+    def _sanitize_resource_usage(self) -> None:
+        cpu_capacity = float(self.cpu_num)
+        gpu_capacity = float(self.gpu_capacity_num)
+        if not math.isfinite(self.used_cpu):
+            raise RuntimeError(
+                f"Host {self.host_id} used_cpu 非有限数值: "
+                f"{self.used_cpu}"
+            )
+        if not math.isfinite(self.used_gpu):
+            raise RuntimeError(
+                f"Host {self.host_id} used_gpu 非有限数值: "
+                f"{self.used_gpu}"
+            )
+        if abs(self.used_cpu) <= self.RESOURCE_EPS:
+            self.used_cpu = 0.0
+
+        if abs(self.used_gpu) <= self.RESOURCE_EPS:
+            self.used_gpu = 0.0
+
+        if abs(self.used_cpu - cpu_capacity) <= self.RESOURCE_EPS:
+            self.used_cpu = cpu_capacity
+
+        if abs(self.used_gpu - gpu_capacity) <= self.RESOURCE_EPS:
+            self.used_gpu = gpu_capacity
+
+        if (
+                self.used_cpu < -self.RESOURCE_EPS
+                or self.used_cpu > cpu_capacity + self.RESOURCE_EPS
+        ):
+            raise RuntimeError(
+                f"Host {self.host_id} CPU 资源记账异常："
+                f"used_cpu={self.used_cpu}, "
+                f"capacity={cpu_capacity}, "
+                f"running_count={len(self.running_queue)}"
+            )
+
+        if (
+                self.used_gpu < -self.RESOURCE_EPS
+                or self.used_gpu > gpu_capacity + self.RESOURCE_EPS
+        ):
+            raise RuntimeError(
+                f"Host {self.host_id} GPU 资源记账异常："
+                f"used_gpu={self.used_gpu}, "
+                f"capacity={gpu_capacity}, "
+                f"running_count={len(self.running_queue)}"
+            )
+
+            # 这里只可能清理 RESOURCE_EPS 范围内的边界误差。
+        self.used_cpu = min(max(self.used_cpu, 0.0), cpu_capacity)
+        self.used_gpu = min(max(self.used_gpu, 0.0), gpu_capacity)
+
+        if self.running_queue.is_empty():
+            if self.used_cpu != 0.0 or self.used_gpu != 0.0:
+                raise RuntimeError(
+                    f"Host {self.host_id} 状态不一致："
+                    f"running_queue 已空，"
+                    f"但 used_cpu={self.used_cpu}, "
+                    f"used_gpu={self.used_gpu}"
+                )
 
     # 初始化host
     def initialize_host(self):
@@ -51,6 +112,7 @@ class Host:
 
     # 负载计算
     def calculate_load(self):
+        self._sanitize_resource_usage()
         if self.cpu_num > 0:
             # total_cpu_run = self.running_queue.get_total_cpu_demand()
             self.cpu_load = min(max(self.used_cpu / self.cpu_num, 0.0), 1.0)
@@ -69,19 +131,39 @@ class Host:
     def can_ever_accommodate(self, job) -> bool:
         job_cpu = float(job.cpu_request)
         job_gpu = float(job.gpu_request)
-        if job_cpu > float(self.cpu_num):
+
+        if (job_cpu > float(self.cpu_num) + self.RESOURCE_EPS):
             return False
-        if job_gpu > float(self.gpu_capacity_num):
+
+        if (job_gpu > float(self.gpu_capacity_num) + self.RESOURCE_EPS):
             return False
+
         return True
+
+    # 返回经过浮点误差清理后的当前可用 CPU
+    def get_available_cpu(self) -> float:
+        self._sanitize_resource_usage()
+        available_cpu = (float(self.cpu_num) - float(self.used_cpu))
+        if abs(available_cpu) <= self.RESOURCE_EPS:
+            return 0.0
+        return max(available_cpu, 0.0)
+
+    # 返回经过浮点误差清理后的当前可用 GPU
+    def get_available_gpu(self) -> float:
+        self._sanitize_resource_usage()
+        available_gpu = (float(self.gpu_capacity_num) - float(self.used_gpu))
+        if abs(available_gpu) <= self.RESOURCE_EPS:
+            return 0.0
+        return max(available_gpu, 0.0)
 
     # 检查当前资源剩余量是否满足卸载要求
     def can_accommodate(self, job) -> bool:
+        self._sanitize_resource_usage()
         job_cpu = float(job.cpu_request)
         job_gpu = float(job.gpu_request)
-        if self.used_cpu + job_cpu > float(self.cpu_num):
+        if self.used_cpu + job_cpu > float(self.cpu_num) + self.RESOURCE_EPS:
             return False
-        if self.used_gpu + job_gpu > float(self.gpu_capacity_num):
+        if self.used_gpu + job_gpu > float(self.gpu_capacity_num) + self.RESOURCE_EPS:
             return False
         return True
 
@@ -102,6 +184,7 @@ class Host:
         self.running_queue.push(job)
         self.used_cpu += float(job.cpu_request)
         self.used_gpu += float(job.gpu_request)
+        self._sanitize_resource_usage()
         self.calculate_load()  # 联动计算负载
         # print(f"成功，主机{self.host_id}接收了任务{job.job_id}")
         return True
@@ -113,8 +196,9 @@ class Host:
             return  None
         self.used_cpu -= float(removed_job.cpu_request)
         self.used_gpu -= float(removed_job.gpu_request)
-        self.used_cpu = max(self.used_cpu, 0.0,)
-        self.used_gpu = max(self.used_gpu, 0.0,)
+        self._sanitize_resource_usage()
+        # self.used_cpu = max(self.used_cpu, 0.0,)
+        # self.used_gpu = max(self.used_gpu, 0.0,)
         self.calculate_load()
         return removed_job
 

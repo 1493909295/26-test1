@@ -32,6 +32,7 @@ class CloudEdgeEnv(AECEnv):
     JOB_FEAT_DIM = 4
     DC_FEAT_DIM = 8
     HOST_FEAT_DIM = 9
+    TIME_EPS = 1e-9
 
     def __init__(
         self,
@@ -721,8 +722,10 @@ class CloudEdgeEnv(AECEnv):
             pending_arrival_events = []
             while (
                     self.event_queue
-                    and float(self.event_queue[0][0])
-                    == current_event_time
+                    and self._is_same_event_time(
+                        self.event_queue[0][0],
+                        current_event_time,
+                    )
             ):
                 event_time, event_type, event_job_id = heapq.heappop(self.event_queue)
 
@@ -750,8 +753,10 @@ class CloudEdgeEnv(AECEnv):
             while arrival_index < len(pending_arrival_events):
                 while (
                         self.event_queue
-                        and float(self.event_queue[0][0])
-                        == current_event_time
+                        and self._is_same_event_time(
+                            self.event_queue[0][0],
+                            current_event_time,
+                        )
                 ):
                     new_event_time, new_event_type, new_event_job_id = (
                         heapq.heappop(self.event_queue)
@@ -963,12 +968,22 @@ class CloudEdgeEnv(AECEnv):
                 continue
             if self.graph is not None and not self.graph.has_edge(agent_id, target_dc_id):
                 mask[action_idx] = 0
+                continue
             # 检查本次调度是否会引起确定性的超时丢弃
             if current_job is not None:
-                transfer_latency = float(self.graph[agent_id][target_dc_id].get( "weight", 0.0,))
+                transfer_latency = float(
+                    self.graph[
+                        agent_id
+                    ][
+                        target_dc_id
+                    ].get(
+                        "weight",
+                        0.0,
+                    )
+                )
                 predicted_completion_time = (self._predict_completion_time_if_start_now(job=current_job, extra_latency=transfer_latency,))
                 drop_limit = (self._get_drop_completion_limit(current_job))
-                if predicted_completion_time > drop_limit:
+                if predicted_completion_time > drop_limit + self.TIME_EPS:
                     mask[action_idx] = 0
                     continue
         # 最后一个动作是卸载到云
@@ -992,7 +1007,7 @@ class CloudEdgeEnv(AECEnv):
                     transfer_latency = float(self.graph[agent_id][self.cloud_id].get("weight", 0.0,))
                     predicted_completion_time = (self._predict_completion_time_if_start_now(job=current_job, extra_latency=transfer_latency,))
                     drop_limit = (self._get_drop_completion_limit(current_job))
-                    if predicted_completion_time > drop_limit:
+                    if predicted_completion_time > drop_limit + self.TIME_EPS:
                         mask[cloud_action_idx] = 0
         return mask
 
@@ -1053,8 +1068,8 @@ class CloudEdgeEnv(AECEnv):
         host.calculate_load()
         running_cpu = float(host.used_cpu)
         running_gpu = float(host.used_gpu)
-        available_cpu = max(host.cpu_num - running_cpu, 0.0)
-        available_gpu = max(host.gpu_capacity_num - running_gpu, 0.0)
+        available_cpu = host.get_available_cpu()
+        available_gpu = host.get_available_gpu()
         waiting_jobs = len(host.waiting_queue)
         waiting_workload = float(host.waiting_queue.get_total_duration())
         running_jobs = len(host.running_queue)
@@ -1440,7 +1455,7 @@ class CloudEdgeEnv(AECEnv):
         predicted_completion_time = (
             self._predict_completion_time_if_start_now(job=job, extra_latency=0.0,))
         drop_limit = (self._get_drop_completion_limit(job))
-        return (predicted_completion_time > drop_limit)
+        return (predicted_completion_time > drop_limit + self.TIME_EPS)
 
     # 任务丢弃记录
     def _drop_arrival_job(self, job_id: str,drop_reasion: str) -> None:
@@ -2043,4 +2058,14 @@ class CloudEdgeEnv(AECEnv):
         self.current_job_id = None
         self.current_dc_id = None
         self.current_agent_id = None
+
+    # 判断两个浮点事件时间是否属于同一个仿真时刻
+    @classmethod
+    def _is_same_event_time(cls, time_a: float, time_b: float,) -> bool:
+        return math.isclose(
+            float(time_a),
+            float(time_b),
+            rel_tol=0.0,
+            abs_tol=cls.TIME_EPS,
+        )
 
