@@ -4,7 +4,7 @@ import csv
 import json
 import random
 import sys
-
+import os
 import time
 
 from dataclasses import dataclass, field
@@ -486,6 +486,8 @@ def append_csv_log(csv_path: Path, row: Dict[str, Any],) -> None:
 
         # 写入当前 episode 数据。
         writer.writerow(row)
+        csv_file.flush()
+        os.fsync(csv_file.fileno())
 
 # 把 episode 统计整理成固定结构的 CSV 行
 def build_episode_log_row(
