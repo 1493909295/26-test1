@@ -43,6 +43,7 @@ class TrainConfig:
     resume_checkpoint: Optional[str] = conf.Resume_Checkpoint
     vary_episode_seed: bool = conf.Vary_Episode_Seed
     completion_credit_decay: float = conf.COMPLETION_CREDIT_DECAY
+    failure_credit_decay: float = (conf.FAILURE_CREDIT_DECAY)
 
 # 统计一个 episode 运行期间的统计信息
 @dataclass
@@ -615,7 +616,7 @@ def train(
                 action_type = infer_action_type(env=env, agent_id=decision.agent_id, action=action)
 
                 # 执行动作、推进事件队列并构造一条经验放入经验池
-                transition, next_decision = collector.execute_and_collect(decision=decision, action=action)
+                transition, next_decision = collector.execute_and_collect(decision=decision, action=action,action_type=action_type,)
                 replay_buffer.add(transition)
                 decision = next_decision
 
@@ -639,12 +640,11 @@ def train(
 
                     if correction_reason == "completed":
                         applied_credits = (
-                            replay_buffer.apply_discounted_completion_reward(
+                            replay_buffer.apply_discounted_terminal_reward(
                                 job_id=correction_job_id,
                                 reward_delta=reward_delta,
-                                credit_decay=float(
-                                    train_config.completion_credit_decay
-                                ),
+                                credit_decay=float(train_config.completion_credit_decay),
+                                finalize_pending_edge=False,
                             )
                         )
                         if not applied_credits:
@@ -660,11 +660,48 @@ def train(
                                     reward_delta=reward_delta,
                                 )
                             continue
-                        for (correction_agent_id, completion_credit,) in applied_credits:
+                        for (correction_agent_id, terminal_credit,) in applied_credits:
                             stats.record_reward_correction(
                                 agent_id=correction_agent_id,
-                                reward_delta=completion_credit,
+                                reward_delta=terminal_credit,
                             )
+                        continue
+                    if correction_reason in TERMINAL_FAILURE_REASONS:
+                        applied_penalties = (
+                            replay_buffer.apply_discounted_terminal_reward(
+                                job_id=correction_job_id,
+                                reward_delta=reward_delta,
+                                credit_decay=float(
+                                    train_config.failure_credit_decay
+                                ),
+                                finalize_pending_edge=True,
+                            )
+                        )
+                        if not applied_penalties:
+                            # 防御性 fallback。
+                            correction_agent_id = (
+                                replay_buffer.apply_reward_correction(
+                                    job_id=correction_job_id,
+                                    reward_delta=reward_delta,
+                                )
+                            )
+
+                            if correction_agent_id is not None:
+                                stats.record_reward_correction(
+                                    agent_id=correction_agent_id,
+                                    reward_delta=reward_delta,
+                                )
+
+                            continue
+                        for (
+                                correction_agent_id,
+                                terminal_penalty,
+                        ) in applied_penalties:
+                            stats.record_reward_correction(
+                                agent_id=correction_agent_id,
+                                reward_delta=terminal_penalty,
+                            )
+
                         continue
 
                     correction_agent_id = (

@@ -82,6 +82,7 @@ class Transition:
     global_state: FloatArray
     action_mask: MaskArray
     action: int
+    action_type: str
     reward: float
     next_agent_id: Optional[str]
 
@@ -107,6 +108,7 @@ class Transition:
             "global_state": self.global_state.copy(),
             "action_mask": self.action_mask.copy(),
             "action": self.action,
+            "action_type": self.action_type,
             "reward": self.reward,
             "next_agent_id": self.next_agent_id,
             "next_agent_index": self.next_agent_index,
@@ -213,8 +215,9 @@ class TransitionCollector:
         return self._build_current_decision_snapshot()
     # 这里相当于把原来的 capture_decision() 拆成 _build_current_decision_snapshot()->capture_decision(),这样后面 execute_and_collect() 也可以调用同一个函数
 
-    def execute_and_collect(self, decision: DecisionSnapshot, action: int,) -> Tuple[Transition, Optional[DecisionSnapshot]]:
+    def execute_and_collect(self, decision: DecisionSnapshot, action: int,action_type: str,) -> Tuple[Transition, Optional[DecisionSnapshot]]:
 
+        action_type = str(action_type)
         # 例行检查
         self._require_reset()
 
@@ -260,6 +263,7 @@ class TransitionCollector:
             global_state=decision.global_state.copy(),
             action_mask=decision.action_mask.copy(),
             action=int(action),
+            action_type=action_type,
             reward=reward,
             next_agent_id=next_agent_id,
             next_agent_index=next_agent_index,
