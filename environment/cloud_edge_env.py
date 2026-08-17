@@ -1913,15 +1913,35 @@ class CloudEdgeEnv(AECEnv):
         # 边边转发
         if action_type == "edge_dc":
             transfer_latency = float(transfer_latency)
-            edge_latency_cost = self._normalize(value=transfer_latency, scale=float(self.max_edge_latency),)
-            # 允许等待的总时间
-            allowed_waiting_time = max(self.drop_deadline_ratio * float(job.duration), self.norm_eps,)
-            # 当前已经等了多久
-            elapsed_waiting_time = max(float(self.current_time) - float(job.arrive_time), 0.0,)
-            # 还剩多久
-            remaining_waiting_budget = max(allowed_waiting_time - elapsed_waiting_time, self.norm_eps,)
-            # 本次转发消耗的预算比例
-            edge_deadline_risk_cost = self._normalize(value=transfer_latency, scale=remaining_waiting_budget,)
+
+            edge_latency_cost = self._normalize(
+                value=transfer_latency,
+                scale=float(self.max_latency),
+            )
+
+            # 任务允许等待的总时间。
+            allowed_waiting_time = max(
+                self.drop_deadline_ratio * float(job.duration),
+                self.norm_eps,
+            )
+
+            # 任务到当前时刻已经消耗的等待时间。
+            elapsed_waiting_time = max(
+                float(self.current_time) - float(job.arrive_time),
+                0.0,
+            )
+
+            # 当前任务剩余的 deadline budget。
+            remaining_waiting_budget = max(
+                allowed_waiting_time - elapsed_waiting_time,
+                self.norm_eps,
+            )
+
+            edge_deadline_risk_cost = self._normalize(
+                value=transfer_latency,
+                scale=remaining_waiting_budget,
+            )
+
             return -float(
                 self.edge_forward_base_penalty
                 + self.edge_latency_cost_weight * edge_latency_cost
@@ -1933,7 +1953,7 @@ class CloudEdgeEnv(AECEnv):
         if action_type == "cloud":
             transfer_latency = float(transfer_latency)
 
-            cloud_latency_cost = self._normalize(value=transfer_latency, scale=float(self.max_cloud_latency),)
+            cloud_latency_cost = self._normalize(value=transfer_latency, scale=float(self.max_latency),)
 
             return -float(self.execution_time_cost_weight * duration_cost + self.cloud_latency_cost_weight * cloud_latency_cost)
 
