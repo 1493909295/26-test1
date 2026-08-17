@@ -242,6 +242,119 @@ def count_completed_jobs(env: Any) -> int:
             completed_count += len(completed_queue)
     return int(completed_count)
 
+# 统计当前 episode 的 SLA 与任务完成时间指标
+def calculate_service_metrics(env: Any) -> Dict[str, float]:
+    completed_jobs = []
+    for job in getattr(env, "jobs", []):
+        if getattr(job, "finish_time", None) is not None:
+            completed_jobs.append(job)
+
+    total_jobs = int(len(getattr(env, "jobs", [])))
+
+    dropped_jobs = int(len(getattr(env, "dropped_jobs_info", [],)))
+
+    total_completion_time = 0.0
+    sla_satisfied_jobs = 0
+    sla_violated_completed_jobs = 0
+    total_violation_degree = 0.0
+
+    sla_ratio = float(env.sla_deadline_ratio)
+    drop_ratio = float(env.drop_deadline_ratio)
+
+    for job in completed_jobs:
+        turnaround_time = (job.get_turnaround_time())
+        if turnaround_time is None:
+            continue
+
+        turnaround_time = float(turnaround_time)
+        duration = max(float(job.duration),1e-8,)
+        sla_limit = (sla_ratio * duration)
+        drop_limit = (drop_ratio * duration)
+        total_completion_time += (turnaround_time)
+
+        if turnaround_time <= sla_limit:
+            sla_satisfied_jobs += 1
+
+        else:
+            sla_violated_completed_jobs += 1
+            violation_degree = (
+                                       turnaround_time - sla_limit
+                               ) / max(
+                drop_limit - sla_limit,
+                1e-8,
+            )
+
+            total_violation_degree += float(
+                np.clip(
+                    violation_degree,
+                    0.0,
+                    1.0,
+                )
+            )
+
+    completed_count = len(
+        completed_jobs
+    )
+
+    avg_completion_time = (
+        total_completion_time
+        / completed_count
+        if completed_count > 0
+        else 0.0
+    )
+
+    # Drop 直接视为最严重 SLA violation，degree = 1。
+    total_violation_degree += float(
+        dropped_jobs
+    )
+
+    sla_satisfaction_rate = (
+        sla_satisfied_jobs / total_jobs
+        if total_jobs > 0
+        else 0.0
+    )
+
+    sla_violation_rate = (
+        (
+                sla_violated_completed_jobs
+                + dropped_jobs
+        )
+        / total_jobs
+        if total_jobs > 0
+        else 0.0
+    )
+
+    mean_sla_violation_degree = (
+        total_violation_degree
+        / total_jobs
+        if total_jobs > 0
+        else 0.0
+    )
+
+    return {
+        "sla_satisfied_jobs": int(
+            sla_satisfied_jobs
+        ),
+        "sla_violated_completed_jobs": int(
+            sla_violated_completed_jobs
+        ),
+        "sla_satisfaction_rate": float(
+            sla_satisfaction_rate
+        ),
+        "sla_violation_rate": float(
+            sla_violation_rate
+        ),
+        "mean_sla_violation_degree": float(
+            mean_sla_violation_degree
+        ),
+        "total_completion_time": float(
+            total_completion_time
+        ),
+        "avg_completion_time": float(
+            avg_completion_time
+        ),
+    }
+
 # 统计当前环境所有 Host 中剩余的 waiting job 数量
 def count_waiting_jobs(env: Any) -> int:
     waiting_count = 0
@@ -402,6 +515,8 @@ def build_episode_log_row(
     waiting_timeout_drops = int(getattr( env, "waiting_timeout_drops", 0,))
     max_waiting_queue_length = int(getattr( env, "max_waiting_queue_length", 0,))
     remaining_waiting_jobs = count_waiting_jobs(env)
+    service_metrics = calculate_service_metrics(env)
+
     # 返回固定列顺序的字典。
     return {
         "episode": int(stats.episode),
@@ -420,6 +535,13 @@ def build_episode_log_row(
         "total_jobs": total_jobs,
         "completed_jobs": completed_jobs,
         "dropped_jobs": dropped_jobs,
+        "sla_satisfied_jobs": int(service_metrics["sla_satisfied_jobs"]),
+        "sla_violated_completed_jobs": int(service_metrics["sla_violated_completed_jobs"]),
+        "sla_satisfaction_rate": float(service_metrics["sla_satisfaction_rate"]),
+        "sla_violation_rate": float(service_metrics["sla_violation_rate"]),
+        "mean_sla_violation_degree": float(service_metrics["mean_sla_violation_degree"]),
+        "total_completion_time": float(service_metrics["total_completion_time"]),
+        "avg_completion_time": float(service_metrics["avg_completion_time"]),
         "unresolved_jobs": unresolved_jobs,
         "queued_jobs": queued_jobs,
         "started_from_waiting_jobs": started_from_waiting_jobs,
@@ -469,6 +591,10 @@ def print_episode_summary(row: Dict[str, Any]) -> None:
     print(
         f"Episode {int(row['episode']):5d} | "
         f"return={float(row['episode_return']):9.4f} | "
+        f"sla_sat={float(row['sla_satisfaction_rate']):6.2%} | "
+        f"sla_vio={float(row['sla_violation_rate']):6.2%} | "
+        f"avg_T={float(row['avg_completion_time']):8.2f} | "
+        f"sum_T={float(row['total_completion_time']):10.2f} | "
         f"decisions={int(row['decision_count']):6d} | "
         f"completed={int(row['completed_jobs']):5d} | "
         f"dropped={int(row['dropped_jobs']):5d} | "

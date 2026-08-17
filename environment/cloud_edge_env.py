@@ -1090,11 +1090,12 @@ class CloudEdgeEnv(AECEnv):
         if job is None:
             return [0.0] * self.job_feat_dim
         # 当前 Job 已经等待了多久
-        waiting_time = max(self.current_time - float(job.arrive_time), 0.0)
+        elapsed_time = max(self.current_time - float(job.arrive_time), 0.0)
         # 当前 Job 最多允许等待多久
-        allowed_waiting_time = max(self.drop_deadline_ratio  * float(job.duration), self.norm_eps,)
+        pre_execution_drop_budget = max((self.drop_deadline_ratio - 1.0) * float(job.duration), self.norm_eps,)
         # 当前 Job 已经消耗了多少等待预算
-        deadline_consumed_ratio = self._normalize(value=waiting_time, scale=allowed_waiting_time,)
+        deadline_consumed_ratio = float(np.clip(elapsed_time / pre_execution_drop_budget, 0.0, 1.0,))
+
 
 
         # return [
@@ -1515,18 +1516,18 @@ class CloudEdgeEnv(AECEnv):
         if not started:
             return False
 
-        actual_waiting_time = job.get_waiting_time()
-        if actual_waiting_time is None:
-            actual_waiting_time = 0.0
-        actual_waiting_time = max(float(actual_waiting_time), 0.0,)
-        allowed_waiting_time = max(self.drop_deadline_ratio * float(job.duration),self.norm_eps,)
-        waiting_ratio = self._normalize(value=actual_waiting_time, scale=allowed_waiting_time,)
-        if waiting_ratio > 0.0:
-            self._record_reward_correction(
-                job_id=job_id,
-                reward_delta=-float(self.waiting_time_cost_weight * waiting_ratio),
-                reason="job_start_waiting_cost",
-            )
+        # actual_waiting_time = job.get_waiting_time()
+        # if actual_waiting_time is None:
+        #     actual_waiting_time = 0.0
+        # actual_waiting_time = max(float(actual_waiting_time), 0.0,)
+        # allowed_waiting_time = max(self.drop_deadline_ratio * float(job.duration),self.norm_eps,)
+        # waiting_ratio = self._normalize(value=actual_waiting_time, scale=allowed_waiting_time,)
+        # if waiting_ratio > 0.0:
+        #     self._record_reward_correction(
+        #         job_id=job_id,
+        #         reward_delta=-float(self.waiting_time_cost_weight * waiting_ratio),
+        #         reason="job_start_waiting_cost",
+        #     )
 
 
         # 添加任务完成事件到队列
@@ -1682,22 +1683,18 @@ class CloudEdgeEnv(AECEnv):
             current_time=float(self.current_time),
         )
 
-        # Job 真正开始执行之前实际等待了多久。
-        actual_waiting_time = (finished_job.get_waiting_time())
-        if actual_waiting_time is None:
-            actual_waiting_time = 0.0
-        actual_waiting_time = max(float(actual_waiting_time), 0.0,)
-
-        allowed_waiting_time = max(self.drop_deadline_ratio * float(finished_job.duration),self.norm_eps,)
-
-        waiting_ratio = self._normalize(value=actual_waiting_time, scale=allowed_waiting_time,)
-
-        completion_reward = (self.task_completion_reward)
-
+        turnaround_time = finished_job.get_turnaround_time()
+        turnaround_time = max(float(turnaround_time), 0.0,)
+        completion_time_cost = self._calculate_completion_time_cost(completion_time=turnaround_time,)
+        sla_violation_degree = self._calculate_sla_violation_degree(job=finished_job, completion_time=turnaround_time,)
+        completion_reward = float(self.task_completion_reward)
+        completion_time_penalty = float(self.completion_time_cost_weight * completion_time_cost)
+        sla_violation_penalty = float(self.sla_violation_cost_weight * sla_violation_degree)
+        final_reward_delta = (completion_reward  - completion_time_penalty - sla_violation_penalty)
         self._record_reward_correction(
             job_id=job_id,
-            reward_delta=completion_reward,
-            reason="completed",
+            reward_delta=float(final_reward_delta),
+            reason="task_final_completion_outcome",
         )
 
         # 更新负载
@@ -1925,38 +1922,26 @@ class CloudEdgeEnv(AECEnv):
                 return -float(self.resource_drop_penalty)
 
         # job执行成本
-        duration_cost = self._normalize(value=float(job.duration), scale=float(self.max_job_duration),)
+        # duration_cost = self._normalize(value=float(job.duration), scale=float(self.max_job_duration),)
 
         # 本地执行
         if action_type == "local_host":
-            local_cost = (self.execution_time_cost_weight * duration_cost)
+            local_cost = 0.0
 
             # 本地host执行，但是进入了等待队列
             if int(queue_length_after_action) > 0:
                 queue_length = float(queue_length_after_action)
+
                 # 评估等待队列拥挤程度，用queue_length + 1是为了让结果处于[0,1)
                 queue_congestion_ratio = (queue_length / (queue_length + 1.0))
-                current_waiting_time = max(float(self.current_time) - float(job.arrive_time),0.0,)
-                allowed_waiting_time = max(self.drop_deadline_ratio * float(job.duration),self.norm_eps,)
-                deadline_consumed_ratio = self._normalize(value=current_waiting_time, scale=allowed_waiting_time,)
+                elapsed_time = (self._get_elapsed_service_time(job))
+                pre_execution_sla_budget = max((self.sla_deadline_ratio - 1.0) * float(job.duration), self.norm_eps,)
+                sla_budget_consumed_ratio = float(np.clip(elapsed_time / pre_execution_sla_budget, 0.0, 1.0,))
                 # 综合排队风险
-                queue_admission_risk = (
-                        0.5 * queue_congestion_ratio +
-                        0.5 * deadline_consumed_ratio
-                )
+                queue_admission_risk = (0.5 * queue_congestion_ratio + 0.5 * sla_budget_consumed_ratio)
                 local_cost += (self.queue_admission_cost_weight * queue_admission_risk)
 
-
             return -float(local_cost)
-
-        # 卸载到其他 edge 或 cloud
-        # if action_type in {"edge_dc", "cloud"}:
-        #     transfer_latency = float(transfer_latency)
-        #     latency_cost = self._normalize(
-        #         value=transfer_latency,
-        #         scale=float(self.max_latency),
-        #     )
-        #     return -float(latency_cost)
 
         # 边边转发
         if action_type == "edge_dc":
@@ -1964,46 +1949,68 @@ class CloudEdgeEnv(AECEnv):
 
             edge_latency_cost = self._normalize(
                 value=transfer_latency,
-                scale=float(self.max_latency),
+                scale=float(
+                    self.max_edge_latency
+                ),
             )
 
-            # 任务允许等待的总时间。
-            allowed_waiting_time = max(
-                self.drop_deadline_ratio * float(job.duration),
-                self.norm_eps,
+            predicted_completion_time = (
+                self._predict_completion_time_if_start_now(
+                    job=job,
+                    extra_latency=transfer_latency,
+                )
             )
 
-            # 任务到当前时刻已经消耗的等待时间。
-            elapsed_waiting_time = max(
-                float(self.current_time) - float(job.arrive_time),
-                0.0,
-            )
-
-            # 当前任务剩余的 deadline budget。
-            remaining_waiting_budget = max(
-                allowed_waiting_time - elapsed_waiting_time,
-                self.norm_eps,
-            )
-
-            edge_deadline_risk_cost = self._normalize(
-                value=transfer_latency,
-                scale=remaining_waiting_budget,
+            predicted_sla_violation_degree = (
+                self._calculate_sla_violation_degree(
+                    job=job,
+                    completion_time=predicted_completion_time,
+                )
             )
 
             return -float(
                 self.edge_forward_base_penalty
-                + self.edge_latency_cost_weight * edge_latency_cost
-                + self.edge_deadline_risk_cost_weight * edge_deadline_risk_cost
+                + self.edge_latency_cost_weight
+                * edge_latency_cost
+                + self.sla_risk_cost_weight
+                * predicted_sla_violation_degree
             )
-            # return -float(self.edge_forward_base_penalty + self.edge_latency_cost_weight * edge_latency_cost)
+
 
         # 云边转发
         if action_type == "cloud":
-            transfer_latency = float(transfer_latency)
+            transfer_latency = float(
+                transfer_latency
+            )
 
-            cloud_latency_cost = self._normalize(value=transfer_latency, scale=float(self.max_latency),)
+            cloud_latency_cost = self._normalize(
+                value=transfer_latency,
+                scale=float(
+                    self.max_cloud_latency
+                ),
+            )
 
-            return -float(self.execution_time_cost_weight * duration_cost + self.cloud_latency_cost_weight * cloud_latency_cost)
+            # Cloud 与 Edge 使用完全相同的 SLA 定义。
+            predicted_completion_time = (
+                self._predict_completion_time_if_start_now(
+                    job=job,
+                    extra_latency=transfer_latency,
+                )
+            )
+
+            predicted_sla_violation_degree = (
+                self._calculate_sla_violation_degree(
+                    job=job,
+                    completion_time=predicted_completion_time,
+                )
+            )
+
+            return -float(
+                self.cloud_latency_cost_weight
+                * cloud_latency_cost
+                + self.sla_risk_cost_weight
+                * predicted_sla_violation_degree
+            )
 
     # 检查好一个 episode 是否结束
     def _check_episode_finished(self) -> bool:
