@@ -3,6 +3,10 @@ import numpy as np
 import random
 import math
 from environment.job import JobList
+from environment.energy_model import (
+    calculate_edge_host_power_components_w,
+    calculate_edge_host_total_power_w,
+)
 import networkx as nx
 import config as conf
 # import matplotlib.pyplot as plt
@@ -131,44 +135,10 @@ class Host:
 
     # Edge Host IT 功率模型
     def get_power_components(self) -> dict:
-
-        self.calculate_load()
-
-        cpu_idle_power = float(conf.EDGE_CPU_IDLE_POWER_W)
-        cpu_full_power = float(conf.EDGE_CPU_FULL_POWER_W)
-        gpu_idle_power = float(conf.EDGE_GPU_IDLE_POWER_W)
-        gpu_full_power = float(conf.EDGE_GPU_FULL_POWER_W)
-
-        idle_power = cpu_idle_power
-        # 判断host内有没有GPU，实际上查了数据集后发现都有GPU
-        has_gpu = (self.gpu_capacity_num > 0)
-        if has_gpu:
-            idle_power += gpu_idle_power
-        cpu_dynamic_power = (cpu_full_power - cpu_idle_power) * float(self.cpu_load)
-        if has_gpu:
-            gpu_dynamic_power = (gpu_full_power - gpu_idle_power) * math.log2(1.0 + float(self.gpu_load))
-        else:
-            gpu_dynamic_power = 0.0
-
-        total_power = (idle_power + cpu_dynamic_power + gpu_dynamic_power)
-        total_power = max(float(total_power), 0.0,)
-
-        return {
-            "idle_power_w": float(idle_power),
-            "cpu_dynamic_power_w": float(
-                cpu_dynamic_power
-            ),
-            "gpu_dynamic_power_w": float(
-                gpu_dynamic_power
-            ),
-            "total_power_w": float(
-                total_power
-            ),
-        }
+        return calculate_edge_host_power_components_w(host=self,)
 
     def get_total_power(self) -> float:
-        power_components = (self.get_power_components())
-        return float(power_components["total_power_w"])
+        return calculate_edge_host_total_power_w(host=self,)
 
 
     # 检查总容量能不能满足资源要求

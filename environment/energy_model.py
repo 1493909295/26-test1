@@ -50,3 +50,48 @@ def calculate_transfer_energy_j(latency_s: float,) -> float:
         float(conf.TRANSFER_RECEIVE_FIXED_ENERGY_J) +
         float(conf.TRANSFER_LATENCY_ENERGY_COEFFICIENT_W) * float(latency_s)
     )
+
+# 计算host当前功率
+def calculate_edge_host_power_components_w(host,) -> dict:
+
+    host.calculate_load()
+    cpu_load = float(host.cpu_load)
+    gpu_load = float(host.gpu_load)
+
+    cpu_idle_power_w = float(conf.EDGE_CPU_IDLE_POWER_W)
+    cpu_full_power_w = float(conf.EDGE_CPU_FULL_POWER_W)
+    gpu_idle_power_w = float(conf.EDGE_GPU_IDLE_POWER_W)
+    gpu_full_power_w = float(conf.EDGE_GPU_FULL_POWER_W)
+
+    idle_power_w = cpu_idle_power_w + gpu_idle_power_w
+    cpu_dynamic_power_w = (cpu_full_power_w - cpu_idle_power_w) * cpu_load
+    gpu_dynamic_power_w = (gpu_full_power_w - gpu_idle_power_w) * math.log2(1.0 + gpu_load)
+    total_power_w = (idle_power_w + cpu_dynamic_power_w + gpu_dynamic_power_w)
+
+    return {
+        "idle_power_w": float(idle_power_w),
+        "cpu_dynamic_power_w": float(cpu_dynamic_power_w),
+        "gpu_dynamic_power_w": float(gpu_dynamic_power_w),
+        "total_power_w": float(total_power_w),
+    }
+
+# 返回host总功率
+def calculate_edge_host_total_power_w(host,) -> float:
+    power_components = (calculate_edge_host_power_components_w(host=host,))
+
+    return float(power_components["total_power_w"])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
