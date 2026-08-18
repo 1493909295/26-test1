@@ -18,6 +18,15 @@ SLA_DEADLINE_RATIO = 2.0
 DROP_DEADLINE_RATIO = 2.5
 QUEUE_LENGTH_SCALE = 10.0      # 队列长度归一化使用参数（根据训练后最大等待队列的一半）
 ENV_KEEP_PATH = os.path.join(BASE_DIR, "./environment/env_keep")
+SIMULATION_TIME_UNIT = "s"     # 系统时间基本单位
+ENERGY_UNIT = "J"              # 系统能量基本单位
+EDGE_CPU_IDLE_POWER_W = 110.0       # edge host CPU 空闲功率
+EDGE_CPU_FULL_POWER_W = 170.0       # edge host CPU 满载功率
+EDGE_GPU_IDLE_POWER_W = 25.0        # edge host GPU 空闲功率
+EDGE_GPU_FULL_POWER_W = 250.0       # edge host CPU 满载功率
+EDGE_EDGE_TRANSFER_ENERGY_RATIO = 0.04      # e2e传输能耗系数
+EDGE_CLOUD_TRANSFER_ENERGY_RATIO = 0.10     # e2c传输能耗系数
+ENERGY_NORMALIZATION_PERCENTILE = 95.0      # 能耗归一化参数
 
 # 模型基本参数
 ACTOR_HIDDEN_DIM = 256      # actor-net 隐藏层维度
@@ -76,3 +85,11 @@ RESOURCE_DROP_PENALTY = 2.0             # 资源不足惩罚，其实已经不�
 COMPLETION_CREDIT_DECAY = 0.8           # 调度链奖励衰减参数
 FAILURE_CREDIT_DECAY = 0.8              # 调度链惩罚衰减参数
 
+# 能耗成本权重。
+#
+# 当前阶段必须保持为 0.0：
+# 先完成 Edge / Cloud / Transmission 能耗模型和日志统计，
+# 验证物理能耗计算正确以后，再逐步调高该权重。
+#
+# 这样当前这一步只建立能耗配置，不会改变现有 MASAC 的奖励函数和训练行为。
+ENERGY_COST_WEIGHT = 0.0
