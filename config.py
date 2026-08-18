@@ -18,15 +18,24 @@ SLA_DEADLINE_RATIO = 2.0
 DROP_DEADLINE_RATIO = 2.5
 QUEUE_LENGTH_SCALE = 10.0      # 队列长度归一化使用参数（根据训练后最大等待队列的一半）
 ENV_KEEP_PATH = os.path.join(BASE_DIR, "./environment/env_keep")
+
 SIMULATION_TIME_UNIT = "s"     # 系统时间基本单位
 ENERGY_UNIT = "J"              # 系统能量基本单位
 EDGE_CPU_IDLE_POWER_W = 110.0       # edge host CPU 空闲功率
 EDGE_CPU_FULL_POWER_W = 170.0       # edge host CPU 满载功率
 EDGE_GPU_IDLE_POWER_W = 25.0        # edge host GPU 空闲功率
-EDGE_GPU_FULL_POWER_W = 250.0       # edge host CPU 满载功率
-EDGE_EDGE_TRANSFER_ENERGY_RATIO = 0.04      # e2e传输能耗系数
-EDGE_CLOUD_TRANSFER_ENERGY_RATIO = 0.10     # e2c传输能耗系数
+EDGE_GPU_FULL_POWER_W = 250.0       # edge host GPU 满载功率
+# EDGE_EDGE_TRANSFER_ENERGY_RATIO = 0.04      # e2e传输能耗系数
+# EDGE_CLOUD_TRANSFER_ENERGY_RATIO = 0.10     # e2c传输能耗系数
+
+# 以下参数来源诡异，有待验证
 ENERGY_NORMALIZATION_PERCENTILE = 95.0      # 能耗归一化参数
+CLOUD_CPU_POWER_PER_UNIT_W = 0.4711         # cloud单位CPU功率
+CLOUD_GPU_POWER_PER_UNIT_W = 226.9522       # cloud单位GPU功率
+TRANSFER_SEND_FIXED_ENERGY_J = 866.1977     # 发送能耗
+TRANSFER_RECEIVE_FIXED_ENERGY_J = 866.1977  # 接收能耗
+TRANSFER_LATENCY_ENERGY_COEFFICIENT_W = 628.4384    # 传输功率
+
 
 # 模型基本参数
 ACTOR_HIDDEN_DIM = 256      # actor-net 隐藏层维度
