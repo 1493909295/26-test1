@@ -366,6 +366,923 @@ def count_waiting_jobs(env: Any) -> int:
             waiting_count += len(waiting_queue)
     return int(waiting_count)
 
+# 功能函数计算安全比例，避免分母为0日志出问题
+def safe_ratio(numerator: float, denominator: float,) -> float:
+    denominator = float(denominator)
+    if denominator <= 0.0:
+        return 0.0
+    return float(float(numerator) / denominator)
+
+# 日志用，计算资源占用情况
+def calculate_resource_timeline_metrics(jobs: list, episode_duration_s: float,) -> Dict[str, float]:
+    episode_duration_s = max(float(episode_duration_s), 0.0,)
+    cpu_resource_seconds = 0.0
+    gpu_resource_seconds = 0.0
+    running_job_seconds = 0.0
+    events: Dict[float, list] = {}
+    valid_running_jobs = 0
+
+    for job in jobs:
+        start_time = getattr(job, "start_time", None,)
+        finish_time = getattr(job, "finish_time", None,)
+
+        if (start_time is None or finish_time is None):
+            continue
+
+        start_time = float(start_time)
+        finish_time = float(finish_time)
+        run_time_s = max(finish_time - start_time, 0.0,)
+        cpu_request = float(getattr(job, "cpu_request", 0.0,))
+        gpu_request = float(getattr( job, "gpu_request", 0.0,))
+
+        cpu_resource_seconds += (cpu_request * run_time_s)
+        gpu_resource_seconds += (gpu_request * run_time_s)
+        running_job_seconds += (run_time_s)
+        valid_running_jobs += 1
+
+        if start_time not in events:
+            events[start_time] = [0.0, 0.0, 0,]
+        if finish_time not in events:
+            events[finish_time] = [0.0, 0.0, 0,]
+
+        # 任务开始：CPU/GPU/Running Count 增加。
+        events[start_time][0] += (cpu_request)
+        events[start_time][1] += (gpu_request)
+        events[start_time][2] += 1
+
+        # 任务结束：CPU/GPU/Running Count 释放。
+        events[finish_time][0] -= (cpu_request)
+        events[finish_time][1] -= (gpu_request)
+        events[finish_time][2] -= 1
+
+    current_used_cpu = 0.0
+    current_used_gpu = 0.0
+    current_running_jobs = 0
+
+    peak_used_cpu = 0.0
+    peak_used_gpu = 0.0
+    peak_running_jobs = 0
+
+    busy_time_s = 0.0
+    previous_event_time = 0.0
+
+    for event_time in sorted(events.keys()):
+        event_time = float(event_time)
+        interval_s = max(event_time - previous_event_time, 0.0,)
+
+        # 在前一个事件到当前事件之间，如果至少有一个 Job 在运行，则 Host/System 是 busy 状态。
+        if current_running_jobs > 0:
+            busy_time_s += (interval_s)
+
+        cpu_delta, gpu_delta, running_delta = (events[event_time])
+
+        current_used_cpu += float(cpu_delta)
+        current_used_gpu += float(gpu_delta)
+        current_running_jobs += int(running_delta)
+        # 防止浮点残差产生 -1e-15 一类值。
+        current_used_cpu = max(current_used_cpu, 0.0,)
+        current_used_gpu = max(current_used_gpu, 0.0,)
+        current_running_jobs = max(current_running_jobs, 0,)
+
+        peak_used_cpu = max(peak_used_cpu, current_used_cpu,)
+        peak_used_gpu = max(peak_used_gpu, current_used_gpu,)
+        peak_running_jobs = max(peak_running_jobs, current_running_jobs,)
+        previous_event_time = (event_time)
+
+    return {
+        "valid_running_jobs":
+            int(valid_running_jobs),
+        "cpu_resource_seconds":
+            float(cpu_resource_seconds),
+        "gpu_resource_seconds":
+            float(gpu_resource_seconds),
+        "avg_used_cpu":
+            safe_ratio(
+                cpu_resource_seconds,
+                episode_duration_s,
+            ),
+        "avg_used_gpu":
+            safe_ratio(
+                gpu_resource_seconds,
+                episode_duration_s,
+            ),
+        "peak_used_cpu":
+            float(peak_used_cpu),
+        "peak_used_gpu":
+            float(peak_used_gpu),
+        "avg_running_jobs":
+            safe_ratio(
+                running_job_seconds,
+                episode_duration_s,
+            ),
+        "peak_running_jobs":
+            int(peak_running_jobs),
+        "busy_time_s":
+            float(busy_time_s),
+        "busy_ratio":
+            safe_ratio(
+                busy_time_s,
+                episode_duration_s,
+            ),
+    }
+
+# Episode 级 Workload / Edge / Cloud Load 统计
+def calculate_episode_load_metrics(env: Any,) -> Dict[str, Any]:
+
+    episode_duration_s = max(float(getattr(env, "current_time", 0.0,)), 0.0,)
+    all_jobs = list(getattr(env, "jobs", [],))
+    cloud_id = str(getattr(env, "cloud_id", "cloud", ))
+
+    cpu_requests = np.asarray([float(getattr(job, "cpu_request", 0.0,)) for job in all_jobs],dtype=np.float64,)
+    gpu_requests = np.asarray([float(getattr(job, "gpu_request", 0.0,)) for job in all_jobs],dtype=np.float64,)
+    durations = np.asarray([float( getattr( job, "duration", 0.0,)) for job in all_jobs], dtype=np.float64,)
+    arrival_times = np.asarray([float(getattr(job, "arrive_time", 0.0,)) for job in all_jobs],dtype=np.float64,)
+
+    edge_jobs = []
+    cloud_jobs = []
+    edge_total_cpu_capacity = 0.0
+    edge_total_gpu_capacity = 0.0
+    edge_host_cpu_avg_loads = []
+    edge_host_gpu_avg_loads = []
+    edge_host_busy_ratios = []
+    edge_host_details = {}
+    dc_load_details = {}
+
+    for dc in getattr(env, "datacenters", [],):
+        dc_id = str(dc.dc_id)
+        is_cloud = (dc_id == cloud_id)
+        dc_jobs = []
+        dc_cpu_capacity = 0.0
+        dc_gpu_capacity = 0.0
+
+        for host_idx, host in enumerate(getattr(dc, "host_list", [],)):
+            completed_queue = getattr(host, "completed_queue", None,)
+            host_jobs = list(getattr(completed_queue, "_queue", [],))
+            dc_jobs.extend(host_jobs)
+            host_timeline = (
+                calculate_resource_timeline_metrics(
+                    jobs=host_jobs,
+                    episode_duration_s=episode_duration_s,
+                )
+            )
+
+            cpu_capacity = float(getattr(host, "cpu_num", 0.0,))
+            gpu_capacity = float(getattr(host, "gpu_capacity_num", 0.0,))
+
+            if not is_cloud:
+                dc_cpu_capacity += (cpu_capacity)
+                dc_gpu_capacity += (gpu_capacity)
+                edge_total_cpu_capacity += (cpu_capacity)
+                edge_total_gpu_capacity += (gpu_capacity)
+                avg_cpu_load = safe_ratio(host_timeline["avg_used_cpu"], cpu_capacity,)
+                peak_cpu_load = safe_ratio(host_timeline["peak_used_cpu"], cpu_capacity,)
+                avg_gpu_load = safe_ratio(host_timeline["avg_used_gpu"], gpu_capacity,)
+                peak_gpu_load = safe_ratio(host_timeline["peak_used_gpu"], gpu_capacity,)
+                edge_host_cpu_avg_loads.append(avg_cpu_load)
+
+                if gpu_capacity > 0.0:
+                    edge_host_gpu_avg_loads.append(avg_gpu_load)
+
+                edge_host_busy_ratios.append(float(host_timeline["busy_ratio"]))
+                edge_host_details[
+                    f"{dc_id}/{host.host_id}"
+                ] = {
+                    "cpu_capacity":cpu_capacity,
+                    "gpu_capacity":gpu_capacity,
+                    "completed_jobs":len(host_jobs),
+                    "avg_cpu_load":avg_cpu_load,
+                    "peak_cpu_load":peak_cpu_load,
+                    "avg_gpu_load":avg_gpu_load,
+                    "peak_gpu_load":peak_gpu_load,
+                    "avg_running_jobs":host_timeline["avg_running_jobs"],
+                    "peak_running_jobs":host_timeline["peak_running_jobs"],
+                    "busy_ratio":host_timeline["busy_ratio"],
+                }
+
+        dc_timeline = (calculate_resource_timeline_metrics(jobs=dc_jobs, episode_duration_s=episode_duration_s,))
+
+        if is_cloud:
+            cloud_jobs.extend(dc_jobs)
+            dc_load_details[dc_id] = {
+                "completed_jobs":len(dc_jobs),
+                "avg_used_cpu":dc_timeline["avg_used_cpu"],
+                "peak_used_cpu":dc_timeline["peak_used_cpu"],
+                "avg_used_gpu":dc_timeline["avg_used_gpu"],
+                "peak_used_gpu":dc_timeline[ "peak_used_gpu"],
+                "avg_running_jobs":dc_timeline["avg_running_jobs"],
+                "peak_running_jobs":dc_timeline["peak_running_jobs"],
+                "busy_ratio":dc_timeline[ "busy_ratio"],
+            }
+
+        else:
+            edge_jobs.extend(dc_jobs)
+            dc_load_details[dc_id] = {
+                "cpu_capacity":dc_cpu_capacity,
+                "gpu_capacity":dc_gpu_capacity,
+                "completed_jobs":len(dc_jobs),
+                "avg_cpu_load":safe_ratio(dc_timeline["avg_used_cpu"],dc_cpu_capacity,),
+                "peak_cpu_load":safe_ratio(dc_timeline["peak_used_cpu"],dc_cpu_capacity,),
+                "avg_gpu_load":safe_ratio(dc_timeline["avg_used_gpu"], dc_gpu_capacity,),
+                "peak_gpu_load":safe_ratio(dc_timeline["peak_used_gpu"],dc_gpu_capacity,),
+                "avg_running_jobs":dc_timeline["avg_running_jobs"],
+                "peak_running_jobs": dc_timeline["peak_running_jobs"],
+                "busy_ratio":dc_timeline["busy_ratio"],
+            }
+
+    edge_timeline = (calculate_resource_timeline_metrics(jobs=edge_jobs, episode_duration_s=episode_duration_s,))
+    cloud_timeline = (calculate_resource_timeline_metrics(jobs=cloud_jobs,episode_duration_s=episode_duration_s,))
+    edge_cpu_host_mean = (float(np.mean(edge_host_cpu_avg_loads))
+        if edge_host_cpu_avg_loads
+        else 0.0
+    )
+    edge_cpu_host_std = (float(np.std(edge_host_cpu_avg_loads))
+        if edge_host_cpu_avg_loads
+        else 0.0
+    )
+    edge_cpu_host_p95 = (float(np.percentile(edge_host_cpu_avg_loads,95,))
+        if edge_host_cpu_avg_loads
+        else 0.0
+    )
+    edge_gpu_host_mean = (float(np.mean(edge_host_gpu_avg_loads))
+        if edge_host_gpu_avg_loads
+        else 0.0
+    )
+    edge_gpu_host_std = (float(np.std(edge_host_gpu_avg_loads))
+        if edge_host_gpu_avg_loads
+        else 0.0
+    )
+
+    if len(arrival_times) >= 2:
+        arrival_span_s = float(np.max(arrival_times) - np.min(arrival_times))
+        observed_arrival_rate = safe_ratio(len(arrival_times) - 1, arrival_span_s,)
+
+    else:
+        arrival_span_s = 0.0
+        observed_arrival_rate = 0.0
+
+    return {
+
+        "workload_total_cpu_request":
+            float(np.sum(cpu_requests))
+            if cpu_requests.size
+            else 0.0,
+
+        "workload_mean_cpu_request":
+            float(
+                np.mean(cpu_requests)
+            )
+            if cpu_requests.size
+            else 0.0,
+
+        "workload_max_cpu_request":
+            float(
+                np.max(cpu_requests)
+            )
+            if cpu_requests.size
+            else 0.0,
+
+        "workload_total_gpu_request":
+            float(
+                np.sum(gpu_requests)
+            )
+            if gpu_requests.size
+            else 0.0,
+
+        "workload_mean_gpu_request":
+            float(
+                np.mean(gpu_requests)
+            )
+            if gpu_requests.size
+            else 0.0,
+
+        "workload_max_gpu_request":
+            float(
+                np.max(gpu_requests)
+            )
+            if gpu_requests.size
+            else 0.0,
+
+        "workload_gpu_job_ratio":
+            float(
+                np.mean(
+                    gpu_requests > 0.0
+                )
+            )
+            if gpu_requests.size
+            else 0.0,
+
+        "workload_total_duration_s":
+            float(
+                np.sum(durations)
+            )
+            if durations.size
+            else 0.0,
+
+        "workload_mean_duration_s":
+            float(
+                np.mean(durations)
+            )
+            if durations.size
+            else 0.0,
+
+        "workload_p95_duration_s":
+            float(
+                np.percentile(
+                    durations,
+                    95,
+                )
+            )
+            if durations.size
+            else 0.0,
+
+        "workload_max_duration_s":
+            float(
+                np.max(durations)
+            )
+            if durations.size
+            else 0.0,
+
+        "workload_arrival_span_s":
+            arrival_span_s,
+
+        "workload_observed_arrival_rate":
+            observed_arrival_rate,
+
+        "edge_completed_jobs":
+            int(
+                len(edge_jobs)
+            ),
+
+        "edge_total_cpu_capacity":
+            float(
+                edge_total_cpu_capacity
+            ),
+
+        "edge_total_gpu_capacity":
+            float(
+                edge_total_gpu_capacity
+            ),
+
+        "edge_cpu_resource_seconds":
+            float(
+                edge_timeline[
+                    "cpu_resource_seconds"
+                ]
+            ),
+
+        "edge_gpu_resource_seconds":
+            float(
+                edge_timeline[
+                    "gpu_resource_seconds"
+                ]
+            ),
+
+        # 整个 Edge 系统容量加权、时间加权平均负载。
+        "edge_avg_cpu_load":
+            safe_ratio(
+                edge_timeline[
+                    "avg_used_cpu"
+                ],
+                edge_total_cpu_capacity,
+            ),
+
+        "edge_peak_cpu_load":
+            safe_ratio(
+                edge_timeline[
+                    "peak_used_cpu"
+                ],
+                edge_total_cpu_capacity,
+            ),
+
+        "edge_avg_gpu_load":
+            safe_ratio(
+                edge_timeline[
+                    "avg_used_gpu"
+                ],
+                edge_total_gpu_capacity,
+            ),
+
+        "edge_peak_gpu_load":
+            safe_ratio(
+                edge_timeline[
+                    "peak_used_gpu"
+                ],
+                edge_total_gpu_capacity,
+            ),
+
+        "edge_avg_running_jobs":
+            float(
+                edge_timeline[
+                    "avg_running_jobs"
+                ]
+            ),
+
+        "edge_peak_running_jobs":
+            int(
+                edge_timeline[
+                    "peak_running_jobs"
+                ]
+            ),
+
+        # 每台 Edge Host 平均 CPU Load 的均值、标准差、P95。
+        #
+        # std 越大说明长期负载越不均衡。
+        "edge_host_avg_cpu_load_mean":
+            edge_cpu_host_mean,
+
+        "edge_host_avg_cpu_load_std":
+            edge_cpu_host_std,
+
+        "edge_host_avg_cpu_load_p95":
+            edge_cpu_host_p95,
+
+        "edge_host_avg_gpu_load_mean":
+            edge_gpu_host_mean,
+
+        "edge_host_avg_gpu_load_std":
+            edge_gpu_host_std,
+
+        "edge_host_busy_ratio_mean":
+            float(
+                np.mean(
+                    edge_host_busy_ratios
+                )
+            )
+            if edge_host_busy_ratios
+            else 0.0,
+
+        "edge_host_busy_ratio_max":
+            float(
+                np.max(
+                    edge_host_busy_ratios
+                )
+            )
+            if edge_host_busy_ratios
+            else 0.0,
+
+        "cloud_completed_jobs":
+            int(
+                len(cloud_jobs)
+            ),
+
+        "cloud_cpu_resource_seconds":
+            float(
+                cloud_timeline[
+                    "cpu_resource_seconds"
+                ]
+            ),
+
+        "cloud_gpu_resource_seconds":
+            float(
+                cloud_timeline[
+                    "gpu_resource_seconds"
+                ]
+            ),
+
+        "cloud_avg_used_cpu":
+            float(
+                cloud_timeline[
+                    "avg_used_cpu"
+                ]
+            ),
+
+        "cloud_peak_used_cpu":
+            float(
+                cloud_timeline[
+                    "peak_used_cpu"
+                ]
+            ),
+
+        "cloud_avg_used_gpu":
+            float(
+                cloud_timeline[
+                    "avg_used_gpu"
+                ]
+            ),
+
+        "cloud_peak_used_gpu":
+            float(
+                cloud_timeline[
+                    "peak_used_gpu"
+                ]
+            ),
+
+        "cloud_avg_running_jobs":
+            float(
+                cloud_timeline[
+                    "avg_running_jobs"
+                ]
+            ),
+
+        "cloud_peak_running_jobs":
+            int(
+                cloud_timeline[
+                    "peak_running_jobs"
+                ]
+            ),
+
+        "cloud_busy_ratio":
+            float(
+                cloud_timeline[
+                    "busy_ratio"
+                ]
+            ),
+
+        "dc_load_details":
+            json.dumps(
+                dc_load_details,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+
+        "edge_host_load_details":
+            json.dumps(
+                edge_host_details,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+    }
+
+# Episode Energy / Power 统计
+def calculate_episode_energy_metrics(env: Any,) -> Dict[str, float]:
+
+    simulation_end_time_s = float(getattr(env,"current_time", 0.0,))
+
+    energy_end_time_s = float(
+        getattr(
+            env,
+            "last_energy_update_time",
+            simulation_end_time_s,
+        )
+    )
+
+    energy_time_s = max(
+        energy_end_time_s,
+        0.0,
+    )
+
+
+    edge_idle_energy_j = float(
+        getattr(
+            env,
+            "edge_idle_energy_j",
+            0.0,
+        )
+    )
+
+    edge_cpu_dynamic_energy_j = float(
+        getattr(
+            env,
+            "edge_cpu_dynamic_energy_j",
+            0.0,
+        )
+    )
+
+    edge_gpu_dynamic_energy_j = float(
+        getattr(
+            env,
+            "edge_gpu_dynamic_energy_j",
+            0.0,
+        )
+    )
+
+    cloud_compute_energy_j = float(
+        getattr(
+            env,
+            "cloud_compute_energy_j",
+            0.0,
+        )
+    )
+
+    transfer_energy_j = float(
+        getattr(
+            env,
+            "transfer_energy_j",
+            0.0,
+        )
+    )
+
+    edge_edge_transfer_energy_j = float(
+        getattr(
+            env,
+            "edge_edge_transfer_energy_j",
+            0.0,
+        )
+    )
+
+    edge_cloud_transfer_energy_j = float(
+        getattr(
+            env,
+            "edge_cloud_transfer_energy_j",
+            0.0,
+        )
+    )
+
+
+    edge_total_energy_j = (
+        edge_idle_energy_j
+        + edge_cpu_dynamic_energy_j
+        + edge_gpu_dynamic_energy_j
+    )
+
+    system_compute_energy_j = (
+        edge_total_energy_j
+        + cloud_compute_energy_j
+    )
+
+    system_dynamic_compute_energy_j = (
+        edge_cpu_dynamic_energy_j
+        + edge_gpu_dynamic_energy_j
+        + cloud_compute_energy_j
+    )
+
+    total_system_energy_j = (
+        system_compute_energy_j
+        + transfer_energy_j
+    )
+
+
+    all_jobs = list(
+        getattr(
+            env,
+            "jobs",
+            [],
+        )
+    )
+
+    task_compute_energy_j = sum(
+        float(
+            getattr(
+                job,
+                "compute_energy_j",
+                0.0,
+            )
+        )
+        for job in all_jobs
+    )
+
+    task_transfer_energy_j = sum(
+        float(
+            getattr(
+                job,
+                "transfer_energy_j",
+                0.0,
+            )
+        )
+        for job in all_jobs
+    )
+
+    task_edge_edge_transfer_energy_j = sum(
+        float(
+            getattr(
+                job,
+                "edge_edge_transfer_energy_j",
+                0.0,
+            )
+        )
+        for job in all_jobs
+    )
+
+    task_edge_cloud_transfer_energy_j = sum(
+        float(
+            getattr(
+                job,
+                "edge_cloud_transfer_energy_j",
+                0.0,
+            )
+        )
+        for job in all_jobs
+    )
+
+    task_attributable_energy_j = (
+        task_compute_energy_j
+        + task_transfer_energy_j
+    )
+
+
+    total_jobs = len(
+        all_jobs
+    )
+
+    completed_jobs = count_completed_jobs(
+        env
+    )
+
+
+
+    # 系统 Transmission 总量应该与 EE + EC 严格一致。
+    transfer_split_gap_j = (
+        transfer_energy_j
+        - edge_edge_transfer_energy_j
+        - edge_cloud_transfer_energy_j
+    )
+
+    # 系统账本与全部 Job 的 Transmission attribution
+    # 正常情况下也应该一致。
+    transfer_job_accounting_gap_j = (
+        transfer_energy_j
+        - task_transfer_energy_j
+    )
+
+    # Energy clock 与 Simulation clock 应在 Episode 结束时一致。
+    energy_time_gap_s = (
+        simulation_end_time_s
+        - energy_end_time_s
+    )
+
+
+    return {
+
+        "episode_energy_time_s":
+            energy_time_s,
+
+        "energy_time_gap_s":
+            float(
+                energy_time_gap_s
+            ),
+
+        "edge_idle_energy_j":
+            edge_idle_energy_j,
+
+        "edge_cpu_dynamic_energy_j":
+            edge_cpu_dynamic_energy_j,
+
+        "edge_gpu_dynamic_energy_j":
+            edge_gpu_dynamic_energy_j,
+
+        "edge_total_energy_j":
+            edge_total_energy_j,
+
+        "cloud_compute_energy_j":
+            cloud_compute_energy_j,
+
+        "system_compute_energy_j":
+            system_compute_energy_j,
+
+        "system_dynamic_compute_energy_j":
+            system_dynamic_compute_energy_j,
+
+        "transfer_energy_j":
+            transfer_energy_j,
+
+        "edge_edge_transfer_energy_j":
+            edge_edge_transfer_energy_j,
+
+        "edge_cloud_transfer_energy_j":
+            edge_cloud_transfer_energy_j,
+
+        "total_system_energy_j":
+            total_system_energy_j,
+
+        "total_system_energy_kwh":
+            total_system_energy_j
+            / 3_600_000.0,
+
+
+        "edge_idle_avg_power_w":
+            safe_ratio(
+                edge_idle_energy_j,
+                energy_time_s,
+            ),
+
+        "edge_cpu_dynamic_avg_power_w":
+            safe_ratio(
+                edge_cpu_dynamic_energy_j,
+                energy_time_s,
+            ),
+
+        "edge_gpu_dynamic_avg_power_w":
+            safe_ratio(
+                edge_gpu_dynamic_energy_j,
+                energy_time_s,
+            ),
+
+        "edge_total_avg_power_w":
+            safe_ratio(
+                edge_total_energy_j,
+                energy_time_s,
+            ),
+
+        "cloud_compute_avg_power_w":
+            safe_ratio(
+                cloud_compute_energy_j,
+                energy_time_s,
+            ),
+
+        "system_compute_avg_power_w":
+            safe_ratio(
+                system_compute_energy_j,
+                energy_time_s,
+            ),
+
+        # Transmission 模型是离散一次性 Energy，
+        # 这里写的是 Episode horizon 上的等效平均能量率，
+        # 不是单条链路的瞬时物理功率。
+        "transfer_equivalent_avg_power_w":
+            safe_ratio(
+                transfer_energy_j,
+                energy_time_s,
+            ),
+
+        "system_total_equivalent_avg_power_w":
+            safe_ratio(
+                total_system_energy_j,
+                energy_time_s,
+            ),
+
+
+        "edge_idle_energy_share":
+            safe_ratio(
+                edge_idle_energy_j,
+                total_system_energy_j,
+            ),
+
+        "edge_cpu_dynamic_energy_share":
+            safe_ratio(
+                edge_cpu_dynamic_energy_j,
+                total_system_energy_j,
+            ),
+
+        "edge_gpu_dynamic_energy_share":
+            safe_ratio(
+                edge_gpu_dynamic_energy_j,
+                total_system_energy_j,
+            ),
+
+        "cloud_compute_energy_share":
+            safe_ratio(
+                cloud_compute_energy_j,
+                total_system_energy_j,
+            ),
+
+        "transfer_energy_share":
+            safe_ratio(
+                transfer_energy_j,
+                total_system_energy_j,
+            ),
+
+
+        "system_energy_per_completed_job_j":
+            safe_ratio(
+                total_system_energy_j,
+                completed_jobs,
+            ),
+
+        "system_energy_per_total_job_j":
+            safe_ratio(
+                total_system_energy_j,
+                total_jobs,
+            ),
+
+        "task_compute_energy_j":
+            float(
+                task_compute_energy_j
+            ),
+
+        "task_transfer_energy_j":
+            float(
+                task_transfer_energy_j
+            ),
+
+        "task_attributable_energy_j":
+            float(
+                task_attributable_energy_j
+            ),
+
+        "task_compute_energy_per_completed_job_j":
+            safe_ratio(
+                task_compute_energy_j,
+                completed_jobs,
+            ),
+
+        "task_attributable_energy_per_total_job_j":
+            safe_ratio(
+                task_attributable_energy_j,
+                total_jobs,
+            ),
+
+
+        "transfer_split_gap_j":
+            float(
+                transfer_split_gap_j
+            ),
+
+        "transfer_job_accounting_gap_j":
+            float(
+                transfer_job_accounting_gap_j
+            ),
+
+        "task_edge_edge_transfer_energy_j":
+            float(
+                task_edge_edge_transfer_energy_j
+            ),
+
+        "task_edge_cloud_transfer_energy_j":
+            float(
+                task_edge_cloud_transfer_energy_j
+            ),
+    }
+
 # 根据模型文件路径生成配套的训练器状态 JSON 路径
 def checkpoint_state_path(model_path: Path) -> Path:
     return model_path.with_suffix(".trainer.json")
@@ -518,6 +1435,8 @@ def build_episode_log_row(
     max_waiting_queue_length = int(getattr( env, "max_waiting_queue_length", 0,))
     remaining_waiting_jobs = count_waiting_jobs(env)
     service_metrics = calculate_service_metrics(env)
+    energy_metrics = (calculate_episode_energy_metrics(env))
+    load_metrics = (calculate_episode_load_metrics(env))
 
     # 返回固定列顺序的字典。
     return {
@@ -533,10 +1452,18 @@ def build_episode_log_row(
         "edge_action_count": int(stats.edge_action_count),
         "cloud_action_count": int(stats.cloud_action_count),
         "drop_action_count": int(stats.drop_action_count),
+        "local_action_rate": safe_ratio(stats.local_action_count, stats.decision_count,),
+        "edge_action_rate": safe_ratio(stats.edge_action_count,stats.decision_count,),
+        "cloud_action_rate": safe_ratio(stats.cloud_action_count,stats.decision_count,),
+        "drop_action_rate": safe_ratio(stats.drop_action_count, stats.decision_count,),
         # "unknown_action_count": int(stats.unknown_action_count),
         "total_jobs": total_jobs,
         "completed_jobs": completed_jobs,
         "dropped_jobs": dropped_jobs,
+        "completion_rate": safe_ratio(completed_jobs, total_jobs,),
+        "drop_rate": safe_ratio(dropped_jobs, total_jobs,),
+        "queue_admission_rate": safe_ratio( queued_jobs,total_jobs,),
+        "waiting_timeout_drop_rate": safe_ratio(waiting_timeout_drops, total_jobs,),
         "sla_satisfied_jobs": int(service_metrics["sla_satisfied_jobs"]),
         "sla_violated_completed_jobs": int(service_metrics["sla_violated_completed_jobs"]),
         "sla_satisfaction_rate": float(service_metrics["sla_satisfaction_rate"]),
@@ -570,11 +1497,184 @@ def build_episode_log_row(
         "mean_q2": stats.mean_metric("mean_q2"),
         "mean_target_q": stats.mean_metric("mean_target_q"),
         "wall_time_seconds": float(wall_time_seconds),
+        "workload_total_cpu_request":load_metrics["workload_total_cpu_request"],
+        "workload_mean_cpu_request":load_metrics["workload_mean_cpu_request"],
+        "workload_max_cpu_request":load_metrics["workload_max_cpu_request"],
+        "workload_total_gpu_request":load_metrics["workload_total_gpu_request"],
+        "workload_mean_gpu_request":load_metrics["workload_mean_gpu_request"],
+        "workload_max_gpu_request":load_metrics["workload_max_gpu_request"],
+        "workload_gpu_job_ratio":load_metrics["workload_gpu_job_ratio"],
+        "workload_total_duration_s":load_metrics["workload_total_duration_s"],
+        "workload_mean_duration_s": load_metrics["workload_mean_duration_s"],
+        "workload_p95_duration_s":load_metrics["workload_p95_duration_s"],
+        "workload_max_duration_s":load_metrics["workload_max_duration_s"],
+        "workload_arrival_span_s":load_metrics["workload_arrival_span_s"],
+        "workload_observed_arrival_rate":load_metrics["workload_observed_arrival_rate"],
+        "edge_completed_jobs":load_metrics["edge_completed_jobs"],
+        "edge_total_cpu_capacity":load_metrics["edge_total_cpu_capacity"],
+        "edge_total_gpu_capacity":load_metrics["edge_total_gpu_capacity"],
+        "edge_cpu_resource_seconds":load_metrics["edge_cpu_resource_seconds"],
+        "edge_gpu_resource_seconds":load_metrics["edge_gpu_resource_seconds"],
+        "edge_avg_cpu_load":load_metrics["edge_avg_cpu_load"],
+        "edge_peak_cpu_load":load_metrics[ "edge_peak_cpu_load"],
+        "edge_avg_gpu_load":load_metrics["edge_avg_gpu_load"],
+        "edge_peak_gpu_load":load_metrics["edge_peak_gpu_load"],
+        "edge_avg_running_jobs":load_metrics["edge_avg_running_jobs"],
+        "edge_peak_running_jobs":load_metrics["edge_peak_running_jobs"],
+        "edge_host_avg_cpu_load_mean":load_metrics["edge_host_avg_cpu_load_mean"],
+        "edge_host_avg_cpu_load_std":load_metrics["edge_host_avg_cpu_load_std"],
+        "edge_host_avg_cpu_load_p95":load_metrics["edge_host_avg_cpu_load_p95"],
+        "edge_host_avg_gpu_load_mean": load_metrics[ "edge_host_avg_gpu_load_mean"],
+        "edge_host_avg_gpu_load_std":load_metrics["edge_host_avg_gpu_load_std"],
+        "edge_host_busy_ratio_mean":load_metrics["edge_host_busy_ratio_mean"],
+        "edge_host_busy_ratio_max":load_metrics["edge_host_busy_ratio_max"],
+        "cloud_completed_jobs":load_metrics["cloud_completed_jobs"],
+        "cloud_cpu_resource_seconds":load_metrics[ "cloud_cpu_resource_seconds"],
+        "cloud_gpu_resource_seconds":load_metrics[ "cloud_gpu_resource_seconds"],
+        "cloud_avg_used_cpu":load_metrics["cloud_avg_used_cpu"],
+        "cloud_peak_used_cpu":load_metrics[ "cloud_peak_used_cpu"],
+        "cloud_avg_used_gpu": load_metrics["cloud_avg_used_gpu"],
+        "cloud_peak_used_gpu":load_metrics["cloud_peak_used_gpu"],
+        "cloud_avg_running_jobs":load_metrics["cloud_avg_running_jobs"],
+        "cloud_peak_running_jobs":load_metrics["cloud_peak_running_jobs"],
+        "cloud_busy_ratio": load_metrics["cloud_busy_ratio" ],
+        "episode_energy_time_s":energy_metrics["episode_energy_time_s"],
+        "energy_time_gap_s":energy_metrics["energy_time_gap_s"],
+        "edge_idle_energy_j":energy_metrics["edge_idle_energy_j"],
+        "edge_cpu_dynamic_energy_j":energy_metrics["edge_cpu_dynamic_energy_j"],
+        "edge_gpu_dynamic_energy_j":energy_metrics["edge_gpu_dynamic_energy_j"],
+        "edge_total_energy_j":energy_metrics["edge_total_energy_j"],
+        "cloud_compute_energy_j":energy_metrics["cloud_compute_energy_j"],
+        "system_compute_energy_j":energy_metrics["system_compute_energy_j"],
+        "system_dynamic_compute_energy_j":energy_metrics["system_dynamic_compute_energy_j"],
+        "transfer_energy_j":energy_metrics["transfer_energy_j"],
+        "edge_edge_transfer_energy_j":energy_metrics["edge_edge_transfer_energy_j"],
+        "edge_cloud_transfer_energy_j":energy_metrics["edge_cloud_transfer_energy_j"],
+        "total_system_energy_j":energy_metrics["total_system_energy_j"],
+        "total_system_energy_kwh":energy_metrics["total_system_energy_kwh"],
+        "edge_idle_avg_power_w":
+            energy_metrics[
+                "edge_idle_avg_power_w"
+            ],
+
+        "edge_cpu_dynamic_avg_power_w":
+            energy_metrics[
+                "edge_cpu_dynamic_avg_power_w"
+            ],
+
+        "edge_gpu_dynamic_avg_power_w":
+            energy_metrics[
+                "edge_gpu_dynamic_avg_power_w"
+            ],
+
+        "edge_total_avg_power_w":
+            energy_metrics[
+                "edge_total_avg_power_w"
+            ],
+
+        "cloud_compute_avg_power_w":
+            energy_metrics[
+                "cloud_compute_avg_power_w"
+            ],
+
+        "system_compute_avg_power_w":
+            energy_metrics[
+                "system_compute_avg_power_w"
+            ],
+
+        "transfer_equivalent_avg_power_w":
+            energy_metrics[
+                "transfer_equivalent_avg_power_w"
+            ],
+
+        "system_total_equivalent_avg_power_w":
+            energy_metrics[
+                "system_total_equivalent_avg_power_w"
+            ],
+        "edge_idle_energy_share":
+            energy_metrics[
+                "edge_idle_energy_share"
+            ],
+
+        "edge_cpu_dynamic_energy_share":
+            energy_metrics[
+                "edge_cpu_dynamic_energy_share"
+            ],
+
+        "edge_gpu_dynamic_energy_share":
+            energy_metrics[
+                "edge_gpu_dynamic_energy_share"
+            ],
+
+        "cloud_compute_energy_share":
+            energy_metrics[
+                "cloud_compute_energy_share"
+            ],
+
+        "transfer_energy_share":
+            energy_metrics[
+                "transfer_energy_share"
+            ],
+        "task_compute_energy_j":
+            energy_metrics[
+                "task_compute_energy_j"
+            ],
+
+        "task_transfer_energy_j":
+            energy_metrics[
+                "task_transfer_energy_j"
+            ],
+
+        "task_attributable_energy_j":
+            energy_metrics[
+                "task_attributable_energy_j"
+            ],
+
+        "task_compute_energy_per_completed_job_j":
+            energy_metrics[
+                "task_compute_energy_per_completed_job_j"
+            ],
+
+        "task_attributable_energy_per_total_job_j":
+            energy_metrics[
+                "task_attributable_energy_per_total_job_j"
+            ],
+
+        "system_energy_per_completed_job_j":
+            energy_metrics[
+                "system_energy_per_completed_job_j"
+            ],
+
+        "system_energy_per_total_job_j":
+            energy_metrics[
+                "system_energy_per_total_job_j"
+            ],
+        "transfer_split_gap_j":
+            energy_metrics[
+                "transfer_split_gap_j"
+            ],
+
+        "transfer_job_accounting_gap_j":
+            energy_metrics[
+                "transfer_job_accounting_gap_j"
+            ],
         "per_agent_returns": json.dumps(
             stats.per_agent_returns,
             ensure_ascii=False,
             sort_keys=True,
         ),
+        # 每个 DC 的 Episode 负载详细信息。
+        "dc_load_details":
+            load_metrics[
+                "dc_load_details"
+            ],
+
+        # 每一台 Edge Host 的 Episode 负载详细信息。
+        "edge_host_load_details":
+            load_metrics[
+                "edge_host_load_details"
+            ],
+
     }
 
 # 打印episode摘要
@@ -590,21 +1690,62 @@ def print_episode_summary(row: Dict[str, Any]) -> None:
     )
 
     # 打印主要训练指标。
+    # 打印 Episode 核心训练指标。
     print(
         f"Episode {int(row['episode']):5d} | "
         f"return={float(row['episode_return']):9.4f} | "
-        f"sla_sat={float(row['sla_satisfaction_rate']):6.2%} | "
         f"sla_vio={float(row['sla_violation_rate']):6.2%} | "
-        f"avg_T={float(row['avg_completion_time']):8.2f} | "
-        f"sum_T={float(row['total_completion_time']):10.2f} | "
-        f"decisions={int(row['decision_count']):6d} | "
+        f"avg_T={float(row['avg_completion_time']):8.2f}s | "
         f"completed={int(row['completed_jobs']):5d} | "
         f"dropped={int(row['dropped_jobs']):5d} | "
-        f"queued={int(row['queued_jobs']):5d} | "
-        f"wait_started={int(row['started_from_waiting_jobs']):5d} | "
-        f"wait_timeout={int(row['waiting_timeout_drops']):5d} | "
-        f"max_wait={int(row['max_waiting_queue_length']):4d} | "
-        f"remain_wait={int(row['remaining_waiting_jobs']):4d} | "
+        f"local={int(row['local_action_count']):5d} | "
+        f"edge={int(row['edge_action_count']):5d} | "
+        f"cloud={int(row['cloud_action_count']):5d}"
+    )
+
+    # 打印本轮负载情况。
+    print(
+        f"  Load   | "
+        f"EdgeCPU(avg/peak)="
+        f"{float(row['edge_avg_cpu_load']):6.2%}/"
+        f"{float(row['edge_peak_cpu_load']):6.2%} | "
+        f"EdgeGPU(avg/peak)="
+        f"{float(row['edge_avg_gpu_load']):6.2%}/"
+        f"{float(row['edge_peak_gpu_load']):6.2%} | "
+        f"HostCPUStd="
+        f"{float(row['edge_host_avg_cpu_load_std']):6.2%} | "
+        f"CloudCPU(avg/peak)="
+        f"{float(row['cloud_avg_used_cpu']):8.2f}/"
+        f"{float(row['cloud_peak_used_cpu']):8.2f} | "
+        f"CloudGPU(avg/peak)="
+        f"{float(row['cloud_avg_used_gpu']):8.2f}/"
+        f"{float(row['cloud_peak_used_gpu']):8.2f}"
+    )
+
+    # 打印本轮 Energy / Power。
+    print(
+        f"  Energy | "
+        f"total="
+        f"{float(row['total_system_energy_kwh']):10.6f} kWh | "
+        f"per_job="
+        f"{float(row['system_energy_per_completed_job_j']):10.2f} J | "
+        f"avgP="
+        f"{float(row['system_total_equivalent_avg_power_w']):10.2f} W | "
+        f"EdgeIdle="
+        f"{float(row['edge_idle_energy_share']):6.2%} | "
+        f"EdgeCPU="
+        f"{float(row['edge_cpu_dynamic_energy_share']):6.2%} | "
+        f"EdgeGPU="
+        f"{float(row['edge_gpu_dynamic_energy_share']):6.2%} | "
+        f"Cloud="
+        f"{float(row['cloud_compute_energy_share']):6.2%} | "
+        f"Transfer="
+        f"{float(row['transfer_energy_share']):6.2%}"
+    )
+
+    # MASAC 本身训练状态。
+    print(
+        f"  MASAC  | "
         f"buffer={int(row['replay_trainable_size']):7d} | "
         f"updates={int(row['episode_updates']):5d} | "
         f"critic_loss={critic_loss_text} | "

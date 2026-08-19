@@ -1,7 +1,0 @@
-﻿datacenter_id,cloud_latency_ms,edge_topology_links
-DC-1,80.15,DC-2(12.73ms); DC-3(13.09ms); DC-4(11.36ms); DC-5(10.49ms); cloud(80.15ms)
-DC-2,101.04,DC-1(12.73ms); DC-3(15.75ms); DC-4(10.05ms); DC-5(9.18ms); cloud(101.04ms)
-DC-3,101.48,DC-1(13.09ms); DC-2(15.75ms); DC-4(14.2ms); DC-5(15.39ms); cloud(101.48ms)
-DC-4,128.7,DC-1(11.36ms); DC-2(10.05ms); DC-3(14.2ms); DC-5(11.37ms); cloud(128.7ms)
-DC-5,96.18,DC-1(10.49ms); DC-2(9.18ms); DC-3(15.39ms); DC-4(11.37ms); cloud(96.18ms)
-cloud,0.0,DC-1(80.15ms); DC-2(101.04ms); DC-3(101.48ms); DC-4(128.7ms); DC-5(96.18ms)
