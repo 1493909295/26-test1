@@ -24,6 +24,12 @@ class Job:
         self.start_time = None
         self.finish_time = None
 
+        # 任务级能耗记录
+        self.compute_energy_j = 0.0
+        self.transfer_energy_j = 0.0
+        self.edge_edge_transfer_energy_j = 0.0
+        self.edge_cloud_transfer_energy_j = 0.0
+
 
     # 更新任务所属数据中心
     def set_target_datacenter(self, datacenter_id):
@@ -40,6 +46,26 @@ class Job:
     # 记录任务结束时间
     def mark_as_finished(self, current_time):
         self.finish_time = current_time
+
+    # 设置当前任务最终的可归因计算能耗
+    def set_compute_energy(self, energy_j):
+        self.compute_energy_j = float(energy_j)
+
+    # 累计一次 Edge -> Edge 转发产生的传输能耗
+    def add_edge_edge_transfer_energy(self, energy_j):
+        energy_j = float(energy_j)
+        self.edge_edge_transfer_energy_j += (energy_j)
+        self.transfer_energy_j += (energy_j)
+
+    # 累计一次 Edge -> Cloud 转发产生的传输能耗
+    def add_edge_cloud_transfer_energy(self, energy_j):
+        energy_j = float(energy_j)
+        self.edge_cloud_transfer_energy_j += (energy_j)
+        self.transfer_energy_j += (energy_j)
+
+    # 返回当前任务已经产生的总可归因能耗
+    def get_total_attributable_energy(self):
+        return float(self.compute_energy_j + self.transfer_energy_j)
 
     # 计算任务等待时间：开始时间 - 到达时间
     def get_waiting_time(self):
@@ -68,6 +94,15 @@ class Job:
         # 如果任务已完成，顺便打印计算出的等待和周转时间
         if self.finish_time is not None:
             print(f"  性能指标: 等待时间 {self.get_waiting_time():.2f} | 周转时间 {self.get_turnaround_time():.2f}")
+
+        print(
+            f"  能耗账本: "
+            f"计算 {self.compute_energy_j:.2f} J | "
+            f"传输 {self.transfer_energy_j:.2f} J | "
+            f"Edge->Edge {self.edge_edge_transfer_energy_j:.2f} J | "
+            f"Edge->Cloud {self.edge_cloud_transfer_energy_j:.2f} J | "
+            f"总可归因 {self.get_total_attributable_energy():.2f} J"
+        )
         print("-" * 38)
 
     def __repr__(self):
