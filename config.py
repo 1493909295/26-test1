@@ -59,7 +59,7 @@ DEVICE = "cuda:0"
 
 
 # 训练基本参数
-Episodes = 1500         # 训练轮次
+Episodes = 1000         # 训练轮次
 ReplyBuffer_Capacity = 200000           # 经验池容量
 Batch_Size = 512            # 采样批量
 Seed = 42           # 宇宙的终极答案
@@ -94,11 +94,5 @@ RESOURCE_DROP_PENALTY = 2.0             # 资源不足惩罚，其实已经不�
 COMPLETION_CREDIT_DECAY = 0.8           # 调度链奖励衰减参数
 FAILURE_CREDIT_DECAY = 0.8              # 调度链惩罚衰减参数
 
-# 能耗成本权重。
-#
-# 当前阶段必须保持为 0.0：
-# 先完成 Edge / Cloud / Transmission 能耗模型和日志统计，
-# 验证物理能耗计算正确以后，再逐步调高该权重。
-#
-# 这样当前这一步只建立能耗配置，不会改变现有 MASAC 的奖励函数和训练行为。
-ENERGY_COST_WEIGHT = 0.0
+ENERGY_NORMALIZATION_J = 170000.0
+ENERGY_COST_WEIGHT = 0.30

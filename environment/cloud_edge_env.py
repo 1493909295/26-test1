@@ -350,6 +350,9 @@ class CloudEdgeEnv(AECEnv):
         self.completion_time_cost_weight = float(conf.COMPLETION_TIME_COST_WEIGHT)
         self.sla_violation_cost_weight = float(conf.SLA_VIOLATION_COST_WEIGHT)
 
+        self.energy_normalization_j = float(conf.ENERGY_NORMALIZATION_J)
+        self.energy_cost_weight = float(conf.ENERGY_COST_WEIGHT)
+
         # self.waiting_time_cost_weight = float(conf.WAITING_TIME_COST_WEIGHT)
         # self.execution_time_cost_weight = float(conf.EXECUTION_TIME_COST_WEIGHT)
         self.queue_admission_cost_weight = float(conf.QUEUE_ADMISSION_COST_WEIGHT)
@@ -1436,6 +1439,7 @@ class CloudEdgeEnv(AECEnv):
             else 1.0,
             eps,
         )
+
     # 安全除法，避免 scale 为 0
     def _safe_div(self, value: float, scale: float) -> float:
         return float(value) / max(float(scale), self.norm_eps)
@@ -1544,7 +1548,11 @@ class CloudEdgeEnv(AECEnv):
 
         return float(np.clip(completion_time_cost, 0.0, 1.0,))
 
-
+    # 计算任务级 Energy Reward Cost
+    def _calculate_task_energy_cost(self,job: Job,) -> float:
+        attributable_energy_j = float(job.get_total_attributable_energy())
+        energy_cost = (attributable_energy_j / float(self.energy_normalization_j))
+        return float(energy_cost)
 
     # 任务是否丢弃判断
     def _should_drop_arrival_job(self, job_id: str) -> bool:
@@ -1765,12 +1773,14 @@ class CloudEdgeEnv(AECEnv):
                     job_id=str(dropped_job.job_id),
                     drop_reasion="等待超时",
                 )
+
                 self.waiting_timeout_drops += 1
+                drop_energy_cost = (self._calculate_task_energy_cost(job=dropped_job))
+                drop_energy_penalty = float(self.energy_cost_weight * drop_energy_cost)
+
                 self._record_reward_correction(
                     job_id=str(dropped_job.job_id),
-                    reward_delta=-float(
-                        self.timeout_drop_penalty
-                    ),
+                    reward_delta=-float(self.timeout_drop_penalty + drop_energy_penalty),
                     reason="waiting_timeout",
                 )
                 continue
@@ -1809,24 +1819,25 @@ class CloudEdgeEnv(AECEnv):
 
         if dc_id == self.cloud_id:
             attributable_compute_energy_j = (calculate_cloud_task_attributable_compute_energy_j(job=finished_job,))
+
         else:
-            attributable_compute_energy_j = (calculate_edge_task_attributable_compute_energy_j(job=finished_job, host=target_host,))
+            attributable_compute_energy_j = (calculate_edge_task_attributable_compute_energy_j(job=finished_job,host=target_host,))
 
         finished_job.set_compute_energy(attributable_compute_energy_j)
+        turnaround_time = (finished_job.get_turnaround_time())
+        turnaround_time = max(float(turnaround_time),0.0,)
+        completion_time_cost = (self._calculate_completion_time_cost(completion_time=turnaround_time,))
+        sla_violation_degree = (self._calculate_sla_violation_degree(job=finished_job,completion_time=turnaround_time,))
 
-        turnaround_time = finished_job.get_turnaround_time()
-        turnaround_time = max(float(turnaround_time), 0.0,)
-        completion_time_cost = self._calculate_completion_time_cost(completion_time=turnaround_time,)
-        sla_violation_degree = self._calculate_sla_violation_degree(job=finished_job, completion_time=turnaround_time,)
+        task_energy_cost = (self._calculate_task_energy_cost(job=finished_job))
         completion_reward = float(self.task_completion_reward)
         completion_time_penalty = float(self.completion_time_cost_weight * completion_time_cost)
         sla_violation_penalty = float(self.sla_violation_cost_weight * sla_violation_degree)
-        final_reward_delta = (completion_reward  - completion_time_penalty - sla_violation_penalty)
-        self._record_reward_correction(
-            job_id=job_id,
-            reward_delta=float(final_reward_delta),
-            reason="task_final_completion_outcome",
-        )
+        energy_penalty = float(self.energy_cost_weight * task_energy_cost)
+
+        final_reward_delta = (completion_reward - completion_time_penalty - sla_violation_penalty - energy_penalty)
+
+        self._record_reward_correction(job_id=job_id,reward_delta=float(final_reward_delta),reason="completed",)
 
         # 更新负载
         target_dc.calculate_dc_loads()
@@ -2046,12 +2057,14 @@ class CloudEdgeEnv(AECEnv):
 
         # 丢任务惩罚
         if action_type == "drop" or not success:
+            task_energy_cost = (self._calculate_task_energy_cost(job=job))
+            energy_penalty = float(self.energy_cost_weight * task_energy_cost)
 
             if failure_reason == "等待超时":
-                return -float(self.timeout_drop_penalty)
+                return -float(self.timeout_drop_penalty + energy_penalty)
 
             if failure_reason == "资源不足":
-                return -float(self.resource_drop_penalty)
+                return -float(self.resource_drop_penalty + energy_penalty)
 
         # job执行成本
         # duration_cost = self._normalize(value=float(job.duration), scale=float(self.max_job_duration),)

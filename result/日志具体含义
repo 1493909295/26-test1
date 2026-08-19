@@ -1,0 +1,160 @@
+一、Episode 基本信息
+episode	当前训练轮次编号。
+episode_seed	当前 Episode 使用的随机种子，用于复现实验和判断不同 Episode 的 workload 差异。
+episode_return	当前 Episode 所有即时 reward 与延迟 reward correction 的累计总 Return，是判断策略学习趋势的核心指标。
+
+二、决策与动作
+decision_count	当前 Episode 总共进行了多少次调度决策。
+normal_action_count	正常可学习动作数量；当前实现中 random 和 policy 动作都会计入，forced 不计入。
+forced_action_count	因环境约束而被强制执行的动作数量。
+random_action_count	Random Warmup 等阶段随机选合法动作的数量。
+policy_action_count	由当前 Actor/MASAC policy 真正选择的动作数量。
+local_action_count	调度到当前 Edge DC 本地 Host 的次数。
+edge_action_count	Edge→Edge 调度次数。
+cloud_action_count	Edge→Cloud 调度次数。
+drop_action_count	主动选择 Drop 动作的次数。
+local_action_rate	local_action_count / decision_count。
+edge_action_rate	edge_action_count / decision_count，判断 Edge→Edge 是否真正学出来很重要。
+cloud_action_rate	cloud_action_count / decision_count。
+drop_action_rate	drop_action_count / decision_count。
+
+三、Job、SLA、Waiting Queue
+total_jobs	本轮总任务数。
+completed_jobs	最终真正完成的任务数。
+dropped_jobs	最终被丢弃的任务数。
+completion_rate	completed_jobs / total_jobs，比单独比较 Energy 更重要。
+drop_rate	dropped_jobs / total_jobs。
+queue_admission_rate	环境累计 queued_jobs / total_jobs，反映多少排队行为发生。
+waiting_timeout_drop_rate	Waiting Queue 超时丢弃数量占总 Job 的比例。
+sla_satisfied_jobs	完成时间处于 SLA 满足区间内的任务数。
+sla_violated_completed_jobs	虽然完成，但超过 SLA 满足时间的任务数。
+sla_satisfaction_rate	SLA 满足 Job 数 / 总 Job 数。
+sla_violation_rate	SLA 违约完成任务 + Drop 任务，占总任务数的比例。
+mean_sla_violation_degree	全部 Job 的平均归一化 SLA 违约程度；Drop 按最严重违约 degree=1 处理。
+total_completion_time	所有完成任务从到达到完成的时间之和。
+avg_completion_time	完成任务平均完成时间。
+unresolved_jobs	total_jobs - completed_jobs - dropped_jobs，正常 Episode 完整结束时理论上应为 0。
+queued_jobs	本 Episode 环境累计进入 Waiting Queue 的计数。
+started_from_waiting_jobs	从 Waiting Queue 中最终成功获得资源并启动执行的数量。
+waiting_timeout_drops	Waiting Queue 中因为超时而被丢弃的数量。
+max_waiting_queue_length	整轮出现过的最大 Waiting Queue 长度。
+remaining_waiting_jobs	Episode 写日志时仍残留在 Waiting Queue 的任务数；正常收尾应为 0。
+
+四、训练过程、Replay Buffer、MASAC
+simulation_end_time	当前 Episode 最终仿真时间。虽然列名目前没有 _s 后缀，但当前系统语义是秒。
+episode_updates	当前 Episode 内执行了多少次 MASAC update。
+global_decision_steps	从训练开始到当前为止累计的所有 Decision Steps。
+global_normal_action_steps	全局累计正常动作步数，不包含 forced action。
+replay_size	Replay Buffer 当前总 transition 数。
+replay_trainable_size	Replay Buffer 中可用于正常学习的 transition 数。
+replay_forced_size	Buffer 中 forced transition 数量。
+masac_update_step	MASAC 自训练开始以来累计 update 次数。
+critic_loss	本 Episode 各次 update 的平均 Critic Loss。
+q1_loss	Q1 Critic 平均损失。
+q2_loss	Q2 Critic 平均损失。
+actor_loss	Actor 平均损失。
+alpha_loss	SAC entropy-temperature 参数的平均优化损失。
+alpha	Episode 结束时当前 entropy temperature α，不是 Episode 平均值。
+policy_entropy	当前 Episode update 中的平均 Policy Entropy，观察探索程度。
+target_entropy	SAC 当前使用的平均目标熵。
+mean_q1	Episode update 中 Q1 输出的平均值。
+mean_q2	Q2 输出平均值。
+mean_target_q	TD Target Q 的平均值，可与 Q1/Q2 比较观察 Critic 是否偏移。
+wall_time_seconds	这一整个 Episode 实际运行耗费的现实墙钟时间，用于训练性能分析。
+
+五、Workload
+workload_total_cpu_request	所有 Job 的 CPU request 总和。
+workload_mean_cpu_request	单任务平均 CPU request。
+workload_max_cpu_request	本轮最大 CPU request。
+workload_total_gpu_request	所有任务 GPU request 总和。
+workload_mean_gpu_request	平均 GPU request。
+workload_max_gpu_request	最大 GPU request。
+workload_gpu_job_ratio	gpu_request > 0 的 Job 比例，反映 GPU 型 workload 占比。
+workload_total_duration_s	所有任务原始执行时间 duration 的总和。
+workload_mean_duration_s	平均任务执行时间。
+workload_p95_duration_s	duration 的 95 分位数，观察长任务尾部。
+workload_max_duration_s	最长 Job 的 duration。
+workload_arrival_span_s	最后一个任务到达时间减去第一个任务到达时间。
+workload_observed_arrival_rate	当前实现为 (任务数-1) / arrival_span，即实际观察到的任务到达率，单位近似 jobs/s。
+
+六、Edge 负载
+edge_completed_jobs	最终在所有 Edge Host 完成的任务数。
+edge_total_cpu_capacity	所有 Edge Host CPU capacity 总和。
+edge_total_gpu_capacity	Edge Host GPU capacity 总和。
+edge_cpu_resource_seconds
+edge_gpu_resource_seconds
+edge_avg_cpu_load	整个 Edge 系统时间加权、容量加权平均 CPU 利用率。
+edge_peak_cpu_load	Edge 系统聚合 CPU 使用量达到过的最高比例。
+edge_avg_gpu_load	Edge 系统平均 GPU 利用率。
+edge_peak_gpu_load	Edge 系统峰值 GPU 利用率。
+edge_avg_running_jobs	Episode 时间尺度上 Edge 同时运行 Job 数的平均值。
+edge_peak_running_jobs	Edge 系统出现过的最大并发运行任务数。
+edge_host_avg_cpu_load_mean	先算每台 Edge Host 的长期平均 CPU load，再求 Host 间平均值。
+edge_host_avg_cpu_load_std	各 Host 平均 CPU load 的标准差，核心负载均衡指标；越高代表 Host 间长期负载越不均匀。
+edge_host_avg_cpu_load_p95	各 Host 长期平均 CPU load 的 95 分位数。
+edge_host_avg_gpu_load_mean	有 GPU 的 Edge Host 长期平均 GPU load 的均值。
+edge_host_avg_gpu_load_std	Host 间 GPU 平均负载标准差。
+edge_host_busy_ratio_mean	每台 Edge Host busy ratio 的平均值。
+edge_host_busy_ratio_max	最忙 Edge Host 的 busy ratio。
+
+七、Cloud 负载
+cloud_completed_jobs	最终在 Cloud 完成的任务数量。
+cloud_cpu_resource_seconds	Cloud 累计 CPU·s。
+cloud_gpu_resource_seconds	Cloud 累计 GPU·s。
+cloud_avg_used_cpu	Episode 时间尺度上 Cloud 平均实际占用 CPU units。
+cloud_peak_used_cpu	Cloud 最大同时占用 CPU units。
+cloud_avg_used_gpu	Cloud 平均实际占用 GPU units。
+cloud_peak_used_gpu	Cloud 最大 GPU units 占用。
+cloud_avg_running_jobs	Cloud 平均并发运行任务数。
+cloud_peak_running_jobs	Cloud 峰值并发任务数。
+cloud_busy_ratio	Episode 中 Cloud 至少存在一个 running Job 的时间比例。
+
+八、系统 Energy
+episode_energy_time_s	Energy Accounting 实际积分到的最终时间，即 last_energy_update_time。
+energy_time_gap_s	simulation_end_time - energy_end_time；Episode 正常完整 flush 后应该约等于 0。
+edge_idle_energy_j	全部 Edge Host 空闲基础功率累计产生的能耗。
+edge_cpu_dynamic_energy_j	Edge CPU 动态 workload 能耗。
+edge_gpu_dynamic_energy_j	Edge GPU 动态 workload 能耗。
+edge_total_energy_j	Edge idle + CPU dynamic + GPU dynamic。
+cloud_compute_energy_j	Cloud workload 的累计 Compute Energy。
+system_compute_energy_j	edge_total_energy + cloud_compute_energy。
+system_dynamic_compute_energy_j	Edge CPU dynamic + Edge GPU dynamic + Cloud compute，不含 Edge Idle。
+transfer_energy_j	本轮全部 Edge→Edge 和 Edge→Cloud Transmission Energy。
+edge_edge_transfer_energy_j	其中 Edge→Edge 传输能耗。
+edge_cloud_transfer_energy_j	其中 Edge→Cloud 传输能耗。
+total_system_energy_j	system_compute_energy_j + transfer_energy_j，系统最终总能耗。
+total_system_energy_kwh	将总 J 换算成 kWh，公式为 J / 3,600,000。
+
+九、平均 Power
+edge_idle_avg_power_w	整轮 Edge Idle 平均功率。
+edge_cpu_dynamic_avg_power_w	Edge CPU dynamic 平均功率。
+edge_gpu_dynamic_avg_power_w	Edge GPU dynamic 平均功率。
+edge_total_avg_power_w	Edge 总平均功率。
+cloud_compute_avg_power_w	Cloud workload 平均计算功率。
+system_compute_avg_power_w	Edge + Cloud 的平均 IT Compute Power。
+transfer_equivalent_avg_power_w	transfer_energy / episode_energy_time，网络传输的 Episode 等效平均功率。
+system_total_equivalent_avg_power_w	total_system_energy / episode_energy_time，整个模型的 Episode 等效平均功率。
+
+十、Energy 构成比例
+edge_idle_energy_share	Edge Idle 占系统总能耗比例。
+edge_cpu_dynamic_energy_share	Edge CPU 动态能耗占比。
+edge_gpu_dynamic_energy_share	Edge GPU 动态能耗占比。
+cloud_compute_energy_share	Cloud Compute Energy 占比。
+transfer_energy_share	Transmission Energy 占比。
+
+十一、任务归因与单位任务 Energy
+task_compute_energy_j	全部 Job 的可归因 Compute Energy 总和。
+task_transfer_energy_j	全部 Job 的可归因 Transmission Energy 总和。
+task_attributable_energy_j	task_compute_energy + task_transfer_energy。
+task_compute_energy_per_completed_job_j	可归因 Compute Energy / completed jobs。
+task_attributable_energy_per_total_job_j	所有任务可归因 Energy / total jobs。
+system_energy_per_completed_job_j	系统物理总 Energy / 完成 Job 数，是非常重要的能源效率指标。
+system_energy_per_total_job_j	系统总 Energy / 输入总任务数。
+
+十二、诊断和详细底稿
+transfer_split_gap_j	transfer_energy - edge_edge_transfer_energy - edge_cloud_transfer_energy；正常应约为 0，用于检查 Transmission 分类账本。
+transfer_job_accounting_gap_j	system transfer energy - Σ job.transfer_energy；正常应约为 0，用于检查系统账本和任务账本是否一致。
+per_agent_returns	JSON 字符串，保存每个 Edge Agent 本轮累计 Return。
+dc_load_details	JSON 字符串，保存每个 DC 的 CPU/GPU capacity、平均/峰值负载、并发和 busy ratio 等详细数据。
+edge_host_load_details	JSON 字符串，保存每台 Edge Host 的容量、完成任务数、平均/峰值 CPU/GPU、并发任务和 busy ratio。
+
