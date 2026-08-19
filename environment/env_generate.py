@@ -48,11 +48,11 @@ class EnvGenerator:
             if self.datacenter_graph and dc.dc_id in self.datacenter_graph:
                 for neighbor in self.datacenter_graph.neighbors(dc.dc_id):
                     weight = self.datacenter_graph[dc.dc_id][neighbor].get('weight', 0)
-                    topology_links.append(f"{neighbor}({weight}ms)")
+                    topology_links.append(f"{neighbor}({weight}s)")
 
             dc_records.append({
                 'datacenter_id': dc.dc_id,
-                'cloud_latency_ms': getattr(dc, 'cloud_latency', 'N/A'),
+                'cloud_latency_s': getattr(dc, 'cloud_latency', 'N/A'),
                 'edge_topology_links': "; ".join(topology_links)  # 用分号隔开每个邻居关系
             })
         pd.DataFrame(dc_records).to_csv(os.path.join(target_dir, 'datacenters.csv'), index=False, encoding='utf-8-sig')
@@ -92,8 +92,8 @@ class EnvGenerator:
             f.write(f"实例化主机总数   : {self.host_num} 台\n")
             f.write(f"模拟生成的任务数 : {self.job_num} 个\n")
             f.write(f"任务到达率     : {self.lambda_rate}\n")
-            f.write(f"边->云端时延范围 : {self.cloud_latency_range} ms\n")
-            f.write(f"边边互相时延范围 : {self.edge_latency_range} ms\n")
+            f.write(f"边->云端时延范围 : {self.cloud_latency_range} s\n")
+            f.write(f"边边互相时延范围 : {self.edge_latency_range} s\n")
             f.write(f"===================================================\n")
 
         print(f"💾 [环境保持成功] 本次实验环境快照已安全持久化至: {target_dir}")
@@ -203,15 +203,15 @@ class UseOldEnv:
         dc_df = pd.read_csv(os.path.join(self.env_keep_path, 'datacenters.csv'))
         for _, row in dc_df.iterrows():
             dc_id = row['datacenter_id']
-            cloud_lat = float(row['cloud_latency_ms'])
+            cloud_lat = float(row['cloud_latency_s'])
             dc = DataCenter(dc_id=dc_id, cloud_latency=cloud_lat)
-            dc.cloud_latency = float(row['cloud_latency_ms'])
+            dc.cloud_latency = float(row['cloud_latency_s'])
             dc.host_list = []
             dc.job_list = []
             self.global_dc_list.append(dc)
             self.datacenter_graph.add_node(dc_id, dc_instance=dc)
 
-        # 重建拓扑连线 (解析形如 "DC-2(15.2ms); DC-3(8.5ms)")
+        # 重建拓扑连线 (解析形如 "DC-2(15.2s); DC-3(8.5s)")
         for _, row in dc_df.iterrows():
             dc_id = row['datacenter_id']
             links_str = str(row['edge_topology_links'])
@@ -221,7 +221,7 @@ class UseOldEnv:
                     link = link.strip()
                     if not link: continue
                     # 正则匹配提取目标 DC 和 权重
-                    match = re.match(r'(.*?)\(([\d\.]+)ms\)', link)
+                    match = re.match(r'(.*?)\(([\d\.]+)s\)', link)
                     if match:
                         target_dc = match.group(1).strip()
                         weight = float(match.group(2))
@@ -344,7 +344,7 @@ if __name__ == "__main__":
     # # 打印其中一个 DC 来看看是否真的挂载成功了
     # test_dc = old_env.global_dc_list[0]
     # print(f"\n🏢 抽查节点 【{test_dc.dc_id}】 详情:")
-    # print(f"   🌐 云端时延: {test_dc.cloud_latency} ms")
+    # print(f"   🌐 云端时延: {test_dc.cloud_latency} s")
     # print(f"   💻 恢复的主机数: {len(test_dc.host_list)}")
     # print(f"   📝 恢复的任务数: {len(test_dc.job_list)}")
     # print(f"   🔗 拓扑邻居数: {len(list(old_env.datacenter_graph.neighbors(test_dc.dc_id)))}")

@@ -309,7 +309,7 @@ class DataCenter:
         print(f"\n" + "=" * 25 + f" 数据中心 【{self.dc_id}】 详情 " + "=" * 25)
         print(f"  - 节点中心 ID       : {self.dc_id}")
         print(f"  - 挂载主机总数      : {len(self.host_list)} 台")
-        print(f"  本地边端 ──(时延: {self.cloud_latency:.2f} ms)──> 云计算中心")
+        print(f"  本地边端 ──(时延: {self.cloud_latency:.2f} s)──> 云计算中心")
         print(f"  - 区域 CPU 整体利用率 : {self.dc_cpu_load * 100:>5.1f}%")
         print(f"  - 区域 GPU 整体利用率 : {self.dc_gpu_load * 100:>5.1f}%")
 

@@ -45,11 +45,10 @@ def calculate_cloud_task_attributable_compute_energy_j(job,) -> float:
 
 # 传输能耗
 def calculate_transfer_energy_j(latency_s: float,) -> float:
-    return float(
-        float(conf.TRANSFER_SEND_FIXED_ENERGY_J) +
-        float(conf.TRANSFER_RECEIVE_FIXED_ENERGY_J) +
-        float(conf.TRANSFER_LATENCY_ENERGY_COEFFICIENT_W) * float(latency_s)
-    )
+    send_energy_j = float(conf.TRANSFER_SEND_FIXED_ENERGY_J)
+    receive_energy_j = float(conf.TRANSFER_RECEIVE_FIXED_ENERGY_J)
+    latency_energy_j = (float(conf.TRANSFER_LATENCY_ENERGY_COEFFICIENT_W) * float(latency_s))
+    return float(send_energy_j + receive_energy_j + latency_energy_j)
 
 # 计算host当前功率
 def calculate_edge_host_power_components_w(host,) -> dict:
