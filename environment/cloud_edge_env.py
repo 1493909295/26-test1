@@ -14,6 +14,7 @@ import networkx as nx
 from environment.datacenter import (Host, DataCenter, hosts_generate, datacenters_generate)
 from environment.job import (Job, JobList, jobs_generate)
 from environment.env_generate import (EnvGenerator, UseOldEnv)
+from environment.energy_model import (calculate_edge_host_power_components_w,calculate_cloud_attributable_power_w,)
 
 import config as conf
 
@@ -187,6 +188,15 @@ class CloudEdgeEnv(AECEnv):
 
         # 能耗上次结算时间点
         self.last_energy_update_time: float = 0.0
+
+        # 能耗数据
+        self.edge_idle_energy_j: float = 0.0
+        self.edge_cpu_dynamic_energy_j: float = 0.0
+        self.edge_gpu_dynamic_energy_j: float = 0.0
+        self.cloud_compute_energy_j: float = 0.0
+        self.transfer_energy_j: float = 0.0
+        self.edge_edge_transfer_energy_j: float = 0.0
+        self.edge_cloud_transfer_energy_j: float = 0.0
 
         # 当前需要决策的智能体、需要调度的job
         self.current_agent_id = None
@@ -364,9 +374,77 @@ class CloudEdgeEnv(AECEnv):
     def state(self) -> np.ndarray:
         return self._cached_global_state.copy()
 
+    # 清空当前 Episode 的系统级物理能源账本
+    def _reset_episode_energy_counters(self,) -> None:
+        self.edge_idle_energy_j = 0.0
+        self.edge_cpu_dynamic_energy_j = 0.0
+        self.edge_gpu_dynamic_energy_j = 0.0
+        self.cloud_compute_energy_j = 0.0
+        self.transfer_energy_j = 0.0
+        self.edge_edge_transfer_energy_j = 0.0
+        self.edge_cloud_transfer_energy_j = 0.0
+
+    # 返回当前 Episode 已累计的全部 Edge IT Energy
+    def get_edge_total_energy_j(self,) -> float:
+        return float(self.edge_idle_energy_j + self.edge_cpu_dynamic_energy_j + self.edge_gpu_dynamic_energy_j)
+
+    # 返回当前 Episode 已累计的整个 Cloud-Edge 系统物理能耗
+    def get_total_system_energy_j(self,) -> float:
+        return float(self.get_edge_total_energy_j() + self.cloud_compute_energy_j + self.transfer_energy_j)
+
+    # 系统计算能耗积分
+    def _update_compute_energy_to(self, new_time: float,) -> None:
+
+        new_time = float(new_time)
+
+        # 当前尚未完成能耗结算的时间区间长度。
+        delta_t = (new_time - float(self.last_energy_update_time))
+
+        if delta_t <= self.TIME_EPS:
+            return
+
+        edge_idle_power_w = 0.0
+        edge_cpu_dynamic_power_w = 0.0
+        edge_gpu_dynamic_power_w = 0.0
+
+        # 统计当前时刻整个 Edge 系统
+        for edge_dc_id in self.edge_dc_ids:
+            edge_dc = self.dc_map[edge_dc_id]
+            for host in edge_dc.host_list:
+                power_components = (calculate_edge_host_power_components_w( host=host,))
+
+                edge_idle_power_w += float(power_components["idle_power_w"])
+                edge_cpu_dynamic_power_w += float(power_components["cpu_dynamic_power_w"])
+                edge_gpu_dynamic_power_w += float(power_components["gpu_dynamic_power_w"])
+
+        self.edge_idle_energy_j += (edge_idle_power_w * delta_t)
+        self.edge_cpu_dynamic_energy_j += (edge_cpu_dynamic_power_w * delta_t)
+        self.edge_gpu_dynamic_energy_j += (edge_gpu_dynamic_power_w * delta_t)
+
+        # 统计云的
+        cloud_dc = self.dc_map[self.cloud_id]
+        cloud_used_cpu = 0.0
+        cloud_used_gpu = 0.0
+
+        for cloud_host in cloud_dc.host_list:
+            cloud_used_cpu += float(cloud_host.used_cpu)
+            cloud_used_gpu += float(cloud_host.used_gpu)
+
+        cloud_power_w = (
+            calculate_cloud_attributable_power_w(
+                used_cpu=cloud_used_cpu,
+                used_gpu=cloud_used_gpu,
+            )
+        )
+        self.cloud_compute_energy_j += (float(cloud_power_w) * delta_t)
+
+        # 更新系统能耗计算时间
+        self.last_energy_update_time = (new_time)
+
     # 时间推进接口
     def _advance_simulation_time(self, new_time: float,) -> None:
         new_time = float(new_time)
+        self._update_compute_energy_to(new_time)
         self.current_time = new_time
 
     # 每轮新训练重启环境
@@ -417,6 +495,9 @@ class CloudEdgeEnv(AECEnv):
         # 重置仿真时间
         self.current_time = 0.0
         self.last_energy_update_time = 0.0
+
+        # 重置能耗统计
+        self._reset_episode_energy_counters()
 
         # 重置当前决策相关状态
         self.current_agent_id = None
