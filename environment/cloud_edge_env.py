@@ -14,7 +14,11 @@ import networkx as nx
 from environment.datacenter import (Host, DataCenter, hosts_generate, datacenters_generate)
 from environment.job import (Job, JobList, jobs_generate)
 from environment.env_generate import (EnvGenerator, UseOldEnv)
-from environment.energy_model import (calculate_edge_host_power_components_w,calculate_cloud_attributable_power_w,)
+from environment.energy_model import (
+    calculate_edge_host_power_components_w,
+    calculate_cloud_attributable_power_w,
+    calculate_edge_task_attributable_compute_energy_j,
+    calculate_cloud_task_attributable_compute_energy_j,)
 
 import config as conf
 
@@ -1787,6 +1791,13 @@ class CloudEdgeEnv(AECEnv):
             job=finished_job,
             current_time=float(self.current_time),
         )
+
+        if dc_id == self.cloud_id:
+            attributable_compute_energy_j = (calculate_cloud_task_attributable_compute_energy_j(job=finished_job,))
+        else:
+            attributable_compute_energy_j = (calculate_edge_task_attributable_compute_energy_j(job=finished_job, host=target_host,))
+
+        finished_job.set_compute_energy(attributable_compute_energy_j)
 
         turnaround_time = finished_job.get_turnaround_time()
         turnaround_time = max(float(turnaround_time), 0.0,)
