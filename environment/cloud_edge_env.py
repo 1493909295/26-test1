@@ -185,6 +185,9 @@ class CloudEdgeEnv(AECEnv):
         # 当前时间
         self.current_time: float = 0.0
 
+        # 能耗上次结算时间点
+        self.last_energy_update_time: float = 0.0
+
         # 当前需要决策的智能体、需要调度的job
         self.current_agent_id = None
         self.current_job_id = None
@@ -361,6 +364,11 @@ class CloudEdgeEnv(AECEnv):
     def state(self) -> np.ndarray:
         return self._cached_global_state.copy()
 
+    # 时间推进接口
+    def _advance_simulation_time(self, new_time: float,) -> None:
+        new_time = float(new_time)
+        self.current_time = new_time
+
     # 每轮新训练重启环境
     def reset(self,seed: Optional[int] = None, options: Optional[dict] = None):
 
@@ -408,6 +416,7 @@ class CloudEdgeEnv(AECEnv):
 
         # 重置仿真时间
         self.current_time = 0.0
+        self.last_energy_update_time = 0.0
 
         # 重置当前决策相关状态
         self.current_agent_id = None
@@ -446,7 +455,7 @@ class CloudEdgeEnv(AECEnv):
         first_decision_found = False
         while self.event_queue:
             event_time, event_type, job_id = heapq.heappop(self.event_queue)
-            self.current_time = event_time
+            self._advance_simulation_time(event_time)
             if event_type != JOB_ARRIVAL:
                 continue
             job = self.job_map[job_id]
@@ -718,7 +727,7 @@ class CloudEdgeEnv(AECEnv):
         next_decision_found = False
         while self.event_queue:
             current_event_time = float(self.event_queue[0][0])
-            self.current_time = current_event_time
+            self._advance_simulation_time(current_event_time)
             pending_arrival_events = []
             while (
                     self.event_queue
@@ -1782,7 +1791,7 @@ class CloudEdgeEnv(AECEnv):
                 event_time = float(event_time)
                 event_job_id = str(event_job_id)
 
-                self.current_time = event_time
+                self._advance_simulation_time(event_time)
 
                 # Episode 尾部理论上只应该剩下 JOB_FINISH。
                 #
