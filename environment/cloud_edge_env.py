@@ -906,17 +906,15 @@ class CloudEdgeEnv(AECEnv):
                         )
                     )
                     if cloud_result == "dropped":
+                        dropped_job = self.job_map[event_job_id]
+                        task_energy_cost = (self._calculate_task_energy_cost(job=dropped_job))
+                        energy_penalty = float(self.energy_cost_weight * task_energy_cost)
 
                         if cloud_arrival_timeout:
-                            reward_delta = -float(
-                                self.timeout_drop_penalty
-                            )
+                            reward_delta = -float(self.timeout_drop_penalty + energy_penalty)
                             reason = "cloud_arrival_timeout"
-
                         else:
-                            reward_delta = -float(
-                                self.resource_drop_penalty
-                            )
+                            reward_delta = -float(self.resource_drop_penalty + energy_penalty)
                             reason = "cloud_resource_failure"
 
                         self._record_reward_correction(

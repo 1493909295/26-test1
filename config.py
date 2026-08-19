@@ -94,5 +94,5 @@ RESOURCE_DROP_PENALTY = 2.0             # 资源不足惩罚，其实已经不�
 COMPLETION_CREDIT_DECAY = 0.8           # 调度链奖励衰减参数
 FAILURE_CREDIT_DECAY = 0.8              # 调度链惩罚衰减参数
 
-ENERGY_NORMALIZATION_J = 170000.0
-ENERGY_COST_WEIGHT = 0.30
+ENERGY_NORMALIZATION_J = 170000.0       # 将真实物理能耗 J 缩放到适合 Reward 学习的数值范围
+ENERGY_COST_WEIGHT = 0.30               #  控制 Energy objective 在联合 Reward 中的相对权重

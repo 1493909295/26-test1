@@ -1443,17 +1443,9 @@ def build_episode_log_row(
         "episode": int(stats.episode),
         "episode_seed": int(stats.episode_seed),
         "episode_return": float(stats.episode_return),
-
-        "energy_cost_weight": float(
-            conf.ENERGY_COST_WEIGHT
-        ),
-        "energy_optimization_enabled": bool(
-            float(
-                conf.ENERGY_COST_WEIGHT
-            ) > 0.0
-        ),
-
-
+        "energy_normalization_j": float(conf.ENERGY_NORMALIZATION_J),
+        "energy_cost_weight": float(conf.ENERGY_COST_WEIGHT),
+        "energy_optimization_enabled": bool(float(conf.ENERGY_COST_WEIGHT) > 0.0),
         "decision_count": int(stats.decision_count),
         "normal_action_count": int(stats.normal_action_count),
         "forced_action_count": int(stats.forced_action_count),
