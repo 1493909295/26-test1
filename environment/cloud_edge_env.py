@@ -982,8 +982,11 @@ class CloudEdgeEnv(AECEnv):
 
         # episode 结束处理
         if not next_decision_found:
-            if len(self.event_queue) == 0:
-                self._drain_remaining_jobs_at_episode_tail()
+
+            self._drain_remaining_jobs_at_episode_tail()
+
+            # if len(self.event_queue) == 0:
+            #     self._drain_remaining_jobs_at_episode_tail()
             if self._check_episode_finished():
                 self._terminate_episode()
 
@@ -1965,6 +1968,7 @@ class CloudEdgeEnv(AECEnv):
                     remaining_running_jobs == 0
                     and remaining_waiting_jobs == 0
             ):
+                self._update_compute_energy_to(float(self.current_time))
                 return
 
             ####################################################################
