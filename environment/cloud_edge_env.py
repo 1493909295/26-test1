@@ -18,7 +18,8 @@ from environment.energy_model import (
     calculate_edge_host_power_components_w,
     calculate_cloud_attributable_power_w,
     calculate_edge_task_attributable_compute_energy_j,
-    calculate_cloud_task_attributable_compute_energy_j,)
+    calculate_cloud_task_attributable_compute_energy_j,
+    calculate_transfer_energy_j,)
 
 import config as conf
 
@@ -1591,14 +1592,25 @@ class CloudEdgeEnv(AECEnv):
 
     # 调度到其他地方计算的job，打包成新到达事件
     def _enqueue_transfer_arrival_event(self, job: Job, source_dc_id: str, target_dc_id: str,) -> float:
+
         job_id = str(job.job_id)
         source_dc_id = str(source_dc_id)
         target_dc_id = str(target_dc_id)
 
-        latency = float(
+        latency_s = float(
             self.graph[source_dc_id][target_dc_id].get("weight", 0.0)
         )
-        arrival_event_time = float(self.current_time) + latency
+        # 一次性计算本次 Transmission Energy
+        transfer_energy_j = (calculate_transfer_energy_j(latency_s=latency_s,))
+        self.transfer_energy_j += float(transfer_energy_j)
+        if target_dc_id == self.cloud_id:
+            self.edge_cloud_transfer_energy_j += float(transfer_energy_j)
+            job.add_edge_cloud_transfer_energy(transfer_energy_j)
+        else:
+            self.edge_edge_transfer_energy_j += float(transfer_energy_j)
+            job.add_edge_edge_transfer_energy(transfer_energy_j)
+
+        arrival_event_time = float(self.current_time) + latency_s
         job.set_target_datacenter(target_dc_id)
 
         heapq.heappush(
