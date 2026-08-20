@@ -12,7 +12,7 @@ import copy
 from typing import Any, Dict, List, Optional, Tuple,Union
 import networkx as nx
 from environment.datacenter import (Host, DataCenter, hosts_generate, datacenters_generate)
-from environment.job import (Job, JobList, jobs_generate)
+from environment.job import (Job, JobList, jobs_generate,load_job_dataset,)
 from environment.env_generate import (EnvGenerator, UseOldEnv)
 from environment.energy_model import (
     calculate_edge_host_power_components_w,
@@ -75,24 +75,41 @@ class CloudEdgeEnv(AECEnv):
             )
 
         # 环境完备性检查
-        required_attrs = ["wait_assign_jobs_list","global_dc_list","datacenter_graph",]
+        required_attrs = ["global_dc_list","datacenter_graph",]
         for attr in required_attrs:
             if not hasattr(self.env_source, attr):
                 raise AttributeError(
                     f"env_source 缺少必要属性 {attr}，"
                     f"请检查 EnvGenerator 或 UseOldEnv 是否正确生成/加载环境。"
                 )
-        if len(self.env_source.wait_assign_jobs_list) == 0:
-            raise ValueError("环境中的 wait_assign_jobs_list 为空，无法进行训练。")
+        # if len(self.env_source.wait_assign_jobs_list) == 0:
+        #     raise ValueError("环境中的 wait_assign_jobs_list 为空，无法进行训练。")
         if len(self.env_source.global_dc_list) == 0:
             raise ValueError("环境中的 global_dc_list 为空，无法进行训练。")
         if self.env_source.datacenter_graph is None:
             raise ValueError("环境中的 datacenter_graph 为空，无法计算节点间时延。")
 
         # 保存一份干净的基础环境副本,避免一个 episode 修改 host 队列、job 状态后污染下一个 episode
-        self.base_jobs = copy.deepcopy(self.env_source.wait_assign_jobs_list)
+        # self.base_jobs = copy.deepcopy(self.env_source.wait_assign_jobs_list)
         self.base_datacenters = copy.deepcopy(self.env_source.global_dc_list)
         self.base_graph = copy.deepcopy(self.env_source.datacenter_graph)
+
+        source_job_num = int(getattr(self.env_source, "job_num",conf.NUM_JOBS,))
+        source_lambda_rate = float(getattr(self.env_source, "lambda_rate", conf.LAMBDA_RATE,))
+        self.lambda_rate = (
+            source_lambda_rate
+            if source_lambda_rate > 0.0
+            else float(conf.LAMBDA_RATE)
+        )
+        self.job_dataset_path = str(
+            getattr(
+                self.env_source,
+                "job_dataset_path",
+                conf.JOB_DATASET_PATH,
+            )
+            or conf.JOB_DATASET_PATH
+        )
+
 
         # 云节点定义
         self.cloud_id = "cloud"
@@ -458,6 +475,34 @@ class CloudEdgeEnv(AECEnv):
         self._update_compute_energy_to(new_time)
         self.current_time = new_time
 
+    # 为当前 Episode 生成一套全新的任务 workload
+    def _generate_episode_workload(self,) -> List[Job]:
+        seed_tag = (
+            str(self.seed_value)
+            if self.seed_value is not None
+            else "none"
+        )
+
+        jobs = jobs_generate(
+            job_num=self.job_num,
+            lambda_rate=self.lambda_rate,
+            job_dataset_path=self.job_dataset_path,
+            wait_assign_jobs_list=[],
+            rng=self.rng,
+            job_id_prefix=(
+                f"episode_seed_{seed_tag}"
+            ),
+        )
+
+        # 按照到达时间排序
+        jobs.sort(key=lambda job: float(job.arrive_time))
+
+        for job in jobs:
+            arrived_dc_id = str(self.rng.choice(self.edge_dc_ids))
+            job.set_target_datacenter(arrived_dc_id)
+
+        return jobs
+
     # 每轮新训练重启环境
     def reset(self,seed: Optional[int] = None, options: Optional[dict] = None):
 
@@ -469,7 +514,7 @@ class CloudEdgeEnv(AECEnv):
         self.agents = self.possible_agents[:]
 
         # 从base_jobs模板恢复当前 episode 的任务、数据中心和拓扑图。
-        self.jobs = copy.deepcopy(self.base_jobs)
+        # self.jobs = copy.deepcopy(self.base_jobs)
         self.datacenters = copy.deepcopy(self.base_datacenters)
         self.graph = copy.deepcopy(self.base_graph)
 

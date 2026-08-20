@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 
+from functools import lru_cache
+from typing import Optional
 
 
 class Job:
@@ -169,40 +171,63 @@ class JobList:
                 print(f"  {i + 1}. {job}")
         print("-" * 40)
 
-def jobs_generate(job_num: int, lambda_rate: float, job_dataset_path: str, wait_assign_jobs_list: list) -> list:
+# 读取并缓存任务数据集，没有必要每轮重新读取磁盘
+@lru_cache(maxsize=4)
+def load_job_dataset(job_dataset_path: str) -> pd.DataFrame:
+    df = pd.read_csv(job_dataset_path)
+    return df
+
+def jobs_generate(job_num: int, lambda_rate: float, job_dataset_path: str, wait_assign_jobs_list: list,rng: Optional[np.random.Generator] = None,job_id_prefix: str = "",) -> list:
+
+    job_num = int(job_num)
+    lambda_rate = float(lambda_rate)
+
     # 待分配 jobs 列表
     job_list = wait_assign_jobs_list
 
     # 任务抽取
     try:
-        df = pd.read_csv(job_dataset_path)
-    except FileNotFoundError:
-        print("\n错误：文件 job_info_df.csv 读取失败\n")
-        return job_list
-    sampled_jobs = df.sample(n=job_num, replace=True).reset_index(drop=True)
+        df = load_job_dataset(
+            job_dataset_path
+        )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"任务数据集读取失败: {job_dataset_path}"
+        ) from exc
 
-    # 根据泊松过程生成任务的到达时间
-    inter_arrival_times = np.random.exponential(scale=1.0 / lambda_rate, size=job_num)
+    if rng is None:
+        sampled_jobs = (df.sample( n=job_num, replace=True,).reset_index(drop=True))
+        inter_arrival_times = np.random.exponential(scale=1.0 / lambda_rate, size=job_num,)
+    else:
+        sampled_indices = rng.integers(low=0, high=len(df), size=job_num,)
+        sampled_jobs = (df.iloc[sampled_indices].reset_index(drop=True))
 
-    # 将时间间隔进行累加 (cumsum)，得到每一个任务的绝对到达时间
+        # 使用当前 Episode RNG 重新生成泊松到达过程。
+        inter_arrival_times = rng.exponential(scale=1.0 / lambda_rate,size=job_num,)
+
     arrival_times = np.cumsum(inter_arrival_times)
 
-    # 遍历抽样结果，实例化 Job
     for sample_index, row in sampled_jobs.iterrows():
-        source_job_id = str(row.get("job_name", f"job_unknown_{sample_index}"))
-        job_id = (f"{source_job_id}"
-                  f"__sample_{sample_index:06d}")
-        cpu_req = row.get('cpu_request', 1.0)
-        gpu_req = row.get('gpu_request', 0.0)
-        duration = row.get('duration', 1.0)
-        new_job = Job(
-            job_id=job_id,
-            cpu_request=cpu_req,
-            gpu_request=gpu_req,
-            duration=duration
+        source_job_id = str(row.get( "job_name", f"job_unknown_{sample_index}",))
+
+        # Episode prefix 防止不同 Episode 中 Job ID 重复。
+        prefix = (
+            f"{job_id_prefix}__"
+            if job_id_prefix
+            else ""
         )
-        new_job.set_arrive_time(arrival_times[sample_index])
+        job_id = (
+            f"{prefix}"
+            f"{source_job_id}"
+            f"__sample_{sample_index:06d}"
+        )
+        cpu_req = float(row.get( "cpu_request", 1.0,))
+        gpu_req = float(row.get("gpu_request", 0.0,))
+        duration = float(row.get("duration", 1.0, ))
+        new_job = Job(job_id=job_id, cpu_request=cpu_req, gpu_request=gpu_req, duration=duration,)
+        new_job.set_arrive_time(float( arrival_times[sample_index]))
         job_list.append(new_job)
+
     return job_list
 
 
