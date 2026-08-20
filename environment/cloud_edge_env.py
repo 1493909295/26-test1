@@ -356,10 +356,13 @@ class CloudEdgeEnv(AECEnv):
         # self.waiting_time_cost_weight = float(conf.WAITING_TIME_COST_WEIGHT)
         # self.execution_time_cost_weight = float(conf.EXECUTION_TIME_COST_WEIGHT)
         self.queue_admission_cost_weight = float(conf.QUEUE_ADMISSION_COST_WEIGHT)
-        self.edge_forward_base_penalty = float(conf.EDGE_FORWARD_BASE_PENALTY)
-        self.edge_latency_cost_weight = float(conf.EDGE_LATENCY_COST_WEIGHT)
+        # self.edge_forward_base_penalty = float(conf.EDGE_FORWARD_BASE_PENALTY)
+        # self.edge_latency_cost_weight = float(conf.EDGE_LATENCY_COST_WEIGHT)
         # self.edge_deadline_risk_cost_weight = float(conf.EDGE_DEADLINE_RISK_COST_WEIGHT)
-        self.cloud_latency_cost_weight = float(conf.CLOUD_LATENCY_COST_WEIGHT)
+        # self.cloud_latency_cost_weight = float(conf.CLOUD_LATENCY_COST_WEIGHT)
+        self.remote_offload_base_penalty = float(conf.REMOTE_OFFLOAD_BASE_PENALTY)
+        self.remote_latency_cost_weight = float(conf.REMOTE_LATENCY_COST_WEIGHT)
+
         self.sla_risk_cost_weight = float(conf.SLA_RISK_COST_WEIGHT)
         # 等待被处理的奖励修正事件列表
         self.pending_reward_corrections: List[Dict[str, Any]] = []
@@ -1404,20 +1407,16 @@ class CloudEdgeEnv(AECEnv):
         # 统计拓扑图中最大的链路时延
         # latencies = []
         all_latencies = []
-        edge_latencies = []
-        cloud_latencies = []
-
+        # edge_latencies = []
+        # cloud_latencies = []
+        #
         # 如果基础拓扑图存在，就遍历图中的所有边。
         if self.base_graph is not None:
-            for src_dc_id, dst_dc_id, data in (self.base_graph.edges(data=True)):
-                latency = float(data.get("weight", 0.0))
+            for _, _, data in self.base_graph.edges(data=True):
+                latency = float(
+                    data.get("weight", 0.0)
+                )
                 all_latencies.append(latency)
-                # 任意一端为 cloud，就把该链路视作 Edge <-> Cloud 链路。
-                if (str(src_dc_id) == self.cloud_id or str(dst_dc_id) == self.cloud_id):
-                    cloud_latencies.append(latency)
-                else:
-                    # 两端都不是 Cloud，就属于 Edge <-> Edge 链路。
-                    edge_latencies.append(latency)
 
         self.max_latency = max(
             max(all_latencies)
@@ -1425,18 +1424,18 @@ class CloudEdgeEnv(AECEnv):
             else 1.0,
             eps,
         )
-        self.max_edge_latency = max(
-            max(edge_latencies)
-            if edge_latencies
-            else 1.0,
-            eps,
-        )
-        self.max_cloud_latency = max(
-            max(cloud_latencies)
-            if cloud_latencies
-            else 1.0,
-            eps,
-        )
+        # self.max_edge_latency = max(
+        #     max(edge_latencies)
+        #     if edge_latencies
+        #     else 1.0,
+        #     eps,
+        # )
+        # self.max_cloud_latency = max(
+        #     max(cloud_latencies)
+        #     if cloud_latencies
+        #     else 1.0,
+        #     eps,
+        # )
 
     # 安全除法，避免 scale 为 0
     def _safe_div(self, value: float, scale: float) -> float:
@@ -2086,73 +2085,90 @@ class CloudEdgeEnv(AECEnv):
 
             return -float(local_cost)
 
-        # 边边转发
-        if action_type == "edge_dc":
+        # # 边边转发
+        # if action_type == "edge_dc":
+        #     transfer_latency = float(transfer_latency)
+        #
+        #     edge_latency_cost = self._normalize(
+        #         value=transfer_latency,
+        #         scale=float(
+        #             self.max_edge_latency
+        #         ),
+        #     )
+        #
+        #     predicted_completion_time = (
+        #         self._predict_completion_time_if_start_now(
+        #             job=job,
+        #             extra_latency=transfer_latency,
+        #         )
+        #     )
+        #
+        #     predicted_sla_violation_degree = (
+        #         self._calculate_sla_violation_degree(
+        #             job=job,
+        #             completion_time=predicted_completion_time,
+        #         )
+        #     )
+        #
+        #     return -float(
+        #         self.edge_forward_base_penalty
+        #         + self.edge_latency_cost_weight
+        #         * edge_latency_cost
+        #         + self.sla_risk_cost_weight
+        #         * predicted_sla_violation_degree
+        #     )
+        #
+        # # 云边转发
+        # if action_type == "cloud":
+        #     transfer_latency = float(
+        #         transfer_latency
+        #     )
+        #
+        #     cloud_latency_cost = self._normalize(
+        #         value=transfer_latency,
+        #         scale=float(
+        #             self.max_cloud_latency
+        #         ),
+        #     )
+        #
+        #     # Cloud 与 Edge 使用完全相同的 SLA 定义。
+        #     predicted_completion_time = (
+        #         self._predict_completion_time_if_start_now(
+        #             job=job,
+        #             extra_latency=transfer_latency,
+        #         )
+        #     )
+        #
+        #     predicted_sla_violation_degree = (
+        #         self._calculate_sla_violation_degree(
+        #             job=job,
+        #             completion_time=predicted_completion_time,
+        #         )
+        #     )
+        #
+        #     return -float(
+        #         self.cloud_latency_cost_weight
+        #         * cloud_latency_cost
+        #         + self.sla_risk_cost_weight
+        #         * predicted_sla_violation_degree
+        #     )
+
+        #
+
+        # 远程卸载即时 Reward，Edge→Edge 与 Edge→Cloud 使用完全相同的 Reward 结构
+        if action_type in {"edge_dc", "cloud"}:
+
             transfer_latency = float(transfer_latency)
 
-            edge_latency_cost = self._normalize(
-                value=transfer_latency,
-                scale=float(
-                    self.max_edge_latency
-                ),
-            )
+            remote_latency_cost = self._normalize(value=transfer_latency, scale=float(self.max_latency),)
 
-            predicted_completion_time = (
-                self._predict_completion_time_if_start_now(
-                    job=job,
-                    extra_latency=transfer_latency,
-                )
-            )
-
-            predicted_sla_violation_degree = (
-                self._calculate_sla_violation_degree(
-                    job=job,
-                    completion_time=predicted_completion_time,
-                )
-            )
+            predicted_completion_time = (self._predict_completion_time_if_start_now(job=job,extra_latency=transfer_latency,))
+            predicted_sla_violation_degree = (self._calculate_sla_violation_degree(job=job, completion_time=predicted_completion_time,))
 
             return -float(
-                self.edge_forward_base_penalty
-                + self.edge_latency_cost_weight
-                * edge_latency_cost
-                + self.sla_risk_cost_weight
-                * predicted_sla_violation_degree
-            )
-
-
-        # 云边转发
-        if action_type == "cloud":
-            transfer_latency = float(
-                transfer_latency
-            )
-
-            cloud_latency_cost = self._normalize(
-                value=transfer_latency,
-                scale=float(
-                    self.max_cloud_latency
-                ),
-            )
-
-            # Cloud 与 Edge 使用完全相同的 SLA 定义。
-            predicted_completion_time = (
-                self._predict_completion_time_if_start_now(
-                    job=job,
-                    extra_latency=transfer_latency,
-                )
-            )
-
-            predicted_sla_violation_degree = (
-                self._calculate_sla_violation_degree(
-                    job=job,
-                    completion_time=predicted_completion_time,
-                )
-            )
-
-            return -float(
-                self.cloud_latency_cost_weight
-                * cloud_latency_cost
-                + self.sla_risk_cost_weight
-                * predicted_sla_violation_degree
+                self.remote_offload_base_penalty
+                + self.remote_latency_cost_weight * remote_latency_cost
+                + self.sla_risk_cost_weight * predicted_sla_violation_degree
             )
 
     # 检查好一个 episode 是否结束
