@@ -1,5 +1,5 @@
 /dataset/
-/result/envkeep/
-/environment/
+/result/MASAC/
+/environment/env_keep/
 /schedulers/MASAC/model/
 /schedulers/MASAC/result/
