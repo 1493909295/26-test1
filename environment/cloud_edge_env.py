@@ -68,8 +68,8 @@ class CloudEdgeEnv(AECEnv):
         else:
             self.env_source = EnvGenerator()
             self.env_source.generate_environment(
-                lambda_rate=self.env_source.lambda_rate,
-                job_dataset_path=self.env_source.job_dataset_path,
+                # lambda_rate=self.env_source.lambda_rate,
+                # job_dataset_path=self.env_source.job_dataset_path,
                 cloud_latency_range=self.env_source.cloud_latency_range,
                 edge_latency_range=self.env_source.edge_latency_range,
             )
@@ -95,6 +95,11 @@ class CloudEdgeEnv(AECEnv):
         self.base_graph = copy.deepcopy(self.env_source.datacenter_graph)
 
         source_job_num = int(getattr(self.env_source, "job_num",conf.NUM_JOBS,))
+        self.job_num = (
+            source_job_num
+            if source_job_num > 0
+            else int(conf.NUM_JOBS)
+        )
         source_lambda_rate = float(getattr(self.env_source, "lambda_rate", conf.LAMBDA_RATE,))
         self.lambda_rate = (
             source_lambda_rate
@@ -383,6 +388,8 @@ class CloudEdgeEnv(AECEnv):
         self.sla_risk_cost_weight = float(conf.SLA_RISK_COST_WEIGHT)
         # 等待被处理的奖励修正事件列表
         self.pending_reward_corrections: List[Dict[str, Any]] = []
+
+        self._init_normalization_stats()
         
     # PettingZoo 标准接口，返回指定 agent 的观测空间。
     @functools.lru_cache(maxsize=None)
@@ -517,14 +524,15 @@ class CloudEdgeEnv(AECEnv):
         # self.jobs = copy.deepcopy(self.base_jobs)
         self.datacenters = copy.deepcopy(self.base_datacenters)
         self.graph = copy.deepcopy(self.base_graph)
+        self.jobs = (self._generate_episode_workload())
 
         # 归一化统一不同特征的尺度
-        self._init_normalization_stats()
+        # self._init_normalization_stats()
 
         # 每次episode 开始时，重新随机指定每个 job 到达哪个边缘数据中心
-        for job in self.jobs:
-            arrived_dc_id = str(self.rng.choice(self.edge_dc_ids))
-            job.set_target_datacenter(arrived_dc_id)
+        # for job in self.jobs:
+        #     arrived_dc_id = str(self.rng.choice(self.edge_dc_ids))
+        #     job.set_target_datacenter(arrived_dc_id)
 
         # 构建快速查询映射。
         self.job_map = {
@@ -1390,23 +1398,33 @@ class CloudEdgeEnv(AECEnv):
         eps = 1e-8
         self.norm_eps = eps
 
-        # 统计任务相关特征的最大值，后续可以用这些最大值对 job 特征做 max-scale 归一化
-        self.max_job_cpu = max(
-            max(float(job.cpu_request) for job in self.base_jobs),
-            eps,
-        )
-        self.max_job_gpu = max(
-            max(float(job.gpu_request) for job in self.base_jobs),
-            eps,
-        )
-        self.max_job_duration = max(
-            max(float(job.duration) for job in self.base_jobs),
-            eps,
-        )
-        self.max_arrive_time = max(
-            max(float(job.arrive_time) for job in self.base_jobs),
-            eps,
-        )
+        # # 统计任务相关特征的最大值，后续可以用这些最大值对 job 特征做 max-scale 归一化
+        # self.max_job_cpu = max(
+        #     max(float(job.cpu_request) for job in self.base_jobs),
+        #     eps,
+        # )
+        # self.max_job_gpu = max(
+        #     max(float(job.gpu_request) for job in self.base_jobs),
+        #     eps,
+        # )
+        # self.max_job_duration = max(
+        #     max(float(job.duration) for job in self.base_jobs),
+        #     eps,
+        # )
+        # self.max_arrive_time = max(
+        #     max(float(job.arrive_time) for job in self.base_jobs),
+        #     eps,
+        # )
+
+        job_dataset_df = load_job_dataset(self.job_dataset_path)
+
+        job_cpu_values = np.asarray(job_dataset_df["cpu_request"], dtype=np.float64,)
+        job_gpu_values = np.asarray(job_dataset_df["gpu_request"],dtype=np.float64,)
+        job_duration_values = np.asarray(job_dataset_df["duration"],dtype=np.float64,)
+
+        self.max_job_cpu = max(float(np.max(job_cpu_values)),eps,)
+        self.max_job_gpu = max(float(np.max(job_gpu_values)),eps,)
+        self.max_job_duration = max(float(np.max(job_duration_values)),eps,)
 
         # 统计 host 级别和 datacenter 级别的资源容量最大值
         all_hosts = [
@@ -1431,23 +1449,25 @@ class CloudEdgeEnv(AECEnv):
             eps,
         )
 
-        # Waiting Queue Workload 的归一化参考尺度
-        job_durations = np.asarray(
-            [
-                float(job.duration)
-                for job in self.base_jobs
-            ],
-            dtype=np.float64,
-        )
-        self.queue_workload_scale = max(
-            float(
-                np.percentile(
-                    job_durations,
-                    75.0,       # 这里可能是个坑，留着以后填
-                )
-            ),
-            self.norm_eps,
-        )
+        # # Waiting Queue Workload 的归一化参考尺度
+        # job_durations = np.asarray(
+        #     [
+        #         float(job.duration)
+        #         for job in self.base_jobs
+        #     ],
+        #     dtype=np.float64,
+        # )
+        # self.queue_workload_scale = max(
+        #     float(
+        #         np.percentile(
+        #             job_durations,
+        #             75.0,       # 这里可能是个坑，留着以后填
+        #         )                 # 2026-8-20 1:43，填坑成功
+        #     ),
+        #     self.norm_eps,
+        # )
+
+        self.queue_workload_scale = max(float(np.percentile(job_duration_values, 75.0,)),self.norm_eps,)
 
         # 统计拓扑图中最大的链路时延
         # latencies = []
