@@ -118,6 +118,7 @@ class CloudEdgeEnv(AECEnv):
 
         # 云节点定义
         self.cloud_id = "cloud"
+        self.enable_cloud_action = bool(conf.ENABLE_CLOUD_ACTION)
         dc_ids = [dc.dc_id for dc in self.base_datacenters]
 
         # 提取边缘dc id
@@ -1144,26 +1145,30 @@ class CloudEdgeEnv(AECEnv):
         # 最后一个动作是卸载到云
         cloud_action_idx = self.cloud_action_index
 
-        if self.cloud_id not in self.dc_map:
+        if not self.enable_cloud_action:
             mask[cloud_action_idx] = 0
+        else:
 
-        elif self.graph is not None and not self.graph.has_edge(agent_id, self.cloud_id):
-            mask[cloud_action_idx] = 0
-        elif current_job is not None:
-            cloud_dc = self.dc_map[self.cloud_id]
-            if len(cloud_dc.host_list) == 0:
+            if self.cloud_id not in self.dc_map:
                 mask[cloud_action_idx] = 0
-            else:
-                cloud_host = cloud_dc.host_list[0]
-                if not cloud_host.can_ever_accommodate(current_job):
+
+            elif self.graph is not None and not self.graph.has_edge(agent_id, self.cloud_id):
+                mask[cloud_action_idx] = 0
+            elif current_job is not None:
+                cloud_dc = self.dc_map[self.cloud_id]
+                if len(cloud_dc.host_list) == 0:
                     mask[cloud_action_idx] = 0
                 else:
-                    # Cloud 也必须遵守与 Edge 完全相同的最大完成时间约束。
-                    transfer_latency = float(self.graph[agent_id][self.cloud_id].get("weight", 0.0,))
-                    predicted_completion_time = (self._predict_completion_time_if_start_now(job=current_job, extra_latency=transfer_latency,))
-                    drop_limit = (self._get_drop_completion_limit(current_job))
-                    if predicted_completion_time > drop_limit + self.TIME_EPS:
+                    cloud_host = cloud_dc.host_list[0]
+                    if not cloud_host.can_ever_accommodate(current_job):
                         mask[cloud_action_idx] = 0
+                    else:
+                        # Cloud 也必须遵守与 Edge 完全相同的最大完成时间约束。
+                        transfer_latency = float(self.graph[agent_id][self.cloud_id].get("weight", 0.0,))
+                        predicted_completion_time = (self._predict_completion_time_if_start_now(job=current_job, extra_latency=transfer_latency,))
+                        drop_limit = (self._get_drop_completion_limit(current_job))
+                        if predicted_completion_time > drop_limit + self.TIME_EPS:
+                            mask[cloud_action_idx] = 0
         return mask
 
     # 将一个 DataCenter 编码成长度为 self.dc_feat_dim 的特征向量

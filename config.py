@@ -10,7 +10,7 @@ HOST_DATASET_PATH = os.path.join(BASE_DIR, "./dataset/DC_dataset/node_info_df.cs
 NUM_DATACENTERS = 5          # 数据中心数量
 NUM_HOST = 100               # 全局生成的主机 (Host) 总数量
 NUM_JOBS = 1000              # 全局生成的任务 (Job) 总数量
-LAMBDA_RATE = 0.25           # LAMBDA_RATE 越大，任务到达越密集（时间间隔越短）
+LAMBDA_RATE = 0.15           # LAMBDA_RATE 越大，任务到达越密集（时间间隔越短）
 CLOUD_LATENCY_RANGE = (10, 20) # 边缘节点到云数据中心的时延范围
 EDGE_LATENCY_RANGE = (2,5)    # 边缘节点之间的时延范围
 # DROP_DEADLINE_RATE = 2.0      # 丢弃任务超时倍数
@@ -98,3 +98,7 @@ FAILURE_CREDIT_DECAY = 0.8              # 调度链惩罚衰减参数
 
 ENERGY_NORMALIZATION_J = 170000.0       # 将真实物理能耗 J 缩放到适合 Reward 学习的数值范围
 ENERGY_COST_WEIGHT = 0.30               #  控制 Energy objective 在联合 Reward 中的相对权重
+
+
+# cloud 开关，false为关闭云
+ENABLE_CLOUD_ACTION = False
