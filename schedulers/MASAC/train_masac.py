@@ -1363,6 +1363,9 @@ def load_checkpoint_if_needed(
 # 写训练日志用的
 def build_run_log_path(base_log_path: str) -> Path:
     base_path = Path(base_log_path)
+    if not base_path.is_absolute():
+        base_path = (PROJECT_ROOT/base_path)
+    base_path = base_path.resolve()
     run_start_time = datetime.now().strftime(
         "%Y%m%d_%H%M%S"
     )
@@ -1820,6 +1823,22 @@ def train(
     # 创建 checkpoint 目录
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_csv_path.parent.mkdir(parents=True, exist_ok=True,)
+
+    current_log_pointer_path = (log_csv_path.parent / "current_train_log.txt")
+    current_log_pointer_path.write_text(str(log_csv_path.resolve()), encoding="utf-8",)
+
+    print(
+        "\n"
+        "============================================================\n"
+        "📊 本次训练日志\n"
+        f"CSV Path : {log_csv_path.resolve()}\n"
+        f"Pointer  : {current_log_pointer_path.resolve()}\n"
+        "\n"
+        "每个 Episode 完成后会立即追加一行并写入磁盘。\n"
+        "训练过程中可以直接读取该 CSV 查看已完成 Episode。\n"
+        "============================================================\n",
+        flush=True,
+    )
 
     try:
         # 从 start_episode 训练到 num_episodes，包含最后一个 episode。

@@ -8,10 +8,10 @@ HOST_DATASET_PATH = os.path.join(BASE_DIR, "./dataset/DC_dataset/node_info_df.cs
 
 # 环境基本参数
 NUM_DATACENTERS = 5          # 数据中心数量
-NUM_HOST = 50                # 全局生成的主机 (Host) 总数量
+NUM_HOST = 100               # 全局生成的主机 (Host) 总数量
 NUM_JOBS = 1000              # 全局生成的任务 (Job) 总数量
 LAMBDA_RATE = 0.25           # LAMBDA_RATE 越大，任务到达越密集（时间间隔越短）
-CLOUD_LATENCY_RANGE = (5, 20) # 边缘节点到云数据中心的时延范围
+CLOUD_LATENCY_RANGE = (10, 20) # 边缘节点到云数据中心的时延范围
 EDGE_LATENCY_RANGE = (2,5)    # 边缘节点之间的时延范围
 # DROP_DEADLINE_RATE = 2.0      # 丢弃任务超时倍数
 SLA_DEADLINE_RATIO = 2.0
@@ -59,7 +59,7 @@ DEVICE = "cuda:0"
 
 
 # 训练基本参数
-Episodes = 1000         # 训练轮次
+Episodes = 600         # 训练轮次
 ReplyBuffer_Capacity = 200000           # 经验池容量
 Batch_Size = 512            # 采样批量
 Seed = 42           # 宇宙的终极答案
@@ -88,7 +88,7 @@ QUEUE_ADMISSION_COST_WEIGHT = 0.5       # 排队风险参数，帮助模型认�
 # EDGE_LATENCY_COST_WEIGHT = 1.0          # 边边时延惩罚
 # CLOUD_LATENCY_COST_WEIGHT = 1.0         # 云边时延惩罚
 REMOTE_OFFLOAD_BASE_PENALTY = 0.05        # 远程调度成本
-REMOTE_LATENCY_COST_WEIGHT = 1.0          # 远程时延成本权重
+REMOTE_LATENCY_COST_WEIGHT = 1.5          # 远程时延成本权重
 SLA_RISK_COST_WEIGHT = 1.0              # 违约风险参数
 EDGE_DEADLINE_RISK_COST_WEIGHT = 1.0    # Edge 转发行为对任务剩余 deadline 的侵蚀
 TIMEOUT_DROP_PENALTY = 4.0              # 超时惩罚
