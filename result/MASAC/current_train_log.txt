@@ -1,1 +1,1 @@
-C:\DuYan\experiment\26-MA-3\result\MASAC\train_log_20260821_180854.csv
+C:\DuYan\experiment\26-MA-4\result\MASAC\train_log_20260824_141702.csv
