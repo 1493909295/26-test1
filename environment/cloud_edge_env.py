@@ -49,12 +49,6 @@ class CloudEdgeEnv(AECEnv):
     ):
         super().__init__()
 
-        # 用于检查非法动作处理模式是否合法
-        # if invalid_action_mode not in {"raise", "stay", "mask"}:
-        #     raise ValueError("invalid_action_mode 必须是 'raise'、'stay' 或 'mask'。")
-
-        # self.invalid_action_mode = invalid_action_mode
-
         # 随机数种子生成器用于任务分配
         self.rng = np.random.default_rng(seed)
         self.seed_value = seed
@@ -82,15 +76,13 @@ class CloudEdgeEnv(AECEnv):
                     f"env_source 缺少必要属性 {attr}，"
                     f"请检查 EnvGenerator 或 UseOldEnv 是否正确生成/加载环境。"
                 )
-        # if len(self.env_source.wait_assign_jobs_list) == 0:
-        #     raise ValueError("环境中的 wait_assign_jobs_list 为空，无法进行训练。")
+
         if len(self.env_source.global_dc_list) == 0:
             raise ValueError("环境中的 global_dc_list 为空，无法进行训练。")
         if self.env_source.datacenter_graph is None:
             raise ValueError("环境中的 datacenter_graph 为空，无法计算节点间时延。")
 
         # 保存一份干净的基础环境副本,避免一个 episode 修改 host 队列、job 状态后污染下一个 episode
-        # self.base_jobs = copy.deepcopy(self.env_source.wait_assign_jobs_list)
         self.base_datacenters = copy.deepcopy(self.env_source.global_dc_list)
         self.base_graph = copy.deepcopy(self.env_source.datacenter_graph)
 
@@ -130,17 +122,14 @@ class CloudEdgeEnv(AECEnv):
         if len(self.edge_dc_ids) == 0:
             raise ValueError("环境中没有可作为智能体的边缘数据中心。")
 
-        # 在训练开始时，为每个待调度任务随机指定一个到达的边缘数据中心,后续每个 episode 的 reset() 都会从 self.base_jobs 深拷贝
-        # for job in self.base_jobs:
-        #     arrived_dc_id = str(self.rng.choice(self.edge_dc_ids))
-        #     job.set_target_datacenter(arrived_dc_id)
-
 
         # 边缘 DC 在前，cloud 放在最后
         self.all_dc_ids = self.edge_dc_ids + [self.cloud_id]
+
         # 记录数据中心数量
         self.num_edge_dc = len(self.edge_dc_ids)
         self.num_all_dc = len(self.all_dc_ids)
+
         # 计算边缘数据中心中最大的 host 数量，不同 DC 的 host 数可能不同。为了构造统一动作空间，需要用最大 host 数量对齐。
         self.max_host_num = max(
             len(dc.host_list)
@@ -148,9 +137,41 @@ class CloudEdgeEnv(AECEnv):
             if dc.dc_id != self.cloud_id
         )
 
+        # Routing Action 编码
+        self.routing_action_to_dc_id = {
+            action_idx: dc_id
+            for action_idx, dc_id
+            in enumerate(self.edge_dc_ids)
+        }
+
+        self.routing_dc_id_to_action = {
+            dc_id: action_idx
+            for action_idx, dc_id
+            in self.routing_action_to_dc_id.items()
+        }
+
+        # cloud开关
+        if self.enable_cloud_action:
+            self.cloud_action_index = self.num_edge_dc
+        else:
+            self.cloud_action_index = None
+
+        self.action_dim = (
+                self.num_edge_dc
+                + (1 if self.enable_cloud_action else 0)
+        )
+
+        self.action_spaces = {
+            agent_id: spaces.Discrete(self.action_dim)
+            for agent_id in self.agent_ids
+        }
+
+        self.single_action_space = spaces.Discrete(
+            self.action_dim
+        )
+
         ######## pettingzoo 要求这俩种获取智能体方法都得有，所以都得写
         # 自己定义的方法，获取边缘数据中心智能体总数
-        # self.num_agents = len(self.edge_dc_ids)  pettingzoo里这个是只读的
         self.num_edge_agents = len(self.edge_dc_ids)
 
         # 获取环境中所有坑智能体数量
@@ -159,43 +180,21 @@ class CloudEdgeEnv(AECEnv):
         self.agents: List[str] = []
         self.agent_ids = self.possible_agents[:]
 
-        # self.agent_id_to_dc_id = {
-        #     agent_id: dc_id
-        #     for agent_id, dc_id in zip(self.possible_agents, self.edge_dc_ids)
-        # }
-        # self.dc_id_to_agent_id = {
-        #     dc_id: agent_id
-        #     for agent_id, dc_id in self.agent_id_to_dc_id.items()
-        # }
+
         self.agent_name_mapping = {
             agent: i
             for i, agent in enumerate(self.possible_agents)
         }
-        # self.remote_edge_dc_ids = {
-        #     agent_id: [
-        #         dc_id
-        #         for dc_id in self.edge_dc_ids
-        #         if dc_id != agent_id
-        #     ]
-        #     for agent_id in self.possible_agents
-        # }
 
         # 取代上面的动作编码方案（在选择datacenter时把自己剔除出去）这种方法会导致相同的动作id代表不同的动作选择
         # 新的方法把所有智能体的动作编码建模成一样的，这样会导致选择前面的host动作与选择本地datacenter是相同意义的动作，
         # 需要在后续第一步掩码时把选自己datacenter设置成非法的
-        self.edge_action_start = self.max_host_num
         self.cloud_action_index = self.max_host_num + self.num_edge_dc
-        self.edge_action_to_dc_id = {
-            self.edge_action_start + idx: dc_id
-            for idx, dc_id in enumerate(self.edge_dc_ids)
-        }
+
         ########################################################################################################################
 
-        # 动作空间维度与动作空间
-        # self.action_dim = self.max_host_num + (self.num_edge_dc - 1) + 1
 
         # 新动作建模方法带来的维度改变（维度+1）
-        self.action_dim = self.max_host_num + self.num_edge_dc  + 1
         self.action_spaces = {
             agent_id: spaces.Discrete(self.action_dim)
             for agent_id in self.agent_ids
@@ -204,8 +203,6 @@ class CloudEdgeEnv(AECEnv):
         # 保存单个智能体的动作空间后续可能用
         self.single_action_space = spaces.Discrete(self.action_dim)
 
-        # 这个是为了兼容
-        # self.action_space = spaces.Discrete(self.action_dim)
 
         # 事件队列
         # 队内元素固定为 (event_time, event_type, job_id)
@@ -230,6 +227,8 @@ class CloudEdgeEnv(AECEnv):
         self.current_agent_id = None
         self.current_job_id = None
         self.current_dc_id = None
+        self.pending_host_job_id = None
+        self.pending_host_dc_id = None
         self.running_job_location = {}
 
         # 丢弃机制
@@ -569,6 +568,10 @@ class CloudEdgeEnv(AECEnv):
         self.current_job_id = None
         self.current_dc_id = None
 
+        # 重置当前 Host 层待决策状态
+        self.pending_host_job_id = None
+        self.pending_host_dc_id = None
+
         # 记录运行中任务的位置，reset 时清空
         self.running_job_location = {}
         self.dropped_jobs_info = []
@@ -787,64 +790,20 @@ class CloudEdgeEnv(AECEnv):
             )
             action_type = str(decoded_action["action_type"])
 
-            if action_type == "local_host":
-                host_idx = decoded_action["host_idx"]
-                # success = self._execute_job_on_host(
-                #     job_id=acting_job_id,
-                #     dc_id=acting_agent,
-                #     host_idx=int(host_idx),
-                # )
-                #
-                # failure_reason = None if success else "资源不足"
-                # action_reward = self._compute_action_reward(
-                #     job_id=acting_job_id,
-                #     action_type="local_host",
-                #     success=success,
-                #     transfer_latency=0.0,
-                #     failure_reason=failure_reason,
-                # )
-                execution_result = self._execute_job_on_host(
-                    job_id=acting_job_id,
-                    dc_id=acting_agent,
-                    host_idx=int(host_idx),
-                )
+            if action_type == "self":
+                self.pending_host_job_id = acting_job_id
+                self.pending_host_dc_id = acting_agent
 
-                success = False
-                failure_reason = None
-                # 默认没有进入等待队列。
-                queue_length_after_action = 0
+                action_reward = 0.0
+                self.rewards[acting_agent] = float(action_reward)
+                self._clear_current_decision()
 
-                if execution_result == "started":
-                    success = True
-                    failure_reason = None
+                self.agent_selection = None
 
-                elif execution_result == "queued":
-                    success = True
-                    failure_reason = None
-                    target_dc = self.dc_map[acting_agent]
-                    target_host = target_dc.host_list[int(host_idx)]
-                    queue_length_after_action = len(target_host.waiting_queue)
+                self._accumulate_rewards()
 
-                elif execution_result == "dropped":
-                    # 真正丢弃时才视为本地调度失败。
-                    success = False
-                    failure_reason = "资源不足"
+                return
 
-                # success = execution_result != "dropped"
-                # failure_reason = (
-                #     "资源不足"
-                #     if execution_result == "dropped"
-                #     else None
-                # )
-
-                action_reward = self._compute_action_reward(
-                    job_id=acting_job_id,
-                    action_type="local_host",
-                    success=success,
-                    transfer_latency=0.0,
-                    failure_reason=failure_reason,
-                    queue_length_after_action=queue_length_after_action,
-                )
 
             elif action_type in {"edge_dc", "cloud"}:
                 target_dc_id = decoded_action["target_dc_id"]
@@ -1078,98 +1037,14 @@ class CloudEdgeEnv(AECEnv):
 
     ################################### 辅助函数部分 ####################################
 
-    # 掩码掉因为要对齐host数量导致的部分host可能不合法行为
+    # 不需要掩码了
     def _get_action_mask(self, agent_id: str) -> np.ndarray:
-        ####        掩码机制主要屏蔽以下场景的动作选择       ####
-        ####    1.因为对齐host数量产生的不存在的本地host
-        ####    2.自己对应的边缘DC
-        ####    3.不存在的目标DC或者与目标DC不存在链路（这种情况不会发生）
-        ####    4.确定本次迁移会引起超时丢弃的动作
-        ####    5.host最大资源量不满足任务需求的动作
-        ### 掩码机制不应该再扩大了，过分的掩码只是在掩盖问题，没办法真正意义上改进模型学习能力
+        agent_id = str(agent_id)
 
-        #默认所有动作合法
-        mask = np.ones(self.action_dim, dtype=np.int8)
-        local_dc = self.dc_map[agent_id]
-
-        # 获取当前正在等待该智能体决策
-        current_job = None
-        if (
-                self.current_job_id is not None
-                and self.current_job_id in self.job_map
-                and self.current_agent_id == agent_id
-        ):
-            current_job = self.job_map[self.current_job_id]
-
-        # 屏蔽由于 max_host_num 对齐产生的、不存在的本地 host
-        for host_idx in range(self.max_host_num):
-            if host_idx >= len(local_dc.host_list):
-                mask[host_idx] = 0
-                continue
-            host = local_dc.host_list[host_idx]
-            if current_job is not None:
-                if not host.can_ever_accommodate(current_job):
-                    mask[host_idx] = 0
-                    continue
-
-        for edge_idx, target_dc_id in enumerate(self.edge_dc_ids):
-            action_idx = self.edge_action_start + edge_idx
-            # 屏蔽“通过边缘卸载槽位卸载到自己”的重复语义动作
-            if target_dc_id == agent_id:
-                mask[action_idx] = 0
-                continue
-            # 只要目标dc和链路都存在就合法
-            if target_dc_id not in self.dc_map:
-                mask[action_idx] = 0
-                continue
-            if self.graph is not None and not self.graph.has_edge(agent_id, target_dc_id):
-                mask[action_idx] = 0
-                continue
-            # 检查本次调度是否会引起确定性的超时丢弃
-            if current_job is not None:
-                transfer_latency = float(
-                    self.graph[
-                        agent_id
-                    ][
-                        target_dc_id
-                    ].get(
-                        "weight",
-                        0.0,
-                    )
-                )
-                predicted_completion_time = (self._predict_completion_time_if_start_now(job=current_job, extra_latency=transfer_latency,))
-                drop_limit = (self._get_drop_completion_limit(current_job))
-                if predicted_completion_time > drop_limit + self.TIME_EPS:
-                    mask[action_idx] = 0
-                    continue
-        # 最后一个动作是卸载到云
-        cloud_action_idx = self.cloud_action_index
-
-        if not self.enable_cloud_action:
-            mask[cloud_action_idx] = 0
-        else:
-
-            if self.cloud_id not in self.dc_map:
-                mask[cloud_action_idx] = 0
-
-            elif self.graph is not None and not self.graph.has_edge(agent_id, self.cloud_id):
-                mask[cloud_action_idx] = 0
-            elif current_job is not None:
-                cloud_dc = self.dc_map[self.cloud_id]
-                if len(cloud_dc.host_list) == 0:
-                    mask[cloud_action_idx] = 0
-                else:
-                    cloud_host = cloud_dc.host_list[0]
-                    if not cloud_host.can_ever_accommodate(current_job):
-                        mask[cloud_action_idx] = 0
-                    else:
-                        # Cloud 也必须遵守与 Edge 完全相同的最大完成时间约束。
-                        transfer_latency = float(self.graph[agent_id][self.cloud_id].get("weight", 0.0,))
-                        predicted_completion_time = (self._predict_completion_time_if_start_now(job=current_job, extra_latency=transfer_latency,))
-                        drop_limit = (self._get_drop_completion_limit(current_job))
-                        if predicted_completion_time > drop_limit + self.TIME_EPS:
-                            mask[cloud_action_idx] = 0
-        return mask
+        return np.ones(
+            self.action_dim,
+            dtype=np.int8,
+        )
 
     # 将一个 DataCenter 编码成长度为 self.dc_feat_dim 的特征向量
     def _encode_dc_features(self, dc: DataCenter) -> List[float]:
@@ -1312,7 +1187,10 @@ class CloudEdgeEnv(AECEnv):
 
     # 将动作编码解码成动作，动作编码必须是int类型
     def _decode_action(self, agent_id: str, action: int) -> Dict[str, Any]:
+        agent_id = str(agent_id)
         action = int(action)
+
+        # 丢弃动作仍然保留
         if action == self.drop_action:
             return {
                 "action_type": "drop",
@@ -1320,15 +1198,19 @@ class CloudEdgeEnv(AECEnv):
                 "target_dc_id": None,
                 "host_idx": None,
             }
-        if 0 <= action < self.max_host_num:
-            return {
-                "action_type": "local_host",
-                "source_dc_id": agent_id,
-                "target_dc_id": agent_id,
-                "host_idx": action,
-            }
-        if self.edge_action_start <= action < self.cloud_action_index:
-            target_dc_id = self.edge_action_to_dc_id[action]
+
+        # Edge Routing action
+        if action in self.routing_action_to_dc_id:
+
+            target_dc_id = str(self.routing_action_to_dc_id[action])
+
+            if target_dc_id == agent_id:
+                return {
+                    "action_type": "self",
+                    "source_dc_id": agent_id,
+                    "target_dc_id": agent_id,
+                    "host_idx": None,
+                }
 
             return {
                 "action_type": "edge_dc",
@@ -1336,7 +1218,11 @@ class CloudEdgeEnv(AECEnv):
                 "target_dc_id": target_dc_id,
                 "host_idx": None,
             }
-        if action == self.cloud_action_index:
+
+        if (
+                self.cloud_action_index is not None
+                and action == self.cloud_action_index
+        ):
             return {
                 "action_type": "cloud",
                 "source_dc_id": agent_id,
@@ -1344,10 +1230,6 @@ class CloudEdgeEnv(AECEnv):
                 "host_idx": None,
             }
 
-        raise ValueError(
-            f"无法解码动作 action={action}，"
-            f"当前动作空间范围应为 [-1] 或 [0, {self.action_dim - 1}]。"
-        )
 
     # 构造 MASAC centralized critic 使用的全局状态
     def _get_global_state(self) -> np.ndarray:
@@ -2251,6 +2133,10 @@ class CloudEdgeEnv(AECEnv):
             return False
         if self.current_dc_id is not None:
             return False
+        if self.pending_host_job_id is not None:
+            return False
+        if self.pending_host_dc_id is not None:
+            return False
 
         # 事件队列中仍有任务到达事件或任务完成事件
         if len(self.event_queue) > 0:
@@ -2272,6 +2158,8 @@ class CloudEdgeEnv(AECEnv):
         self.current_job_id = None
         self.current_dc_id = None
         self.current_agent_id = None
+        self.pending_host_job_id = None
+        self.pending_host_dc_id = None
 
     # 判断两个浮点事件时间是否属于同一个仿真时刻
     @classmethod

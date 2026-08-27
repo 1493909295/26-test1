@@ -94,7 +94,7 @@ class EpisodeStatistics:
             self.policy_action_count += 1
             self.normal_action_count += 1
 
-        if action_type == "local_host":
+        if action_type == "self":
             self.local_action_count += 1
         elif action_type == "edge_dc":
             self.edge_action_count += 1
