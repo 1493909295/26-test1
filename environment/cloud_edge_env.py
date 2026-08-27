@@ -186,22 +186,7 @@ class CloudEdgeEnv(AECEnv):
             for i, agent in enumerate(self.possible_agents)
         }
 
-        # 取代上面的动作编码方案（在选择datacenter时把自己剔除出去）这种方法会导致相同的动作id代表不同的动作选择
-        # 新的方法把所有智能体的动作编码建模成一样的，这样会导致选择前面的host动作与选择本地datacenter是相同意义的动作，
-        # 需要在后续第一步掩码时把选自己datacenter设置成非法的
-        self.cloud_action_index = self.max_host_num + self.num_edge_dc
-
         ########################################################################################################################
-
-
-        # 新动作建模方法带来的维度改变（维度+1）
-        self.action_spaces = {
-            agent_id: spaces.Discrete(self.action_dim)
-            for agent_id in self.agent_ids
-        }
-
-        # 保存单个智能体的动作空间后续可能用
-        self.single_action_space = spaces.Discrete(self.action_dim)
 
 
         # 事件队列

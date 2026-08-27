@@ -15,11 +15,18 @@ import torch
 from datetime import datetime
 # 找根目录
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+H_MASAC_DIR = Path(__file__).resolve().parent
 # 找环境代码
 ENVIRONMENT_DIR = PROJECT_ROOT / "environment"
-from schedulers.MASAC.masac_agent import (DiscreteMASAC, MASACConfig)
-from schedulers.MASAC.replay_buffer import ReplayBuffer
-from schedulers.MASAC.transition_collector import (DecisionSnapshot, TransitionCollector)
+if str(H_MASAC_DIR) not in sys.path:
+    sys.path.insert(0, str(H_MASAC_DIR))
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from h_masac_agent import (DiscreteMASAC,MASACConfig,)
+from replay_buffer import ReplayBuffer
+from transition_collector import (DecisionSnapshot,TransitionCollector,)
 from environment.cloud_edge_env import CloudEdgeEnv
 import config as conf
 
