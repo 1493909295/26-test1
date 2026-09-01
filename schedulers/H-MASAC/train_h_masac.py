@@ -58,6 +58,7 @@ class TrainConfig:
     vary_episode_seed: bool = conf.Vary_Episode_Seed
     completion_credit_decay: float = conf.COMPLETION_CREDIT_DECAY
     failure_credit_decay: float = (conf.FAILURE_CREDIT_DECAY)
+    use_neighbor_historical_feedback: bool = (conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK)
 
 # 统计一个 episode 运行期间的统计信息
 @dataclass
@@ -1781,7 +1782,22 @@ def train(
         old_env_path=train_config.old_env_path,
     )
 
-    routing_observation_builder = (RoutingObservationBuilder(env))
+    routing_observation_builder = (
+        RoutingObservationBuilder(
+            env=env,
+
+            # 当前默认 False：
+            # 只保留 Feedback Observation 接口，
+            # 不让历史结果参与 Routing 决策。
+            use_neighbor_historical_feedback=(
+                train_config
+                    .use_neighbor_historical_feedback
+            ),
+
+            # 当前阶段尚未建立 Historical Feedback Store。
+            neighbor_feedback_provider=None,
+        )
+    )
     routing_obs_dim = int(routing_observation_builder.obs_dim)
 
     # 创建 Transition 采集器

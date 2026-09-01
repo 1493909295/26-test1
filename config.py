@@ -102,3 +102,6 @@ ENERGY_COST_WEIGHT = 0.30               #  控制 Energy objective 在联合 Rew
 
 # cloud 开关，false为关闭云
 ENABLE_CLOUD_ACTION = True
+
+# Neighbor Historical Feedback 开关，false为关闭反馈信息
+USE_NEIGHBOR_HISTORICAL_FEEDBACK = False

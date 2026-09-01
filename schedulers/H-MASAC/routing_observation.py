@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List,Mapping,Optional
 import numpy as np
 from typing import Any, Optional
 
@@ -15,8 +15,18 @@ class RoutingObservationBuilder:
     ROUTE_HISTORY_FEAT_DIM = 3
     # 任务执行反馈
     FEEDBACK_FEAT_PER_DC = 7
+    FEEDBACK_FEATURE_NAMES = (
+        "success_ewma",
+        "sla_success_ewma",
+        "drop_ewma",
+        "completion_time_ewma",
+        "reforward_ewma",
+        "feedback_age",
+        "sample_confidence",
+    )
 
-    def __init__(self, env: Any) -> None:
+    def __init__(self, env: Any, use_neighbor_historical_feedback: bool = False,
+    neighbor_feedback_provider: Optional[Any] = None,) -> None:
 
         self.env = env
         self.edge_dc_ids = [
@@ -30,6 +40,8 @@ class RoutingObservationBuilder:
         self.local_dc_feat_dim = (self.LOCAL_DC_BASE_FEAT_DIM + self.LOCAL_DC_ROUTING_FEAT_DIM)
         self.route_history_feat_dim = (self.ROUTE_HISTORY_FEAT_DIM)
         self.link_feat_dim = len(self.link_target_dc_ids)
+        self.use_neighbor_historical_feedback = bool(use_neighbor_historical_feedback)
+        self.neighbor_feedback_provider = (neighbor_feedback_provider)
         self.feedback_feat_dim = (len(self.edge_dc_ids) * self.FEEDBACK_FEAT_PER_DC)
         self.obs_dim = (
             self.job_feat_dim
@@ -38,6 +50,19 @@ class RoutingObservationBuilder:
             + self.link_feat_dim
             + self.feedback_feat_dim
         )
+
+    # 注入 Neighbor Historical Feedback 数据提供器
+    def set_neighbor_feedback_provider(self, provider: Optional[Any],) -> None:
+        """
+        注入 Neighbor Historical Feedback 数据提供器。
+
+        当前阶段训练时保持 provider=None。
+
+        未来 Provider 必须只读取历史统计数据，
+        不能读取目标 DC 当前实时资源状态。
+        """
+
+        self.neighbor_feedback_provider = provider
 
     # 重置单episode调度信息
     def reset_episode(self) -> None:
@@ -217,8 +242,9 @@ class RoutingObservationBuilder:
         link_features = self._encode_links(agent_id=agent_id,)
         obs.extend(link_features)
 
-        # Neighbor Historical Feedback 占位
-        obs.extend([0.0] * self.feedback_feat_dim)
+        # Neighbor Historical Feedback
+        feedback_features = (self._encode_neighbor_feedback(agent_id=agent_id,))
+        obs.extend(feedback_features)
 
         obs_array = np.asarray(obs, dtype=np.float32,)
 
@@ -913,7 +939,188 @@ class RoutingObservationBuilder:
 
         return features
 
-    
+    #
+    def _encode_neighbor_feedback(self, agent_id: str,) -> List[float]:
+        """
+        构造固定长度的 Neighbor Historical Feedback block。
+
+        固定顺序：
+
+            DC1 的 7维
+            DC2 的 7维
+            ...
+            DCN 的 7维
+
+        当前阶段：
+            USE_NEIGHBOR_HISTORICAL_FEEDBACK=False
+
+        因此无论系统历史如何变化，都返回全 0。
+
+        这保证：
+            1. Actor 输入维度已经稳定；
+            2. 当前实验不受历史反馈影响；
+            3. 以后打开 Feedback 不需要修改网络结构。
+        """
+
+        agent_id = str(agent_id)
+
+        # ==========================================================
+        # Feedback disabled
+        #
+        # 当前正式实验走这里：
+        #
+        #     F_i = 0
+        #
+        # 不查询 Provider；
+        # 不访问 Remote DC；
+        # 不读取任何历史结果。
+        # ==========================================================
+        if not self.use_neighbor_historical_feedback:
+            return [
+                0.0
+                for _ in range(
+                    self.feedback_feat_dim
+                )
+            ]
+
+        # ==========================================================
+        # Feedback enabled
+        #
+        # 未来真正启用时才进入。
+        #
+        # 如果用户打开开关却没有安装 Feedback Provider，
+        # 必须直接报错，而不是偷偷继续返回全 0。
+        # ==========================================================
+        if self.neighbor_feedback_provider is None:
+            raise RuntimeError(
+                "USE_NEIGHBOR_HISTORICAL_FEEDBACK=True，"
+                "但没有配置 Neighbor Feedback Provider。"
+            )
+
+        feedback_features: List[float] = []
+
+        # ==========================================================
+        # 每个 Edge DC 始终占固定 7 维。
+        #
+        # 使用全局固定 edge_dc_ids 顺序，
+        # 对参数共享 Routing Actor 非常重要。
+        # ==========================================================
+        for target_dc_id in self.edge_dc_ids:
+
+            target_dc_id = str(target_dc_id)
+
+            # ------------------------------------------------------
+            # 当前 Agent 自己并不是 Neighbor。
+            #
+            # 但仍然保留自己的固定 slot，
+            # 这样所有 Agent 的输入布局完全一致。
+            #
+            # Self block 恒为 0。
+            # ------------------------------------------------------
+            if target_dc_id == agent_id:
+                feedback_features.extend(
+                    [0.0]
+                    * self.FEEDBACK_FEAT_PER_DC
+                )
+
+                continue
+
+            # ------------------------------------------------------
+            # 未来历史数据接口。
+            #
+            # 这里只允许 Provider 返回历史统计结果。
+            # ------------------------------------------------------
+            feedback = (
+                self.neighbor_feedback_provider
+                    .get_feedback(
+                    source_dc_id=agent_id,
+                    target_dc_id=target_dc_id,
+                )
+            )
+
+            # 尚未收集到任何历史样本：
+            #
+            # 7维全部置 0，
+            # sample_confidence=0 同时能够表达“没有证据”。
+            if feedback is None:
+                feedback_features.extend(
+                    [0.0]
+                    * self.FEEDBACK_FEAT_PER_DC
+                )
+
+                continue
+
+            if not isinstance(
+                    feedback,
+                    Mapping,
+            ):
+                raise TypeError(
+                    "Neighbor Feedback Provider 必须返回 "
+                    "Mapping[str, float] 或 None。"
+                )
+
+            block = [
+                float(
+                    feedback.get(
+                        feature_name,
+                        0.0,
+                    )
+                )
+                for feature_name
+                in self.FEEDBACK_FEATURE_NAMES
+            ]
+
+            # ------------------------------------------------------
+            # Provider 输出必须已经归一化到 [0,1]。
+            #
+            # Observation Builder 不负责决定 EWMA 的统计尺度。
+            # ------------------------------------------------------
+            block_array = np.asarray(
+                block,
+                dtype=np.float32,
+            )
+
+            if not np.all(
+                    np.isfinite(block_array)
+            ):
+                raise ValueError(
+                    "Neighbor Feedback 出现 NaN/Inf："
+                    f"source={agent_id}, "
+                    f"target={target_dc_id}, "
+                    f"block={block}"
+                )
+
+            if (
+                    np.any(block_array < 0.0)
+                    or np.any(block_array > 1.0)
+            ):
+                raise ValueError(
+                    "Neighbor Feedback 必须已经归一化到 [0,1]："
+                    f"source={agent_id}, "
+                    f"target={target_dc_id}, "
+                    f"block={block}"
+                )
+
+            feedback_features.extend(
+                block
+            )
+
+        # ==========================================================
+        # 最终维度检查
+        # ==========================================================
+        if (
+                len(feedback_features)
+                != self.feedback_feat_dim
+        ):
+            raise ValueError(
+                "Neighbor Feedback Observation 维度错误："
+                f"expected={self.feedback_feat_dim}, "
+                f"actual={len(feedback_features)}"
+            )
+
+        return feedback_features
+
+
 
 
 
