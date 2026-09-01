@@ -191,7 +191,6 @@ class TransitionCollector:
         local_obs = (self.routing_observation_builder.build(agent_id).copy())
         observation = self.env.observe(agent_id)
 
-        # local_obs = np.asarray(observation["observation"], dtype=np.float32).copy()
         action_mask = np.asarray(observation["action_mask"], dtype=np.int8,).copy()
         global_state = np.asarray(self.env.state(), dtype=np.float32,)
 
@@ -231,6 +230,8 @@ class TransitionCollector:
         self.routing_observation_builder.record_routing_action(
             job_id=decision.job_id,
             action_type=action_type,
+            source_dc_id=decision.agent_id,
+            action=int(action),
         )
 
         # 使用动作前智能体 ID 读取本次即时奖励

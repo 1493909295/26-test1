@@ -22,6 +22,7 @@ class RoutingObservationBuilder:
         self.edge_dc_ids = list(env.edge_dc_ids)
         self.link_target_dc_ids = (list(env.edge_dc_ids) + [str(env.cloud_id)])
         self.job_edge_hop_counts: Dict[str, int] = {}
+        self.job_edge_transfer_latency_s: Dict[str, float,] = {}
         self.job_feat_dim = self.JOB_FEAT_DIM
         self.local_dc_feat_dim = (self.LOCAL_DC_BASE_FEAT_DIM + self.LOCAL_DC_ROUTING_FEAT_DIM)
         self.route_history_feat_dim = (self.ROUTE_HISTORY_FEAT_DIM)
@@ -38,13 +39,102 @@ class RoutingObservationBuilder:
     # 重置单episode调度信息
     def reset_episode(self) -> None:
         self.job_edge_hop_counts.clear()
+        self.job_edge_transfer_latency_s.clear()
 
     # 记录调度
-    def record_routing_action(self, job_id: str, action_type: str,) -> None:
-        if str(action_type) != "edge_dc":
+    def record_routing_action(self, job_id: str, action_type: str,source_dc_id: str, action: int,) -> None:
+        action_type = str(action_type)
+
+        if action_type != "edge_dc":
             return
+
         job_id = str(job_id)
-        self.job_edge_hop_counts[job_id] = (self.job_edge_hop_counts.get(job_id, 0,) + 1)
+        source_dc_id = str(source_dc_id)
+        action = int(action)
+
+        # ==========================================================
+        # 根据统一 Routing action 编码获得目标 Edge DC。
+        # ==============================================================
+        if action not in self.env.routing_action_to_dc_id:
+            raise ValueError(
+                "无法从 Routing action 获得目标 Edge DC："
+                f"action={action}"
+            )
+
+        target_dc_id = str(
+            self.env.routing_action_to_dc_id[
+                action
+            ]
+        )
+
+        # 这里只检查 action_type 与动作含义是否一致。
+        #
+        # 这不是循环防护：
+        # DC1 -> DC3 -> DC1 依然完全合法。
+        if target_dc_id == source_dc_id:
+            raise RuntimeError(
+                "action_type=edge_dc，"
+                "但目标 DC 与源 DC 相同："
+                f"{source_dc_id}"
+            )
+
+        # ==========================================================
+        # 1. Edge -> Edge hop count
+        #
+        # 不存在 MAX_HOPS。
+        # 该值理论上可以无限增加。
+        # ==============================================================
+        self.job_edge_hop_counts[
+            job_id
+        ] = (
+                self.job_edge_hop_counts.get(
+                    job_id,
+                    0,
+                )
+                + 1
+        )
+
+        # ==========================================================
+        # 2. 累计本次真实 Edge -> Edge transmission latency
+        #
+        # 环境执行传输时本身也是读取 graph edge weight，
+        # 因此这里与真实物理传输模型保持一致。
+        # ==============================================================
+        if (
+                self.env.graph is None
+                or not self.env.graph.has_edge(
+            source_dc_id,
+            target_dc_id,
+        )
+        ):
+            raise RuntimeError(
+                "Routing History 找不到对应 Edge 链路："
+                f"{source_dc_id} -> {target_dc_id}"
+            )
+
+        hop_latency_s = max(
+            float(
+                self.env.graph[
+                    source_dc_id
+                ][
+                    target_dc_id
+                ].get(
+                    "weight",
+                    0.0,
+                )
+            ),
+            0.0,
+        )
+
+        self.job_edge_transfer_latency_s[
+            job_id
+        ] = (
+                self.job_edge_transfer_latency_s.get(
+                    job_id,
+                    0.0,
+                )
+                + hop_latency_s
+        )
 
     # 归一化辅助函数
     def _normalize(self, value: float,  scale: float,) -> float:
@@ -370,4 +460,184 @@ class RoutingObservationBuilder:
             )
 
         return features
+
+    #
+    def _encode_route_history(self, job: Any,) -> List[float]:
+        """
+        将当前 Job 已经产生的 Edge Routing 历史
+        压缩成固定 3 维特征。
+
+        固定顺序：
+
+            [0] routing_hop_ratio
+            [1] cumulative_edge_latency_ratio
+            [2] cumulative_edge_energy_ratio
+
+        不包含：
+            visited_dc
+            previous_dc
+            route_path
+            cycle_flag
+        """
+
+        job_id = str(job.job_id)
+
+        eps = max(
+            float(
+                getattr(
+                    self.env,
+                    "norm_eps",
+                    1e-8,
+                )
+            ),
+            1e-12,
+        )
+
+        # ==========================================================
+        # 1. Routing hop count
+        # ==============================================================
+        hop_count = max(
+            int(
+                self.job_edge_hop_counts.get(
+                    job_id,
+                    0,
+                )
+            ),
+            0,
+        )
+
+        # 不存在 MAX_HOPS，因此不能使用：
+        #
+        #     hop / MAX_HOPS
+        #
+        # 使用无上界 saturating encoding：
+        #
+        #     h / (h + 1)
+        #
+        # 0 -> 0
+        # 1 -> 0.5
+        # 2 -> 0.667
+        # 3 -> 0.75
+        # ...
+        routing_hop_ratio = float(
+            hop_count
+            / (
+                    hop_count
+                    + 1.0
+            )
+        )
+
+        # ==========================================================
+        # 2. Cumulative Edge -> Edge transmission latency
+        # ==============================================================
+        cumulative_latency_s = max(
+            float(
+                self.job_edge_transfer_latency_s.get(
+                    job_id,
+                    0.0,
+                )
+            ),
+            0.0,
+        )
+
+        # 使用系统“单链路最大时延”作为参考尺度。
+        #
+        # 不采用 hard clip：
+        # 多跳累计时延超过单链路最大值后仍然能够继续区分。
+        latency_scale_s = max(
+            float(
+                getattr(
+                    self.env,
+                    "max_latency",
+                    1.0,
+                )
+            ),
+            eps,
+        )
+
+        cumulative_latency_ratio = (
+            self._saturating_ratio(
+                value=cumulative_latency_s,
+                scale=latency_scale_s,
+            )
+        )
+
+        # ==========================================================
+        # 3. Cumulative Edge -> Edge transmission energy
+        #
+        # 直接读取 Job 的物理 Energy ledger，
+        # 不重复维护第二份能耗累计。
+        # ==============================================================
+        cumulative_energy_j = max(
+            float(
+                getattr(
+                    job,
+                    "edge_edge_transfer_energy_j",
+                    0.0,
+                )
+            ),
+            0.0,
+        )
+
+        energy_scale_j = max(
+            float(
+                getattr(
+                    self.env,
+                    "energy_normalization_j",
+                    1.0,
+                )
+            ),
+            eps,
+        )
+
+        cumulative_energy_ratio = (
+            self._saturating_ratio(
+                value=cumulative_energy_j,
+                scale=energy_scale_j,
+            )
+        )
+
+        features = [
+            routing_hop_ratio,
+            cumulative_latency_ratio,
+            cumulative_energy_ratio,
+        ]
+
+        # ==========================================================
+        # Routing History 必须始终严格保持 3 维。
+        # ==============================================================
+        if len(features) != self.route_history_feat_dim:
+            raise ValueError(
+                "Routing History 维度错误："
+                f"expected={self.route_history_feat_dim}, "
+                f"actual={len(features)}"
+            )
+
+        feature_array = np.asarray(
+            features,
+            dtype=np.float32,
+        )
+
+        if not np.all(
+                np.isfinite(feature_array)
+        ):
+            raise ValueError(
+                "Routing History 出现 NaN/Inf："
+                f"job_id={job_id}, "
+                f"features={features}"
+            )
+
+        if (
+                np.any(feature_array < 0.0)
+                or np.any(feature_array > 1.0)
+        ):
+            raise ValueError(
+                "Routing History 超出 [0,1]："
+                f"job_id={job_id}, "
+                f"features={features}"
+            )
+
+        return features
+
+    
 

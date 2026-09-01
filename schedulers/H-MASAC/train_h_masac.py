@@ -1790,7 +1790,7 @@ def train(
     # 创建经验回放池
     replay_buffer = ReplayBuffer(
         capacity=int(train_config.replay_capacity),
-        local_obs_dim=int(env.local_obs_dim),
+        local_obs_dim=routing_obs_dim,
         global_state_dim=int(env.global_state_dim),
         action_dim=int(env.action_dim),
         seed=int(train_config.seed),
