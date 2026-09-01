@@ -31,6 +31,7 @@ from environment.cloud_edge_env import CloudEdgeEnv
 import config as conf
 from routing_observation import (RoutingObservationBuilder,)
 from routing_centralized_state import (RoutingCentralizedStateBuilder,)
+from host_observation import (HostObservationBuilder,)
 
 TERMINAL_FAILURE_REASONS = frozenset({
     "waiting_timeout",
@@ -1782,7 +1783,11 @@ def train(
         seed=train_config.seed,
         old_env_path=train_config.old_env_path,
     )
-
+    host_observation_builder = (
+        HostObservationBuilder(
+            env=env,
+        )
+    )
     routing_observation_builder = (
         RoutingObservationBuilder(
             env=env,
