@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from h_sac_model import (MaskedDiscreteActor, TwinDiscreteCritic,hard_update,soft_update,)
+from h_sac_model import (RoutingDiscreteActor, TwinDiscreteCritic,hard_update,soft_update,)
 from replay_buffer import ( ReplayBatch, ReplayBuffer,)
 
 
@@ -38,13 +38,13 @@ class TensorBatch:
     agent_indices: torch.Tensor
     local_obs: torch.Tensor
     global_states: torch.Tensor
-    action_masks: torch.Tensor
+    # action_masks: torch.Tensor
     actions: torch.Tensor
     rewards: torch.Tensor
     next_agent_indices: torch.Tensor
     next_local_obs: torch.Tensor
     next_global_states: torch.Tensor
-    next_action_masks: torch.Tensor
+    # next_action_masks: torch.Tensor
     terminated: torch.Tensor
     truncated: torch.Tensor
     done: torch.Tensor
@@ -89,7 +89,7 @@ class DiscreteMASAC:
                 )
 
         # 创建参数共享 Actor
-        self.actor = MaskedDiscreteActor(
+        self.actor = RoutingDiscreteActor(
             local_obs_dim=local_obs_dim,
             action_dim=action_dim,
             num_agents=num_agents,
@@ -163,63 +163,70 @@ class DiscreteMASAC:
             self,
             local_obs: np.ndarray,
             agent_index: int,
-            action_mask: np.ndarray,
             deterministic: bool = False,
     ) -> int:
+        """
+        根据当前 Routing Observation 选择动作。
 
-        local_obs_array = np.asarray(local_obs,dtype=np.float32,).copy()
-        action_mask_array = np.asarray(action_mask,dtype=np.bool_,).copy()
-        agent_index = int(agent_index)
+        所有 Routing action 均属于正常策略动作，
+        不接受 action_mask。
+        """
 
-        # 增加 batch 维度并转换为张量
-        # 原 shape=(local_obs_dim,)，转换后为 (1, local_obs_dim)
+        local_obs_array = np.asarray(
+            local_obs,
+            dtype=np.float32,
+        ).copy()
+
+        agent_index = int(
+            agent_index
+        )
+
         local_obs_tensor = torch.as_tensor(
             local_obs_array,
             dtype=torch.float32,
             device=self.device,
         ).unsqueeze(0)
 
-        # 智能体编号也增加 batch 维度，shape=(1,)
         agent_index_tensor = torch.tensor(
             [agent_index],
             dtype=torch.long,
             device=self.device,
         )
 
-        # 动作掩码增加 batch 维度，shape=(1, action_dim)
-        action_mask_tensor = torch.as_tensor(
-            action_mask_array,
-            dtype=torch.bool,
-            device=self.device,
-        ).unsqueeze(0)
-
-        # 动作选择不需要记录梯度
         with torch.no_grad():
-            # 获取动作概率。
-            action_probs, _, _ = self.actor.get_policy(
-                local_obs=local_obs_tensor,
-                agent_indices=agent_index_tensor,
-                action_mask=action_mask_tensor,
+
+            action_probs, _, _ = (
+                self.actor.get_policy(
+                    local_obs=local_obs_tensor,
+                    agent_indices=(
+                        agent_index_tensor
+                    ),
+                )
             )
 
-            # 评估模式选择最大概率动作。
             if deterministic:
+
                 action_tensor = torch.argmax(
                     action_probs,
                     dim=-1,
                 )
 
-            # 训练模式根据概率随机采样。
             else:
-                distribution = torch.distributions.Categorical(
-                    probs=action_probs
+
+                distribution = (
+                    torch.distributions
+                        .Categorical(
+                        probs=action_probs
+                    )
                 )
-                action_tensor = distribution.sample()
 
-        # 从只有一个元素的 Tensor 中取出 Python int
-        action = int(action_tensor.item())
+                action_tensor = (
+                    distribution.sample()
+                )
 
-        return action
+        return int(
+            action_tensor.item()
+        )
 
     # 从 ReplayBuffer 采样并执行一次完整 SAC 更新
     def update(self,replay_buffer: ReplayBuffer,batch_size: int,) -> Dict[str, float]:
@@ -459,11 +466,11 @@ class DiscreteMASAC:
             dtype=torch.float32,
             device=self.device,
         )
-        action_masks = torch.as_tensor(
-            batch.action_masks,
-            dtype=torch.bool,
-            device=self.device,
-        )
+        # action_masks = torch.as_tensor(
+        #     batch.action_masks,
+        #     dtype=torch.bool,
+        #     device=self.device,
+        # )
         actions = torch.as_tensor(
             batch.actions,
             dtype=torch.long,
@@ -489,11 +496,11 @@ class DiscreteMASAC:
             dtype=torch.float32,
             device=self.device,
         )
-        next_action_masks = torch.as_tensor(
-            batch.next_action_masks,
-            dtype=torch.bool,
-            device=self.device,
-        )
+        # next_action_masks = torch.as_tensor(
+        #     batch.next_action_masks,
+        #     dtype=torch.bool,
+        #     device=self.device,
+        # )
         terminated = torch.as_tensor(
             batch.terminated,
             dtype=torch.float32,
@@ -519,13 +526,13 @@ class DiscreteMASAC:
             agent_indices=agent_indices,
             local_obs=local_obs,
             global_states=global_states,
-            action_masks=action_masks,
+            # action_masks=action_masks,
             actions=actions,
             rewards=rewards,
             next_agent_indices=next_agent_indices,
             next_local_obs=next_local_obs,
             next_global_states=next_global_states,
-            next_action_masks=next_action_masks,
+            # next_action_masks=next_action_masks,
             terminated=terminated,
             truncated=truncated,
             done=done,
@@ -547,19 +554,20 @@ class DiscreteMASAC:
             )
 
             # 终止经验的 next_action_mask 通常全 0，为了让 Actor.get_policy() 能正常运行，临时替换成全 1
-            safe_next_action_masks = torch.where(
-                batch.done.to(dtype=torch.bool).unsqueeze(1),
-                torch.ones_like(batch.next_action_masks),
-                batch.next_action_masks,
-            )
+            # safe_next_action_masks = torch.where(
+            #     batch.done.to(dtype=torch.bool).unsqueeze(1),
+            #     torch.ones_like(batch.next_action_masks),
+            #     batch.next_action_masks,
+            # )
 
             # 使用当前 Actor 计算下一决策状态的动作概率。
-            next_action_probs, next_action_log_probs, _ = (
-                self.actor.get_policy(
-                    local_obs=batch.next_local_obs,
-                    agent_indices=safe_next_agent_indices,
-                    action_mask=safe_next_action_masks,
-                )
+            next_action_probs, (
+                next_action_log_probs
+            ), _ = self.actor.get_policy(
+                local_obs=batch.next_local_obs,
+                agent_indices=(
+                    safe_next_agent_indices
+                ),
             )
 
             # 使用目标双 Critic 计算下一全局状态的 Q1 和 Q2。
@@ -653,10 +661,11 @@ class DiscreteMASAC:
     def _update_actor(self, batch: TensorBatch,) -> Dict[str, float]:
 
         # 计算当前局部观测下所有普通动作的概率和 log 概率。
-        action_probs, action_log_probs, _ = self.actor.get_policy(
-            local_obs=batch.local_obs,
-            agent_indices=batch.agent_indices,
-            action_mask=batch.action_masks,
+        action_probs, action_log_probs, _ = (
+            self.actor.get_policy(
+                local_obs=batch.local_obs,
+                agent_indices=batch.agent_indices,
+            )
         )
 
         # Actor 更新不需要修改 Critic 参数
@@ -721,10 +730,13 @@ class DiscreteMASAC:
 
         # alpha 更新时不需要更新 Actor，因此不记录 Actor 计算图。
         with torch.no_grad():
-            action_probs, action_log_probs, _ = self.actor.get_policy(
+            action_probs, (
+                action_log_probs
+            ), _ = self.actor.get_policy(
                 local_obs=batch.local_obs,
-                agent_indices=batch.agent_indices,
-                action_mask=batch.action_masks,
+                agent_indices=(
+                    batch.agent_indices
+                ),
             )
 
             # 计算每条样本当前策略熵。
@@ -733,21 +745,40 @@ class DiscreteMASAC:
                     * action_log_probs
             ).sum(dim=-1)
 
+            target_entropy_value = (
+                    float(
+                        self.config
+                            .target_entropy_ratio
+                    )
+                    * math.log(
+                float(
+                    self.action_dim
+                )
+            )
+            )
+
+            target_entropy = torch.full_like(
+                policy_entropy,
+                fill_value=(
+                    target_entropy_value
+                ),
+            )
+
             # 统计每条样本的合法动作数量。
-            valid_action_count = batch.action_masks.sum(
-                dim=-1
-            ).to(dtype=torch.float32)
+            # valid_action_count = batch.action_masks.sum(
+            #     dim=-1
+            # ).to(dtype=torch.float32)
 
             # 合法动作数量至少为 1。
-            valid_action_count = valid_action_count.clamp_min(
-                1.0
-            )
+            # valid_action_count = valid_action_count.clamp_min(
+            #     1.0
+            # )
 
             # 目标熵随合法动作数量变化。
-            target_entropy = (
-                    float(self.config.target_entropy_ratio)
-                    * torch.log(valid_action_count)
-            )
+            # target_entropy = (
+            #         float(self.config.target_entropy_ratio)
+            #         * torch.log(valid_action_count)
+            # )
 
         # alpha 损失：
         # 当实际熵低于目标熵时，梯度下降会增大 log_alpha；

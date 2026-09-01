@@ -7,7 +7,7 @@ from numpy.typing import NDArray
 
 FloatArray = NDArray[np.float32]
 IntArray = NDArray[np.int64]
-MaskArray = NDArray[np.int8]
+# MaskArray = NDArray[np.int8]
 BoolArray = NDArray[np.bool_]
 
 # ReplayBuffer.add() 所要求的最小 Transition 接口
@@ -18,7 +18,7 @@ class TransitionLike(Protocol):
     env_time: float
     local_obs: FloatArray
     global_state: FloatArray
-    action_mask: MaskArray
+
     action: int
     action_type: str
     reward: float
@@ -28,7 +28,7 @@ class TransitionLike(Protocol):
     next_env_time: float
     next_local_obs: FloatArray
     next_global_state: FloatArray
-    next_action_mask: MaskArray
+
     terminated: bool
     truncated: bool
     done: bool
@@ -38,13 +38,13 @@ class ReplayBatch:
     agent_indices: IntArray
     local_obs: FloatArray
     global_states: FloatArray
-    action_masks: MaskArray
+
     actions: IntArray
     rewards: FloatArray
     next_agent_indices: IntArray
     next_local_obs: FloatArray
     next_global_states: FloatArray
-    next_action_masks: MaskArray
+
     terminated: BoolArray
     truncated: BoolArray
     done: BoolArray
@@ -63,13 +63,13 @@ class ReplayBatch:
             "agent_indices": self.agent_indices.copy(),
             "local_obs": self.local_obs.copy(),
             "global_states": self.global_states.copy(),
-            "action_masks": self.action_masks.copy(),
+            # "action_masks": self.action_masks.copy(),
             "actions": self.actions.copy(),
             "rewards": self.rewards.copy(),
             "next_agent_indices": self.next_agent_indices.copy(),
             "next_local_obs": self.next_local_obs.copy(),
             "next_global_states": self.next_global_states.copy(),
-            "next_action_masks": self.next_action_masks.copy(),
+            # "next_action_masks": self.next_action_masks.copy(),
             "terminated": self.terminated.copy(),
             "truncated": self.truncated.copy(),
             "done": self.done.copy(),
@@ -89,7 +89,6 @@ class ReplayBuffer:
             capacity: int,
             local_obs_dim: int,
             global_state_dim: int,
-            action_dim: int,
             seed: Optional[int] = None,
             forced_action_value: int = -1,
     ) -> None:
@@ -98,13 +97,13 @@ class ReplayBuffer:
         capacity = int(capacity)
         local_obs_dim = int(local_obs_dim)
         global_state_dim = int(global_state_dim)
-        action_dim = int(action_dim)
+
         forced_action_value = int(forced_action_value)
 
         self.capacity = capacity
         self.local_obs_dim = local_obs_dim
         self.global_state_dim = global_state_dim
-        self.action_dim = action_dim
+
         self.forced_action_value = forced_action_value
 
         self.rng = np.random.default_rng(seed)
@@ -132,10 +131,6 @@ class ReplayBuffer:
             dtype=np.float32,
         )
 
-        self.action_masks = np.zeros(
-            (capacity, action_dim),
-            dtype=np.int8,
-        )
 
         self.actions = np.full(
             (capacity,),
@@ -170,10 +165,6 @@ class ReplayBuffer:
             dtype=np.float32,
         )
 
-        self.next_action_masks = np.zeros(
-            (capacity, action_dim),
-            dtype=np.int8,
-        )
 
         self.terminated = np.zeros(
             (capacity,),
@@ -331,10 +322,6 @@ class ReplayBuffer:
             dtype=np.float32,
         )
 
-        self.next_action_masks[pending_index] = np.asarray(
-            successor.action_mask,
-            dtype=np.int8,
-        )
 
         self.next_agent_ids[pending_index] = str(
             successor.agent_id
@@ -392,7 +379,7 @@ class ReplayBuffer:
         self.next_agent_indices[pending_index] = -1
         self.next_local_obs[pending_index].fill(0.0)
         self.next_global_states[pending_index].fill(0.0)
-        self.next_action_masks[pending_index].fill(0)
+
 
         self.next_agent_ids[pending_index] = None
         self.next_job_ids[pending_index] = None
@@ -467,10 +454,10 @@ class ReplayBuffer:
         current_action_type = str(transition.action_type)
         local_obs = np.asarray(transition.local_obs, dtype=np.float32).copy()
         global_state = np.asarray(transition.global_state, dtype=np.float32).copy()
-        action_mask = np.asarray(transition.action_mask, dtype=np.int8).copy()
+
         next_local_obs = np.asarray(transition.next_local_obs, dtype=np.float32).copy()
         next_global_state = np.asarray(transition.next_global_state, dtype=np.float32).copy()
-        next_action_mask = np.asarray(transition.next_action_mask,dtype=np.int8).copy()
+
 
         reward = float(transition.reward)
         env_time = float(transition.env_time)
@@ -539,13 +526,13 @@ class ReplayBuffer:
         self.agent_indices[index] = agent_index
         self.local_obs[index] = local_obs
         self.global_states[index] = global_state
-        self.action_masks[index] = action_mask
+
         self.actions[index] = action
         self.rewards[index] = reward
         self.next_agent_indices[index] = next_agent_index
         self.next_local_obs[index] = next_local_obs
         self.next_global_states[index] = next_global_state
-        self.next_action_masks[index] = next_action_mask
+
         self.terminated[index] = terminated
         self.truncated[index] = truncated
         self.done[index] = done
@@ -866,13 +853,13 @@ class ReplayBuffer:
             agent_indices=self.agent_indices[sampled_indices].copy(),
             local_obs=self.local_obs[sampled_indices].copy(),
             global_states=self.global_states[sampled_indices].copy(),
-            action_masks=self.action_masks[sampled_indices].copy(),
+
             actions=self.actions[sampled_indices].copy(),
             rewards=self.rewards[sampled_indices].copy(),
             next_agent_indices=self.next_agent_indices[sampled_indices].copy(),
             next_local_obs=self.next_local_obs[sampled_indices].copy(),
             next_global_states=self.next_global_states[sampled_indices].copy(),
-            next_action_masks=self.next_action_masks[sampled_indices].copy(),
+
             terminated=self.terminated[sampled_indices].copy(),
             truncated=self.truncated[sampled_indices].copy(),
             done=self.done[sampled_indices].copy(),
@@ -910,13 +897,13 @@ class ReplayBuffer:
         self.agent_indices.fill(-1)
         self.local_obs.fill(0.0)
         self.global_states.fill(0.0)
-        self.action_masks.fill(0)
+
         self.actions.fill(self.forced_action_value)
         self.rewards.fill(0.0)
         self.next_agent_indices.fill(-1)
         self.next_local_obs.fill(0.0)
         self.next_global_states.fill(0.0)
-        self.next_action_masks.fill(0)
+
         self.terminated.fill(False)
         self.truncated.fill(False)
         self.done.fill(False)

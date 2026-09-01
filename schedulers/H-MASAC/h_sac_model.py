@@ -32,7 +32,7 @@ def initialize_linear_layer(layer: nn.Linear, gain: float = 1.0) -> None:
         )
 
 # 参数共享的离散Actor网络
-class MaskedDiscreteActor(nn.Module):
+class RoutingDiscreteActor(nn.Module):
     """
        所有边缘智能体共用同一个 Actor。
        为了让共享 Actor 知道当前是哪一个智能体在决策，
@@ -105,49 +105,41 @@ class MaskedDiscreteActor(nn.Module):
             self,
             local_obs: torch.Tensor,
             agent_indices: torch.Tensor,
-            action_mask: torch.Tensor,
             eps: float = DEFAULT_EPS,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        # Actor 原始偏好
+        logits = self.forward(
+            local_obs=local_obs,
+            agent_indices=agent_indices,
+        )
 
-        # 先通过 Actor 网络计算原始 logits
-        logits = self.forward(local_obs=local_obs, agent_indices=agent_indices)
+        # ==========================================================
+        # 所有结构动作均参与策略分布。
+        #
+        # 不再：
+        #     masked_fill()
+        #     multiply action_mask
+        #     masked renormalization
+        # ==========================================================
+        action_probs = F.softmax(
+            logits,
+            dim=-1,
+        )
 
-        # 把动作掩码统一转换为布尔 Tensor
-        valid_action_mask = action_mask.to(dtype=torch.bool)
+        action_log_probs = torch.log(
+            action_probs.clamp_min(
+                float(eps)
+            )
+        )
 
-        # 统计每条样本有多少个合法动作。
-        valid_action_count = valid_action_mask.sum(dim=-1)
-
-        # 获取当前浮点类型能表示的最小有限值。
-        very_negative = torch.finfo(logits.dtype).min
-
-        # 合法动作保留原始 logits，非法动作替换成极小值。
-        masked_logits = logits.masked_fill(~valid_action_mask, very_negative,)
-
-        # 对应用掩码后的 logits 做 softmax，得到动作概率。
-        action_probs = F.softmax(masked_logits,dim=-1,)
-
-        # 再乘一次掩码，确保非法动作概率严格为 0。
-        action_probs = action_probs * valid_action_mask.to(dtype=action_probs.dtype)
-
-        # 计算每行概率之和。
-        probability_sum = action_probs.sum(dim=-1,keepdim=True,)
-
-        # 重新归一化，防止浮点误差导致概率和略微偏离 1。
-        action_probs = action_probs / probability_sum.clamp_min(float(eps))
-
-        # 对概率取对数。
-        action_log_probs = torch.log(action_probs.clamp_min(float(eps)))
-
-        # 非法动作位置的 log probability 设为 0。
-        # 后续计算 sum(prob * log_prob) 时，这些位置贡献为 0。
-        action_log_probs = torch.where(valid_action_mask, action_log_probs, torch.zeros_like(action_log_probs),)
-
-        # 返回概率、对数概率和掩码后的 logits。
         return (
             action_probs,
             action_log_probs,
-            masked_logits,
+            logits,
         )
 
     # 按照当前策略概率随机采样动作
@@ -164,10 +156,11 @@ class MaskedDiscreteActor(nn.Module):
     ]:
 
         # 获取完整策略分布。
-        action_probs, action_log_probs, _ = self.get_policy(
-            local_obs=local_obs,
-            agent_indices=agent_indices,
-            action_mask=action_mask,
+        action_probs, action_log_probs, _ = (
+            self.get_policy(
+                local_obs=local_obs,
+                agent_indices=agent_indices,
+            )
         )
 
         # 使用离散分类分布包装动作概率。

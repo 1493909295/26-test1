@@ -218,10 +218,26 @@ def build_environment(seed: int, old_env_path: Optional[str] = None,) -> Any:
     )
 
 # 从 DecisionSnapshot 的 action_mask 中随机选择一个合法动作'
-def choose_random_legal_action(decision: DecisionSnapshot, rng: np.random.Generator,) -> int:
-    valid_actions = np.flatnonzero(np.asarray(decision.action_mask, dtype=np.int8))
-    action = rng.choice(valid_actions)
-    return int(action)
+def choose_random_routing_action(
+    action_dim: int,
+    rng: np.random.Generator,
+) -> int:
+
+    action_dim = int(
+        action_dim
+    )
+
+    if action_dim <= 0:
+        raise ValueError(
+            "Routing action_dim 必须大于 0。"
+        )
+
+    return int(
+        rng.integers(
+            low=0,
+            high=action_dim,
+        )
+    )
 
 # 根据动作解码函数获取动作类型
 def infer_action_type(env: Any, agent_id: str, action: int,) -> str:
@@ -1833,23 +1849,16 @@ def train(
     # 创建经验回放池
     replay_buffer = ReplayBuffer(
         capacity=int(
-            train_config.replay_capacity
+            train_config
+                .replay_capacity
         ),
 
-        # Actor observation
-        local_obs_dim=routing_obs_dim,
+        local_obs_dim=(
+            routing_obs_dim
+        ),
 
-        # ==========================================================
-        # Critic centralized state
-        #
-        # 不再使用 env.global_state_dim。
-        # ==========================================================
         global_state_dim=(
             routing_global_state_dim
-        ),
-
-        action_dim=int(
-            env.action_dim
         ),
 
         seed=int(
@@ -1978,20 +1987,38 @@ def train(
                     action_source = "forced"
 
                 # 预热阶段的普通动作
-                elif (global_normal_action_steps < int(train_config.random_warmup_steps)):
-                    # 随机选个动作
-                    action = choose_random_legal_action(
-                        decision=decision,
-                        rng=action_rng,
+                elif (
+                        global_normal_action_steps
+                        < int(
+                    train_config
+                            .random_warmup_steps
+                )
+                ):
+
+                    # 无 Mask：
+                    # 对完整 Routing action space 均匀探索。
+                    action = (
+                        choose_random_routing_action(
+                            action_dim=(
+                                env.action_dim
+                            ),
+                            rng=action_rng,
+                        )
                     )
+
                     action_source = "random"
 
                 # 预热结束，actor根据概率分布采样动作
                 else:
                     action = masac.select_action(
-                        local_obs=decision.local_obs,
-                        agent_index=decision.agent_index,
-                        action_mask=decision.action_mask,
+                        local_obs=(
+                            decision.local_obs
+                        ),
+
+                        agent_index=(
+                            decision.agent_index
+                        ),
+
                         deterministic=False,
                     )
                     action_source = "policy"
