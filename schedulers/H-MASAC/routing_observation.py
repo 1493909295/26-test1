@@ -19,8 +19,11 @@ class RoutingObservationBuilder:
     def __init__(self, env: Any) -> None:
 
         self.env = env
-        self.edge_dc_ids = list(env.edge_dc_ids)
-        self.link_target_dc_ids = (list(env.edge_dc_ids) + [str(env.cloud_id)])
+        self.edge_dc_ids = [
+            str(dc_id)
+            for dc_id in env.edge_dc_ids
+        ]
+        self.link_target_dc_ids = (list(self.edge_dc_ids) + [str(env.cloud_id)])
         self.job_edge_hop_counts: Dict[str, int] = {}
         self.job_edge_transfer_latency_s: Dict[str, float,] = {}
         self.job_feat_dim = self.JOB_FEAT_DIM
@@ -211,7 +214,8 @@ class RoutingObservationBuilder:
         obs.extend(self._encode_route_history( job,))
 
         # 当前 DC 到其他 DC / Cloud 的链路
-        obs.extend(self._encode_links(agent_id,))
+        link_features = self._encode_links(agent_id=agent_id,)
+        obs.extend(link_features)
 
         # Neighbor Historical Feedback 占位
         obs.extend([0.0] * self.feedback_feat_dim)
@@ -639,5 +643,277 @@ class RoutingObservationBuilder:
 
         return features
 
+    #
+    def _encode_links(self, agent_id: str,) -> List[float]:
+        """
+        构造当前 Routing Agent 的链路观测。
+
+        Routing Actor 对其他 DC 只允许看到 Link Information。
+
+        输出顺序固定为：
+
+            Edge DC1
+            Edge DC2
+            ...
+            Edge DCN
+            Cloud
+
+        每个目标只占 1 维：
+
+            normalized transmission latency
+
+        本函数绝对不能访问目标 DC 的：
+
+            CPU/GPU load
+            available resource
+            waiting queue
+            running queue
+            Host state
+
+        因此本函数中不会出现：
+
+            self.env.dc_map[target_dc_id]
+
+        这样的远端动态状态读取。
+        """
+
+        agent_id = str(agent_id)
+
+        # ==========================================================
+        # 1. 基础合法性检查
+        # ==========================================================
+        if agent_id not in self.edge_dc_ids:
+            raise ValueError(
+                "Routing Link Observation 只能为 Edge Agent 构造："
+                f"agent_id={agent_id}"
+            )
+
+        if self.env.graph is None:
+            raise RuntimeError(
+                "当前环境 graph 尚未初始化，"
+                "无法构造 Routing Link Observation。"
+            )
+
+        link_features: List[float] = []
+
+        # ==========================================================
+        # 2. 固定顺序遍历所有 Routing destination
+        #
+        # 注意：
+        # 这里只访问 graph。
+        #
+        # 不访问：
+        #
+        #     env.dc_map[target_dc_id]
+        #
+        # 因此不存在 Remote DC 实时负载泄漏。
+        # ==========================================================
+        for target_dc_id in self.link_target_dc_ids:
+
+            target_dc_id = str(target_dc_id)
+
+            # ------------------------------------------------------
+            # 当前 DC 到自己的 Routing latency 定义为 0。
+            #
+            # 对应 Routing Action = Self。
+            # ------------------------------------------------------
+            if target_dc_id == agent_id:
+
+                latency_s = 0.0
+
+
+            # ------------------------------------------------------
+            # 当前 DC -> Remote Edge / Cloud
+            # ------------------------------------------------------
+            else:
+
+                if not self.env.graph.has_edge(
+                        agent_id,
+                        target_dc_id,
+                ):
+                    raise RuntimeError(
+                        "Routing action space 中存在目标 DC，"
+                        "但 topology 中缺少对应链路："
+                        f"{agent_id} -> {target_dc_id}。"
+                        "当前 H-MASAC 不使用 action mask，"
+                        "因此所有可选 Routing destination "
+                        "必须具有有效物理链路。"
+                    )
+
+                latency_s = max(
+                    float(
+                        self.env.graph[
+                            agent_id
+                        ][
+                            target_dc_id
+                        ].get(
+                            "weight",
+                            0.0,
+                        )
+                    ),
+                    0.0,
+                )
+
+            # ------------------------------------------------------
+            # 使用环境现有 max_latency 尺度。
+            #
+            # Link latency 本身有固定环境尺度，
+            # 因此这里继续采用 max-scale normalization：
+            #
+            #     latency / max_latency
+            #
+            # 与 Routing History 中“累计多跳 latency”
+            # 使用 saturating normalization 不同。
+            # ------------------------------------------------------
+            normalized_latency = self._normalize(
+                value=latency_s,
+                scale=float(
+                    self.env.max_latency
+                ),
+            )
+
+            link_features.append(
+                normalized_latency
+            )
+
+        # ==========================================================
+        # 3. 维度检查
+        # ==========================================================
+        if len(link_features) != self.link_feat_dim:
+            raise ValueError(
+                "Routing Link Observation 维度错误："
+                f"expected={self.link_feat_dim}, "
+                f"actual={len(link_features)}"
+            )
+
+        # ==========================================================
+        # 4. 数值检查
+        # ==========================================================
+        link_array = np.asarray(
+            link_features,
+            dtype=np.float32,
+        )
+
+        if not np.all(
+                np.isfinite(link_array)
+        ):
+            raise ValueError(
+                "Routing Link Observation 出现 NaN/Inf："
+                f"agent_id={agent_id}, "
+                f"features={link_features}"
+            )
+
+        if (
+                np.any(link_array < 0.0)
+                or np.any(link_array > 1.0)
+        ):
+            raise ValueError(
+                "Routing Link Observation 超出 [0,1]："
+                f"agent_id={agent_id}, "
+                f"features={link_features}"
+            )
+
+        return link_features
+
+    #
+    def _encode_job(self, job: Any,) -> List[float]:
+        """
+        构造当前 Routing Job 的固定 5 维特征。
+
+        顺序：
+
+            [0] CPU request
+            [1] GPU request
+            [2] execution duration
+            [3] consumed SLA budget ratio
+            [4] consumed Drop budget ratio
+        """
+
+        eps = max(
+            float(
+                getattr(
+                    self.env,
+                    "norm_eps",
+                    1e-8,
+                )
+            ),
+            1e-12,
+        )
+
+        duration = max(
+            float(job.duration),
+            eps,
+        )
+
+        elapsed_time = max(
+            float(self.env.current_time)
+            - float(job.arrive_time),
+            0.0,
+        )
+
+        sla_budget = max(
+            float(
+                self.env.sla_deadline_ratio
+            )
+            * duration,
+            eps,
+        )
+
+        drop_budget = max(
+            float(
+                self.env.drop_deadline_ratio
+            )
+            * duration,
+            eps,
+        )
+
+        sla_consumed_ratio = float(
+            np.clip(
+                elapsed_time / sla_budget,
+                0.0,
+                1.0,
+            )
+        )
+
+        drop_consumed_ratio = float(
+            np.clip(
+                elapsed_time / drop_budget,
+                0.0,
+                1.0,
+            )
+        )
+
+        features = [
+            self._normalize(
+                float(job.cpu_request),
+                float(self.env.max_job_cpu),
+            ),
+
+            self._normalize(
+                float(job.gpu_request),
+                float(self.env.max_job_gpu),
+            ),
+
+            self._normalize(
+                duration,
+                float(self.env.max_job_duration),
+            ),
+
+            sla_consumed_ratio,
+
+            drop_consumed_ratio,
+        ]
+
+        if len(features) != self.job_feat_dim:
+            raise ValueError(
+                "Routing Job Observation 维度错误："
+                f"expected={self.job_feat_dim}, "
+                f"actual={len(features)}"
+            )
+
+        return features
+
     
+
+
 
