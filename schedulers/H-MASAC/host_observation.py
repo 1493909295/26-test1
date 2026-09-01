@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import  Dict, List
 from typing import Any, Optional
 import numpy as np
 
@@ -36,9 +36,37 @@ class HostObservationBuilder:
 
     LOCAL_DC_FEAT_DIM = 5
 
-    HOST_BASE_FEAT_DIM = 9
+    HOST_BASE_FEATURE_NAMES = (
+        "cpu_capacity",
+        "gpu_capacity",
+        "cpu_load",
+        "gpu_load",
+        "available_cpu",
+        "available_gpu",
+        "waiting_queue_congestion",
+        "waiting_workload_ratio",
+        "running_queue_congestion",
+    )
 
-    HOST_JOB_EVAL_FEAT_DIM = 4
+    HOST_BASE_FEAT_DIM = len(
+        HOST_BASE_FEATURE_NAMES
+    )
+
+    HOST_JOB_EVAL_FEATURE_NAMES = (
+        "can_ever_accommodate",
+        "can_start_now",
+        "estimated_start_delay_ratio",
+        "estimated_completion_ratio",
+    )
+
+    HOST_JOB_EVAL_FEAT_DIM = len(
+        HOST_JOB_EVAL_FEATURE_NAMES
+    )
+
+    HOST_FEATURE_NAMES = (
+            HOST_BASE_FEATURE_NAMES
+            + HOST_JOB_EVAL_FEATURE_NAMES
+    )
 
     HOST_FEAT_DIM = (
         HOST_BASE_FEAT_DIM
@@ -277,6 +305,64 @@ class HostObservationBuilder:
                 value + scale
             )
         )
+
+    def _validate_host_feature_block(
+            self,
+            features: List[float],
+            expected_dim: int,
+            block_name: str,
+    ) -> List[float]:
+        """
+        验证 Host Observation 子块。
+
+        当前所有 Host-level features 都应为：
+            finite
+            且位于 [0, 1]
+
+        如果未来加入没有归一化的物理量，
+        必须先显式修改这里的约束，
+        不能静默把 raw value 塞给网络。
+        """
+
+        feature_array = np.asarray(
+            features,
+            dtype=np.float32,
+        )
+
+        if feature_array.shape != (
+                int(expected_dim),
+        ):
+            raise ValueError(
+                f"{block_name} 维度错误："
+                f"expected={(int(expected_dim),)}, "
+                f"actual={feature_array.shape}"
+            )
+
+        if not np.all(
+                np.isfinite(feature_array)
+        ):
+            raise ValueError(
+                f"{block_name} 出现 NaN/Inf："
+                f"{features}"
+            )
+
+        eps = 1e-6
+
+        if (
+                np.any(feature_array < -eps)
+                or np.any(
+            feature_array > 1.0 + eps
+        )
+        ):
+            raise ValueError(
+                f"{block_name} 必须位于 [0,1]："
+                f"{features}"
+            )
+
+        return [
+            float(value)
+            for value in features
+        ]
 
     def _encode_job(
         self,
@@ -539,14 +625,19 @@ class HostObservationBuilder:
             + waiting_workload
         )
 
-    def _encode_host(
-        self,
-        host: Any,
-        job: Any,
+    def _encode_host_base_features(
+            self,
+            host: Any,
     ) -> List[float]:
+        """
+        编码单台 Host 自身的 9 维实时状态。
 
+        这里不读取当前 Job，
+        只表示 Host 自己当前是什么状态。
+        """
+
+        # 更新当前 CPU/GPU load。
         host.calculate_load()
-
 
         available_cpu = float(
             host.get_available_cpu()
@@ -555,7 +646,6 @@ class HostObservationBuilder:
         available_gpu = float(
             host.get_available_gpu()
         )
-
 
         waiting_jobs = len(
             host.waiting_queue
@@ -567,112 +657,14 @@ class HostObservationBuilder:
 
         waiting_workload = float(
             host.waiting_queue
-            .get_total_duration()
+                .get_total_duration()
         )
-
-
-        # ======================================================
-        # 当前 Job 与 Host 的匹配关系。
-        #
-        # 注意：
-        # 这是 Observation，不是 Action Mask。
-        # ======================================================
-
-        can_ever = bool(
-            host.can_ever_accommodate(
-                job
-            )
-        )
-
-
-        can_start_now = bool(
-            host.waiting_queue.is_empty()
-            and host.can_accommodate(job)
-        )
-
-
-        estimated_start_delay = (
-            self._estimate_host_start_delay(
-                host=host,
-                job=job,
-            )
-        )
-
-
-        duration = max(
-            float(job.duration),
-            1e-8,
-        )
-
-        elapsed_time = max(
-            float(self.env.current_time)
-            - float(job.arrive_time),
-            0.0,
-        )
-
-
-        if estimated_start_delay is None:
-
-            start_delay_ratio = 1.0
-            completion_ratio = 1.0
-
-        else:
-
-            wait_budget = max(
-                (
-                    float(
-                        self.env
-                        .drop_deadline_ratio
-                    )
-                    - 1.0
-                )
-                * duration,
-                1e-8,
-            )
-
-
-            start_delay_ratio = float(
-                np.clip(
-                    estimated_start_delay
-                    / wait_budget,
-                    0.0,
-                    1.0,
-                )
-            )
-
-
-            predicted_completion = (
-                elapsed_time
-                + estimated_start_delay
-                + duration
-            )
-
-
-            drop_limit = max(
-                float(
-                    self.env
-                    .drop_deadline_ratio
-                )
-                * duration,
-                1e-8,
-            )
-
-
-            completion_ratio = float(
-                np.clip(
-                    predicted_completion
-                    / drop_limit,
-                    0.0,
-                    1.0,
-                )
-            )
-
 
         features = [
 
-            # ==================================================
-            # Base Host State：9维
-            # ==================================================
+            # ------------------------------------------------------
+            # 0~1：Host physical capacity
+            # ------------------------------------------------------
 
             self._normalize(
                 host.cpu_num,
@@ -683,6 +675,10 @@ class HostObservationBuilder:
                 host.gpu_capacity_num,
                 self.env.max_host_gpu,
             ),
+
+            # ------------------------------------------------------
+            # 2~3：Current utilization
+            # ------------------------------------------------------
 
             float(
                 np.clip(
@@ -700,6 +696,10 @@ class HostObservationBuilder:
                 )
             ),
 
+            # ------------------------------------------------------
+            # 4~5：Current available resources
+            # ------------------------------------------------------
+
             self._normalize(
                 available_cpu,
                 self.env.max_host_cpu,
@@ -709,6 +709,10 @@ class HostObservationBuilder:
                 available_gpu,
                 self.env.max_host_gpu,
             ),
+
+            # ------------------------------------------------------
+            # 6~8：Queue / execution congestion
+            # ------------------------------------------------------
 
             self._saturating_ratio(
                 waiting_jobs,
@@ -724,32 +728,213 @@ class HostObservationBuilder:
                 running_jobs,
                 self.env.queue_length_scale,
             ),
-
-
-            # ==================================================
-            # Current Job ↔ Host Matching：4维
-            # ==================================================
-
-            1.0 if can_ever else 0.0,
-
-            1.0 if can_start_now else 0.0,
-
-            start_delay_ratio,
-
-            completion_ratio,
         ]
 
+        return self._validate_host_feature_block(
+            features=features,
+            expected_dim=self.HOST_BASE_FEAT_DIM,
+            block_name="Host Base State",
+        )
 
-        if len(features) != self.HOST_FEAT_DIM:
+    def _encode_host_job_eval_features(
+            self,
+            host: Any,
+            job: Any,
+    ) -> List[float]:
+        """
+        编码当前 Job 与当前 Host 的 4 维匹配关系。
 
-            raise ValueError(
-                "Host feature dimension error："
-                f"expected={self.HOST_FEAT_DIM}, "
-                f"actual={len(features)}"
+        这些值只是 Observation Features，
+        不会修改 Host action legality。
+        """
+
+        eps = max(
+            float(
+                getattr(
+                    self.env,
+                    "norm_eps",
+                    1e-8,
+                )
+            ),
+            1e-12,
+        )
+
+        # ==========================================================
+        # 1. Physical feasibility
+        #
+        # Host 总 CPU/GPU 容量是否永远有可能执行 Job。
+        # ==========================================================
+
+        can_ever = bool(
+            host.can_ever_accommodate(
+                job
+            )
+        )
+
+        # ==========================================================
+        # 2. Immediate-start feasibility
+        #
+        # 必须同时：
+        #
+        #     Waiting Queue 为空
+        #     +
+        #     当前剩余 CPU/GPU 足够
+        #
+        # 这与当前环境 _execute_job_on_host() 的实际规则一致。
+        # ==============================================================
+
+        can_start_now = bool(
+            host.waiting_queue.is_empty()
+            and host.can_accommodate(job)
+        )
+
+        # ==========================================================
+        # 3. Estimated start delay
+        # ==========================================================
+
+        estimated_start_delay = (
+            self._estimate_host_start_delay(
+                host=host,
+                job=job,
+            )
+        )
+
+        duration = max(
+            float(job.duration),
+            eps,
+        )
+
+        elapsed_time = max(
+            float(self.env.current_time)
+            - float(job.arrive_time),
+            0.0,
+        )
+
+        if estimated_start_delay is None:
+
+            # Host 物理资源永远不支持当前 Job。
+            #
+            # 不做 Mask，而是把两个风险指标显式置到最高。
+            estimated_start_delay_ratio = 1.0
+            estimated_completion_ratio = 1.0
+
+        else:
+
+            # ======================================================
+            # 可用于等待的预算：
+            #
+            #     (DROP_RATIO - 1) × duration
+            #
+            # 因为最终执行本身至少还需要一个 duration。
+            # ======================================================
+
+            wait_budget = max(
+                (
+                        float(
+                            self.env.drop_deadline_ratio
+                        )
+                        - 1.0
+                )
+                * duration,
+                eps,
             )
 
+            estimated_start_delay_ratio = float(
+                np.clip(
+                    float(
+                        estimated_start_delay
+                    )
+                    / wait_budget,
+                    0.0,
+                    1.0,
+                )
+            )
 
-        return features
+            # ======================================================
+            # 从最初进入系统到预计完成的总服务时间。
+            # ======================================================
+
+            estimated_completion_time = (
+                    elapsed_time
+                    + float(
+                estimated_start_delay
+            )
+                    + duration
+            )
+
+            drop_completion_limit = max(
+                float(
+                    self.env.drop_deadline_ratio
+                )
+                * duration,
+                eps,
+            )
+
+            estimated_completion_ratio = float(
+                np.clip(
+                    estimated_completion_time
+                    / drop_completion_limit,
+                    0.0,
+                    1.0,
+                )
+            )
+
+        features = [
+            1.0 if can_ever else 0.0,
+            1.0 if can_start_now else 0.0,
+            estimated_start_delay_ratio,
+            estimated_completion_ratio,
+        ]
+
+        return self._validate_host_feature_block(
+            features=features,
+            expected_dim=(
+                self.HOST_JOB_EVAL_FEAT_DIM
+            ),
+            block_name=(
+                "Host Current-Job Evaluation"
+            ),
+        )
+
+    def _encode_host(
+            self,
+            host: Any,
+            job: Any,
+    ) -> List[float]:
+        """
+        构造单台 Host 的最终固定 13 维特征：
+
+            9-dimensional Host State
+            +
+            4-dimensional Job-Host Matching
+        """
+
+        base_features = (
+            self._encode_host_base_features(
+                host=host,
+            )
+        )
+
+        job_eval_features = (
+            self._encode_host_job_eval_features(
+                host=host,
+                job=job,
+            )
+        )
+
+        features = (
+                base_features
+                + job_eval_features
+        )
+
+        return self._validate_host_feature_block(
+            features=features,
+            expected_dim=self.HOST_FEAT_DIM,
+            block_name=(
+                f"Host Feature "
+                f"(host_id={host.host_id})"
+            ),
+        )
 
     def build(
         self,
@@ -848,13 +1033,30 @@ class HostObservationBuilder:
         #
         # 不 padding。
         # 不读取其他 DC。
-        for host in local_dc.host_list:
+        for host_index, host in enumerate(
+                local_dc.host_list
+        ):
+
+            host_features = self._encode_host(
+                host=host,
+                job=job,
+            )
+
+            if (
+                    len(host_features)
+                    != self.HOST_FEAT_DIM
+            ):
+                raise ValueError(
+                    "Host block dimension error："
+                    f"dc={dc_id}, "
+                    f"host_index={host_index}, "
+                    f"host_id={host.host_id}, "
+                    f"expected={self.HOST_FEAT_DIM}, "
+                    f"actual={len(host_features)}"
+                )
 
             obs.extend(
-                self._encode_host(
-                    host=host,
-                    job=job,
-                )
+                host_features
             )
 
 
