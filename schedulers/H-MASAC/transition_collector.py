@@ -4,6 +4,7 @@ from typing import Any, Dict, Mapping, Optional, Protocol, Sequence, Tuple
 
 import numpy as np
 from numpy.typing import NDArray
+from routing_observation import (RoutingObservationBuilder,)
 
 
 FloatArray = NDArray[np.float32]
@@ -124,8 +125,9 @@ class Transition:
 
 # 采集器，从环境中抽取经验
 class TransitionCollector:
-    def __init__(self, env: CloudEdgeEnvLike, validate_actions: bool = True,) -> None:
+    def __init__(self, env: CloudEdgeEnvLike, routing_observation_builder:RoutingObservationBuilder,validate_actions: bool = True,) -> None:
         self.env = env
+        self.routing_observation_builder = (routing_observation_builder)
         self.validate_actions = bool(validate_actions)
         # 全局计数，不随episode清空
         self.total_transition_count = 0
@@ -137,6 +139,7 @@ class TransitionCollector:
     # 重置计数器
     def reset_episode(self) -> None:
         self.episode_transition_count = 0
+        self.routing_observation_builder.reset_episode()
 
     # 获取决策状态快照
     # def capture_decision(self) -> DecisionSnapshot:
@@ -185,6 +188,7 @@ class TransitionCollector:
 
         agent_id = self._get_live_selected_agent()
         job_id = str(self.env.current_job_id)
+        local_obs = (self.routing_observation_builder.build(agent_id).copy())
         observation = self.env.observe(agent_id)
 
         local_obs = np.asarray(observation["observation"], dtype=np.float32).copy()
@@ -224,6 +228,11 @@ class TransitionCollector:
         # 执行动作、计算奖励、推进事件队列，并寻找下一决策点
         self.env.step(int(action))
 
+        self.routing_observation_builder.record_routing_action(
+            job_id=decision.job_id,
+            action_type=action_type,
+        )
+
         # 使用动作前智能体 ID 读取本次即时奖励
         reward = float(self.env.rewards[decision.agent_id])
 
@@ -240,7 +249,7 @@ class TransitionCollector:
             next_agent_id: Optional[str] = None
             next_agent_index = -1
             next_job_id: Optional[str] = None
-            next_local_obs = np.zeros(int(self.env.local_obs_dim), dtype=np.float32)
+            next_local_obs = np.zeros(int(self.routing_observation_builder.obs_dim), dtype=np.float32)
             next_action_mask = np.zeros(int(self.env.action_dim), dtype=np.int8)
             next_global_state = np.asarray(self.env.state(), dtype=np.float32)
 

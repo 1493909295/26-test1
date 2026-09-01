@@ -29,6 +29,7 @@ from replay_buffer import ReplayBuffer
 from transition_collector import (DecisionSnapshot,TransitionCollector,)
 from environment.cloud_edge_env import CloudEdgeEnv
 import config as conf
+from routing_observation import (RoutingObservationBuilder,)
 
 TERMINAL_FAILURE_REASONS = frozenset({
     "waiting_timeout",
@@ -1780,8 +1781,11 @@ def train(
         old_env_path=train_config.old_env_path,
     )
 
+    routing_observation_builder = (RoutingObservationBuilder(env))
+    routing_obs_dim = int(routing_observation_builder.obs_dim)
+
     # 创建 Transition 采集器
-    collector = TransitionCollector(env)
+    collector = TransitionCollector(env=env, routing_observation_builder=(routing_observation_builder),)
 
     # 创建经验回放池
     replay_buffer = ReplayBuffer(
@@ -1801,7 +1805,7 @@ def train(
 
     # 创建离散多智能体 SAC 算法
     masac = DiscreteMASAC(
-        local_obs_dim=int(env.local_obs_dim),
+        local_obs_dim=routing_obs_dim,
         global_state_dim=int(env.global_state_dim),
         action_dim=int(env.action_dim),
         num_agents=int(len(env.possible_agents)),

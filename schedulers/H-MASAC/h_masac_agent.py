@@ -7,8 +7,8 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from schedulers.MASAC.sac_model import (MaskedDiscreteActor, TwinDiscreteCritic, hard_update, soft_update)
-from schedulers.MASAC.replay_buffer import (ReplayBatch, ReplayBuffer)
+from h_sac_model import (MaskedDiscreteActor, TwinDiscreteCritic,hard_update,soft_update,)
+from replay_buffer import ( ReplayBatch, ReplayBuffer,)
 
 
 # 超参数配置
