@@ -25,8 +25,7 @@ class RoutingObservationBuilder:
         "sample_confidence",
     )
 
-    def __init__(self, env: Any, use_neighbor_historical_feedback: bool = False,
-    neighbor_feedback_provider: Optional[Any] = None,) -> None:
+    def __init__(self, env: Any, use_neighbor_historical_feedback: bool = False,neighbor_feedback_provider: Optional[Any] = None,) -> None:
 
         self.env = env
         self.edge_dc_ids = [
@@ -217,6 +216,16 @@ class RoutingObservationBuilder:
         waiting_workload = float(host.waiting_queue.get_total_duration())
 
         return float(max_running_remaining + waiting_workload)
+
+    def encode_job_features(self, job: Any,) -> List[float]:
+        return self._encode_job(job)
+
+    def encode_dc_aggregate_features(self, dc: Any, job: Any,) -> List[float]:
+        return self._encode_local_dc(local_dc=dc, job=job,)
+
+    def encode_route_history_features(self, job: Any,) -> List[float]:
+        return self._encode_route_history(job)
+
 
     #
     def build(self, agent_id: str,) -> np.ndarray:

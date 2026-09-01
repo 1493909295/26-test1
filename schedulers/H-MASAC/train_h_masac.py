@@ -30,6 +30,7 @@ from transition_collector import (DecisionSnapshot,TransitionCollector,)
 from environment.cloud_edge_env import CloudEdgeEnv
 import config as conf
 from routing_observation import (RoutingObservationBuilder,)
+from routing_centralized_state import (RoutingCentralizedStateBuilder,)
 
 TERMINAL_FAILURE_REASONS = frozenset({
     "waiting_timeout",
@@ -1800,17 +1801,59 @@ def train(
     )
     routing_obs_dim = int(routing_observation_builder.obs_dim)
 
+    routing_state_builder = (
+        RoutingCentralizedStateBuilder(
+            env=env,
+            routing_observation_builder=(
+                routing_observation_builder
+            ),
+        )
+    )
+
+    routing_global_state_dim = int(
+        routing_state_builder.state_dim
+    )
+
     # 创建 Transition 采集器
-    collector = TransitionCollector(env=env, routing_observation_builder=(routing_observation_builder),)
+    collector = TransitionCollector(
+        env=env,
+        routing_observation_builder=(
+            routing_observation_builder
+        ),
+        routing_state_builder=(
+            routing_state_builder
+        ),
+    )
 
     # 创建经验回放池
     replay_buffer = ReplayBuffer(
-        capacity=int(train_config.replay_capacity),
+        capacity=int(
+            train_config.replay_capacity
+        ),
+
+        # Actor observation
         local_obs_dim=routing_obs_dim,
-        global_state_dim=int(env.global_state_dim),
-        action_dim=int(env.action_dim),
-        seed=int(train_config.seed),
-        forced_action_value=int(env.drop_action),
+
+        # ==========================================================
+        # Critic centralized state
+        #
+        # 不再使用 env.global_state_dim。
+        # ==========================================================
+        global_state_dim=(
+            routing_global_state_dim
+        ),
+
+        action_dim=int(
+            env.action_dim
+        ),
+
+        seed=int(
+            train_config.seed
+        ),
+
+        forced_action_value=int(
+            env.drop_action
+        ),
     )
 
     # 没有传入算法配置时，使用 MASACConfig 默认值，但让算法随机种子与训练配置保持一致
@@ -1821,10 +1864,22 @@ def train(
 
     # 创建离散多智能体 SAC 算法
     masac = DiscreteMASAC(
+        # Routing Actor input
         local_obs_dim=routing_obs_dim,
-        global_state_dim=int(env.global_state_dim),
-        action_dim=int(env.action_dim),
-        num_agents=int(len(env.possible_agents)),
+
+        # Routing Centralized Critic input
+        global_state_dim=(
+            routing_global_state_dim
+        ),
+
+        action_dim=int(
+            env.action_dim
+        ),
+
+        num_agents=int(
+            len(env.possible_agents)
+        ),
+
         config=masac_config,
     )
 

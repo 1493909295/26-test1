@@ -5,7 +5,7 @@ from typing import Any, Dict, Mapping, Optional, Protocol, Sequence, Tuple
 import numpy as np
 from numpy.typing import NDArray
 from routing_observation import (RoutingObservationBuilder,)
-
+from routing_centralized_state import (RoutingCentralizedStateBuilder,)
 
 FloatArray = NDArray[np.float32]
 MaskArray = NDArray[np.int8]
@@ -24,8 +24,8 @@ class CloudEdgeEnvLike(Protocol):
 
     current_job_id: Optional[str]
     current_time: float
-    local_obs_dim: int
-    global_state_dim: int
+    # local_obs_dim: int
+    # global_state_dim: int
     action_dim: int
     drop_action: int
     has_reset: bool
@@ -40,8 +40,8 @@ class CloudEdgeEnvLike(Protocol):
 
     def observe(self, agent: str) -> Dict[str, np.ndarray]:
         ...
-    def state(self) -> np.ndarray:
-        ...
+    # def state(self) -> np.ndarray:
+    #     ...
     def step(self, action: Optional[int]) -> None:
         ...
 
@@ -125,10 +125,19 @@ class Transition:
 
 # 采集器，从环境中抽取经验
 class TransitionCollector:
-    def __init__(self, env: CloudEdgeEnvLike, routing_observation_builder:RoutingObservationBuilder,validate_actions: bool = True,) -> None:
+    def __init__(
+            self,
+            env: CloudEdgeEnvLike,
+            routing_observation_builder:
+            RoutingObservationBuilder,
+            routing_state_builder:
+            RoutingCentralizedStateBuilder,
+            validate_actions: bool = True,
+    ) -> None:
         self.env = env
         self.routing_observation_builder = (routing_observation_builder)
         self.validate_actions = bool(validate_actions)
+        self.routing_state_builder = (routing_state_builder)
         # 全局计数，不随episode清空
         self.total_transition_count = 0
         # 当前episode生成多少条经验
@@ -192,7 +201,11 @@ class TransitionCollector:
         observation = self.env.observe(agent_id)
 
         action_mask = np.asarray(observation["action_mask"], dtype=np.int8,).copy()
-        global_state = np.asarray(self.env.state(), dtype=np.float32,)
+        global_state = (
+            self.routing_state_builder
+                .build()
+                .copy()
+        )
 
         # 把当前环境状态完整封装成决策快照
         return DecisionSnapshot(
@@ -246,13 +259,39 @@ class TransitionCollector:
 
         episode_done = self._is_episode_done()
         if episode_done:
-            next_decision: Optional[DecisionSnapshot] = None
-            next_agent_id: Optional[str] = None
+            next_decision = None
+            next_agent_id = None
             next_agent_index = -1
-            next_job_id: Optional[str] = None
-            next_local_obs = np.zeros(int(self.routing_observation_builder.obs_dim), dtype=np.float32)
-            next_action_mask = np.zeros(int(self.env.action_dim), dtype=np.int8)
-            next_global_state = np.asarray(self.env.state(), dtype=np.float32)
+            next_job_id = None
+
+            next_local_obs = np.zeros(
+                int(
+                    self.routing_observation_builder
+                        .obs_dim
+                ),
+                dtype=np.float32,
+            )
+
+            next_action_mask = np.zeros(
+                int(self.env.action_dim),
+                dtype=np.int8,
+            )
+
+            # ==========================================================
+            # Terminal transition 没有下一 Routing state。
+            #
+            # SAC target 中 done=1 会屏蔽 bootstrap，
+            # 因此这里使用固定全零占位。
+            #
+            # 不再读取旧 env.state()。
+            # ==========================================================
+            next_global_state = np.zeros(
+                int(
+                    self.routing_state_builder
+                        .state_dim
+                ),
+                dtype=np.float32,
+            )
 
         else:
             next_decision = self._build_current_decision_snapshot()
@@ -326,8 +365,8 @@ class TransitionCollector:
             "current_agent_id",
             "current_job_id",
             "current_time",
-            "local_obs_dim",
-            "global_state_dim",
+            # "local_obs_dim",
+            # "global_state_dim",
             "action_dim",
             "drop_action",
             "has_reset",
@@ -344,22 +383,48 @@ class TransitionCollector:
                 )
 
         # observe、state 和 step 不仅要存在，还必须可以调用。
-        for method_name in ("observe", "state", "step"):
-            method = getattr(self.env, method_name, None)
+        for method_name in (
+                "observe",
+                "step",
+        ):
+
+            method = getattr(
+                self.env,
+                method_name,
+                None,
+            )
+
             if not callable(method):
                 raise AttributeError(
-                    f"环境缺少可调用方法：{method_name}()。"
+                    "环境缺少可调用方法："
+                    f"{method_name}()。"
                 )
 
-        if int(self.env.local_obs_dim) <= 0:
-            raise ValueError("local_obs_dim 必须大于 0。")
-
-        if int(self.env.global_state_dim) <= 0:
-            raise ValueError("global_state_dim 必须大于 0。")
 
         if int(self.env.action_dim) <= 0:
             raise ValueError("action_dim 必须大于 0。")
+        if (
+                int(
+                    self.routing_observation_builder
+                            .obs_dim
+                )
+                <= 0
+        ):
+            raise ValueError(
+                "routing_obs_dim 必须大于 0。"
+            )
 
+        if (
+                int(
+                    self.routing_state_builder
+                            .state_dim
+                )
+                <= 0
+        ):
+            raise ValueError(
+                "routing_global_state_dim "
+                "必须大于 0。"
+            )
     # 所有采集动作都要求环境先完成reset
     def _require_reset(self) -> None:
         if not bool(self.env.has_reset):
