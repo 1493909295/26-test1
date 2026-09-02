@@ -7,7 +7,7 @@ from numpy.typing import NDArray
 
 FloatArray = NDArray[np.float32]
 IntArray = NDArray[np.int64]
-# MaskArray = NDArray[np.int8]
+
 BoolArray = NDArray[np.bool_]
 
 # ReplayBuffer.add() 所要求的最小 Transition 接口

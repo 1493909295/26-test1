@@ -137,37 +137,82 @@ class CloudEdgeEnv(AECEnv):
             if dc.dc_id != self.cloud_id
         )
 
+        self.possible_agents = (
+            self.edge_dc_ids[:]
+        )
+
+        self.agents: List[str] = []
+
+        self.agent_ids = (
+            self.possible_agents[:]
+        )
+
+        self.num_edge_agents = len(
+            self.edge_dc_ids
+        )
+
+        self.agent_name_mapping = {
+            agent: i
+            for i, agent
+            in enumerate(
+                self.possible_agents
+            )
+        }
+
+        self.routing_action_target_dc_ids = (
+                list(self.edge_dc_ids)
+                + (
+                    [self.cloud_id]
+                    if self.enable_cloud_action
+                    else []
+                )
+        )
+
         # Routing Action 编码
         self.routing_action_to_dc_id = {
-            action_idx: dc_id
+            action_idx: str(dc_id)
             for action_idx, dc_id
-            in enumerate(self.edge_dc_ids)
+            in enumerate(
+                self.routing_action_target_dc_ids
+            )
         }
 
         self.routing_dc_id_to_action = {
-            dc_id: action_idx
+            str(dc_id): action_idx
             for action_idx, dc_id
             in self.routing_action_to_dc_id.items()
         }
 
         # cloud开关
-        if self.enable_cloud_action:
-            self.cloud_action_index = self.num_edge_dc
-        else:
-            self.cloud_action_index = None
-
-        self.action_dim = (
-                self.num_edge_dc
-                + (1 if self.enable_cloud_action else 0)
+        self.cloud_action_index = (
+            self.routing_dc_id_to_action.get(
+                self.cloud_id
+            )
         )
 
+        # Action dimension 只由真实结构动作数量决定。
+        self.action_dim = len(
+            self.routing_action_target_dc_ids
+        )
+
+        if self.action_dim <= 0:
+            raise ValueError(
+                "Routing action space 为空。"
+            )
+
         self.action_spaces = {
-            agent_id: spaces.Discrete(self.action_dim)
-            for agent_id in self.agent_ids
+            agent_id:
+                spaces.Discrete(
+                    self.action_dim
+                )
+            for agent_id
+            in self.agent_ids
         }
 
-        self.single_action_space = spaces.Discrete(
-            self.action_dim
+        self.single_action_space = (
+            spaces.Discrete(
+                self.action_dim
+            )
         )
 
         ######## pettingzoo 要求这俩种获取智能体方法都得有，所以都得写
@@ -179,6 +224,8 @@ class CloudEdgeEnv(AECEnv):
         # 获取当前活跃智能体数量
         self.agents: List[str] = []
         self.agent_ids = self.possible_agents[:]
+
+
 
 
         self.agent_name_mapping = {
@@ -1171,11 +1218,33 @@ class CloudEdgeEnv(AECEnv):
         return link_features
 
     # 将动作编码解码成动作，动作编码必须是int类型
-    def _decode_action(self, agent_id: str, action: int) -> Dict[str, Any]:
-        agent_id = str(agent_id)
-        action = int(action)
+    def _decode_action(
+            self,
+            agent_id: str,
+            action: int,
+    ) -> Dict[str, Any]:
+        """
+        将 Routing action index 解码成实际目标。
 
-        # 丢弃动作仍然保留
+        Policy action space 中只包含当前结构上真实存在的动作。
+
+        DROP_ACTION=-1 属于环境生命周期 forced action，
+        不属于 Actor 输出空间。
+        """
+
+        agent_id = str(
+            agent_id
+        )
+
+        action = int(
+            action
+        )
+
+        # ==========================================================
+        # Environment-forced Drop
+        #
+        # 不属于 Routing policy action space。
+        # ==========================================================
         if action == self.drop_action:
             return {
                 "action_type": "drop",
@@ -1184,30 +1253,60 @@ class CloudEdgeEnv(AECEnv):
                 "host_idx": None,
             }
 
-        # Edge Routing action
-        if action in self.routing_action_to_dc_id:
-
-            target_dc_id = str(self.routing_action_to_dc_id[action])
-
-            if target_dc_id == agent_id:
-                return {
-                    "action_type": "self",
-                    "source_dc_id": agent_id,
-                    "target_dc_id": agent_id,
-                    "host_idx": None,
-                }
-
-            return {
-                "action_type": "edge_dc",
-                "source_dc_id": agent_id,
-                "target_dc_id": target_dc_id,
-                "host_idx": None,
-            }
+        # ==========================================================
+        # Structural action range validation
+        #
+        # Cloud OFF 后旧 Cloud index 会直接在这里失败。
+        #
+        # 不存在：
+        #     mask cloud
+        #     silently remap cloud
+        # ==============================================================
 
         if (
-                self.cloud_action_index is not None
-                and action == self.cloud_action_index
+                action < 0
+                or action >= self.action_dim
         ):
+            raise ValueError(
+                "非法 Routing action："
+                f"action={action}, "
+                f"valid_range="
+                f"[0, {self.action_dim - 1}], "
+                f"cloud_enabled="
+                f"{self.enable_cloud_action}"
+            )
+
+        if (
+                action
+                not in self.routing_action_to_dc_id
+        ):
+            raise RuntimeError(
+                "Routing action mapping 不完整："
+                f"action={action}, "
+                f"mapping="
+                f"{self.routing_action_to_dc_id}"
+            )
+
+        target_dc_id = str(
+            self.routing_action_to_dc_id[
+                action
+            ]
+        )
+
+        # ==========================================================
+        # Cloud
+        # ==============================================================
+
+        if target_dc_id == self.cloud_id:
+
+            # 理论上 Cloud OFF 时 mapping 中根本不存在 Cloud。
+            # 这里是防止配置不变量被破坏。
+            if not self.enable_cloud_action:
+                raise RuntimeError(
+                    "Cloud action 在关闭状态下"
+                    "仍然出现在 Routing action mapping 中。"
+                )
+
             return {
                 "action_type": "cloud",
                 "source_dc_id": agent_id,
@@ -1215,6 +1314,28 @@ class CloudEdgeEnv(AECEnv):
                 "host_idx": None,
             }
 
+        # ==========================================================
+        # Self
+        # ==============================================================
+
+        if target_dc_id == agent_id:
+            return {
+                "action_type": "self",
+                "source_dc_id": agent_id,
+                "target_dc_id": agent_id,
+                "host_idx": None,
+            }
+
+        # ==========================================================
+        # Edge -> Edge
+        # ==============================================================
+
+        return {
+            "action_type": "edge_dc",
+            "source_dc_id": agent_id,
+            "target_dc_id": target_dc_id,
+            "host_idx": None,
+        }
 
     # 构造 MASAC centralized critic 使用的全局状态
     def _get_global_state(self) -> np.ndarray:

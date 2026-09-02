@@ -8,7 +8,7 @@ from routing_observation import (RoutingObservationBuilder,)
 from routing_centralized_state import (RoutingCentralizedStateBuilder,)
 
 FloatArray = NDArray[np.float32]
-# MaskArray = NDArray[np.int8]
+
 
 # 接口清单类 TransitionCollector 的对象，都应该至少具备它描述的这些接口
 # CloudEdgeEnvLike 类不负责实现逻辑
@@ -53,7 +53,7 @@ class DecisionSnapshot:
     job_id: str
     env_time: float
     local_obs: FloatArray
-    # action_mask: MaskArray
+
     global_state: FloatArray
 
     # 等于None表示由actor给工作，等于-1表示动作是丢弃
@@ -67,7 +67,7 @@ class DecisionSnapshot:
             "job_id": self.job_id,
             "env_time": self.env_time,
             "local_obs": self.local_obs.copy(),
-            # "action_mask": self.action_mask.copy(),
+
             "global_state": self.global_state.copy(),
             "forced_action": self.forced_action,
         }
@@ -81,7 +81,7 @@ class Transition:
     env_time: float
     local_obs: FloatArray
     global_state: FloatArray
-    # action_mask: MaskArray
+
     action: int
     action_type: str
     reward: float
@@ -93,7 +93,7 @@ class Transition:
     next_env_time: float
     next_local_obs: FloatArray
     next_global_state: FloatArray
-    # next_action_mask: MaskArray
+
     terminated: bool
     truncated: bool
     done: bool
@@ -107,7 +107,7 @@ class Transition:
             "env_time": self.env_time,
             "local_obs": self.local_obs.copy(),
             "global_state": self.global_state.copy(),
-            # "action_mask": self.action_mask.copy(),
+
             "action": self.action,
             "action_type": self.action_type,
             "reward": self.reward,
@@ -117,7 +117,7 @@ class Transition:
             "next_env_time": self.next_env_time,
             "next_local_obs": self.next_local_obs.copy(),
             "next_global_state": self.next_global_state.copy(),
-            # "next_action_mask": self.next_action_mask.copy(),
+
             "terminated": self.terminated,
             "truncated": self.truncated,
             "done": self.done,
@@ -294,10 +294,7 @@ class TransitionCollector:
                 dtype=np.float32,
             )
 
-            # next_action_mask = np.zeros(
-            #     int(self.env.action_dim),
-            #     dtype=np.int8,
-            # )
+
 
             # ==========================================================
             # Terminal transition 没有下一 Routing state。
@@ -320,9 +317,9 @@ class TransitionCollector:
             next_agent_id = next_decision.agent_id
             next_job_id = next_decision.job_id
             next_agent_index = next_decision.agent_index
-            # next_observation = self.env.observe(next_agent_id)
+
             next_local_obs = next_decision.local_obs.copy()
-            # next_action_mask = next_decision.action_mask.copy()
+
             next_global_state = next_decision.global_state.copy()
 
         transition = Transition(
@@ -332,7 +329,7 @@ class TransitionCollector:
             env_time=decision.env_time,
             local_obs=decision.local_obs.copy(),
             global_state=decision.global_state.copy(),
-            # action_mask=decision.action_mask.copy(),
+
             action=int(action),
             action_type=action_type,
             reward=reward,
@@ -342,7 +339,7 @@ class TransitionCollector:
             next_env_time=float(self.env.current_time),
             next_local_obs=next_local_obs,
             next_global_state=next_global_state,
-            # next_action_mask=next_action_mask,
+
             terminated=terminated,
             truncated=truncated,
             done=episode_done,
