@@ -2075,14 +2075,22 @@ def train(
         routing_state_builder.state_dim
     )
 
+    pending_trace_store = PendingJobTraceStore()
+
     # 创建 Transition 采集器
     collector = TransitionCollector(
         env=env,
+
         routing_observation_builder=(
             routing_observation_builder
         ),
+
         routing_state_builder=(
             routing_state_builder
+        ),
+
+        pending_trace_store=(
+            pending_trace_store
         ),
     )
 
@@ -2188,7 +2196,10 @@ def train(
                 episode_seed = int(train_config.seed)
 
             # 重启环境
+            pending_trace_store.reset_episode()
             env.reset(seed=episode_seed)
+            pending_trace_store.reset_episode()
+            collector.reset_episode()
             replay_buffer.reset_episode_job_tracking()
             # 为每个智能体创建奖励累计字典
             per_agent_returns = {}
@@ -2224,6 +2235,14 @@ def train(
                 #   env.step()
                 # ==========================================================
                 if env.has_pending_host_decision():
+                    # ==========================================================
+                    # Host Phase
+                    #
+                    # Host 层完全脱离 PettingZoo。
+                    # 这里使用与 Routing Collector 相同的
+                    # pending_trace_store。
+                    # ==========================================================
+
                     host_context = (
                         env.get_pending_host_decision()
                     )
@@ -2234,6 +2253,17 @@ def train(
 
                     host_dc_id = str(
                         host_context["dc_id"]
+                    )
+
+                    # ==========================================================
+                    # 保存 Host SAC 真正做决策的时间。
+                    #
+                    # execute_pending_host_action() 后环境可能已经向前推进，
+                    # 因此不能在执行之后再读取 decision time。
+                    # ==========================================================
+
+                    host_decision_time = float(
+                        env.current_time
                     )
 
                     # Host Observation 完全独立于 PettingZoo。
@@ -2254,28 +2284,158 @@ def train(
                         )
                     )
 
-
-
-
+                    # ==========================================================
                     # 非 PettingZoo Host execution。
+                    #
+                    # Environment 会返回：
+                    #
+                    #   job_id
+                    #   dc_id
+                    #   host_action
+                    #   host_id
+                    #   execution_result
+                    #   env_time
+                    # ==========================================================
+
                     host_result = (
                         env.execute_pending_host_action(
                             host_action=host_action,
                         )
                     )
 
-                    # Host action 后环境已经推进到了：
+                    # ==========================================================
+                    # 防御性检查：
+                    # Trace 中记录的 Job/DC/Action 必须与 Environment
+                    # 真正执行的对象完全一致。
+                    # ==========================================================
+
+                    result_job_id = str(
+                        host_result["job_id"]
+                    )
+
+                    result_dc_id = str(
+                        host_result["dc_id"]
+                    )
+
+                    result_host_action = int(
+                        host_result["host_action"]
+                    )
+
+                    if result_job_id != host_job_id:
+                        raise RuntimeError(
+                            "Host execution 返回 Job 不一致："
+                            f"expected={host_job_id}, "
+                            f"actual={result_job_id}"
+                        )
+
+                    if result_dc_id != host_dc_id:
+                        raise RuntimeError(
+                            "Host execution 返回 DC 不一致："
+                            f"job={host_job_id}, "
+                            f"expected={host_dc_id}, "
+                            f"actual={result_dc_id}"
+                        )
+
+                    if (
+                            result_host_action
+                            != int(host_action)
+                    ):
+                        raise RuntimeError(
+                            "Host execution 返回 action 不一致："
+                            f"job={host_job_id}, "
+                            f"expected={host_action}, "
+                            f"actual={result_host_action}"
+                        )
+
+                    actual_host_id = str(
+                        host_result["host_id"]
+                    )
+
+                    # ==========================================================
+                    # 将 Host Decision 正式加入 Job Causal Trace。
                     #
-                    #   下一 Routing decision
-                    #   或 Episode terminal
+                    # 此时仅记录事实。
+                    # 仍然不写 Host ReplayBuffer。
+                    # ==========================================================
+
+                    pending_trace_store.record_host_step(
+                        job_id=host_job_id,
+                        dc_id=host_dc_id,
+
+                        # 使用真正的决策时间。
+                        env_time=host_decision_time,
+
+                        host_obs=host_obs,
+
+                        action=int(
+                            host_action
+                        ),
+
+                        host_id=actual_host_id,
+
+                        action_source="policy",
+                    )
+
+                    # ==========================================================
+                    # 回填 Host placement 的即时执行结果：
                     #
-                    # 之前缓存的 Routing next_decision 不能继续复用。
+                    #   started
+                    #   queued
+                    #   dropped
+                    #
+                    # 它不是最终 SLA/completion reward。
+                    # ==========================================================
+
+                    pending_trace_store.record_host_result(
+                        job_id=host_job_id,
+
+                        result=str(
+                            host_result[
+                                "execution_result"
+                            ]
+                        ),
+
+                        env_time=float(
+                            host_result[
+                                "env_time"
+                            ]
+                        ),
+                    )
+
+                    # ==========================================================
+                    # execute_pending_host_action() 内部会继续推进事件，
+                    # 因而期间可能已经发生：
+                    #
+                    #   completed
+                    #   waiting_timeout
+                    #   resource failure
+                    #
+                    # 必须在 Host Step 已经写入以后，
+                    # 再消费这些 delayed outcome。
+                    # ==========================================================
+
+                    consume_environment_reward_corrections(
+                        env=env,
+
+                        pending_trace_store=(
+                            pending_trace_store
+                        ),
+
+                        replay_buffer=(
+                            replay_buffer
+                        ),
+
+                        stats=stats,
+
+                        train_config=(
+                            train_config
+                        ),
+                    )
+
+                    # Host action 后之前缓存的 Routing snapshot 已失效。
                     decision = None
 
-                    # 当前第十三步先只打通 Host decision channel。
-                    #
-                    # Host Transition / Host ReplayBuffer
-                    # 在后续经验池改造步骤再正式写入。
+                    # 当前第十四步不创建 Host Replay Transition。
                     continue
 
                 # ==========================================================
@@ -2334,6 +2494,9 @@ def train(
                         decision=decision,
                         action=action,
                         action_type=action_type,
+                        action_source=(
+                            action_source
+                        ),
                     )
                 )
 
@@ -2375,95 +2538,23 @@ def train(
                     env.pop_reward_corrections()
                 )
 
-                for correction in reward_corrections:
-                    correction_job_id = str(correction["job_id"])
-                    reward_delta = float(correction["reward_delta"])
+                consume_environment_reward_corrections(
+                    env=env,
 
-                    correction_reason = str(correction.get("reason", "",))
+                    pending_trace_store=(
+                        pending_trace_store
+                    ),
 
-                    if correction_reason == "completed":
-                        applied_credits = (
-                            replay_buffer.apply_discounted_terminal_reward(
-                                job_id=correction_job_id,
-                                reward_delta=reward_delta,
-                                credit_decay=float(
-                                    train_config.completion_credit_decay
-                                ),
-                            )
-                        )
+                    replay_buffer=(
+                        replay_buffer
+                    ),
 
-                        if not applied_credits:
-                            correction_agent_id = (
-                                replay_buffer.apply_reward_correction(
-                                    job_id=correction_job_id,
-                                    reward_delta=reward_delta,
-                                )
-                            )
-                            if correction_agent_id is not None:
-                                stats.record_reward_correction(
-                                    agent_id=correction_agent_id,
-                                    reward_delta=reward_delta,
-                                )
-                            continue
-                        for (correction_agent_id, terminal_credit,) in applied_credits:
-                            stats.record_reward_correction(
-                                agent_id=correction_agent_id,
-                                reward_delta=terminal_credit,
-                            )
-                        continue
-                    if correction_reason in TERMINAL_FAILURE_REASONS:
-                        applied_penalties = (
-                            replay_buffer.apply_discounted_terminal_reward(
-                                job_id=correction_job_id,
-                                reward_delta=reward_delta,
-                                credit_decay=float(
-                                    train_config.failure_credit_decay
-                                ),
-                            )
-                        )
-                        if not applied_penalties:
-                            # 防御性 fallback。
-                            correction_agent_id = (
-                                replay_buffer.apply_reward_correction(
-                                    job_id=correction_job_id,
-                                    reward_delta=reward_delta,
-                                )
-                            )
+                    stats=stats,
 
-                            if correction_agent_id is not None:
-                                stats.record_reward_correction(
-                                    agent_id=correction_agent_id,
-                                    reward_delta=reward_delta,
-                                )
-
-                            continue
-                        for (
-                                correction_agent_id,
-                                terminal_penalty,
-                        ) in applied_penalties:
-                            stats.record_reward_correction(
-                                agent_id=correction_agent_id,
-                                reward_delta=terminal_penalty,
-                            )
-
-                        continue
-
-
-                    # 把奖励修正到这个 Job 最新一次调度经验。
-                    correction_agent_id = (
-                        replay_buffer.apply_reward_correction(
-                            job_id=correction_job_id,
-                            reward_delta=reward_delta,
-                        )
-                    )
-
-                    # 如果对应 experience 仍然存在于 ReplayBuffer，
-                    # 同时修正当前 episode 日志中的 return。
-                    if correction_agent_id is not None:
-                        stats.record_reward_correction(
-                            agent_id=correction_agent_id,
-                            reward_delta=reward_delta,
-                        )
+                    train_config=(
+                        train_config
+                    ),
+                )
 
                 # 增加计数
                 global_decision_steps += 1
@@ -2503,6 +2594,33 @@ def train(
                         # stats.record_update(update_info)
                         update_info_block.append(update_info)
                     record_update_block(stats=stats,update_infos=update_info_block,)
+
+            # ==============================================================
+            # Episode 结束后的最后一次 delayed outcome flush。
+            #
+            # 正常情况下 Routing/Host Branch 已经实时消费；
+            # 这里作为 Episode tail 的防御性收尾，
+            # 防止最后一批 terminal correction 留在 Environment 中。
+            # ==============================================================
+
+            consume_environment_reward_corrections(
+                env=env,
+
+                pending_trace_store=(
+                    pending_trace_store
+                ),
+
+                replay_buffer=(
+                    replay_buffer
+                ),
+
+                stats=stats,
+
+                train_config=(
+                    train_config
+                ),
+            )
+            pending_trace_store.assert_no_open_trace()
 
             # 计算当前 episode 的真实运行秒数。
             wall_time_seconds = (time.perf_counter() - episode_wall_start)
