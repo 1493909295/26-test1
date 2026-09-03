@@ -2198,7 +2198,7 @@ def train(
             # 重启环境
             pending_trace_store.reset_episode()
             env.reset(seed=episode_seed)
-            pending_trace_store.reset_episode()
+
             collector.reset_episode()
             replay_buffer.reset_episode_job_tracking()
             # 为每个智能体创建奖励累计字典
@@ -2533,10 +2533,7 @@ def train(
                     )
 
 
-                # 消费 env.step() 期间产生的延迟任务结果奖励
-                reward_corrections = (
-                    env.pop_reward_corrections()
-                )
+                
 
                 consume_environment_reward_corrections(
                     env=env,

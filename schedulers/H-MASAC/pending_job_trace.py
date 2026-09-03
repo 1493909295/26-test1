@@ -170,10 +170,56 @@ class PendingJobTraceStore:
             immediate_reward: float,
             target_dc_id: Optional[str],
     ) -> None:
+        """
+        向指定 Job 的 Pending Causal Trace
+        追加一个真实发生的 Routing Decision。
+
+        严格因果约束：
+
+            1. 已 terminal Job 不能继续 Routing；
+            2. 上一个 Edge->Edge predecessor 必须先解析完成，
+               才允许追加新的 Routing Step；
+            3. action_type 与 target_dc_id 必须语义一致；
+            4. 不做 visited-DC / cycle 限制。
+
+        因此：
+            DC1 -> DC3 -> DC1
+
+        仍然完全允许。
+
+        本函数检查的是“因果正确性”，
+        不是限制 Routing 策略。
+        """
+
+        job_id = str(
+            job_id
+        )
+
+        agent_id = str(
+            agent_id
+        )
+
+        action_type = str(
+            action_type
+        )
+
+        action_source = str(
+            action_source
+        )
+
+        target_dc_id = (
+            None
+            if target_dc_id is None
+            else str(target_dc_id)
+        )
 
         trace = self._get_or_create(
             job_id
         )
+
+        # ==========================================================
+        # 已 terminal Job 不允许继续产生 Routing decision。
+        # ==========================================================
 
         if trace.terminal:
             raise RuntimeError(
@@ -182,21 +228,136 @@ class PendingJobTraceStore:
                 f"job={job_id}"
             )
 
+        # ==========================================================
+        # Routing Action Type 合法性检查。
+        # ==========================================================
+
+        allowed_action_types = {
+            "edge_dc",
+            "self",
+            "cloud",
+            "drop",
+        }
+
+        if action_type not in allowed_action_types:
+            raise ValueError(
+                "PendingJobTrace 收到未知 Routing action_type："
+                f"job={job_id}, "
+                f"action_type={action_type}"
+            )
+
+        # ==========================================================
+        # 严格因果链：
+        #
+        # 在添加新的 Routing Step 之前，
+        # 不允许该 Job 还有一个尚未解析的 Edge predecessor。
+        #
+        # 正常顺序必须是：
+        #
+        #   record R0: DC1 -> DC3
+        #       ↓
+        #   Job 到 DC3
+        #       ↓
+        #   resolve R0.next_state
+        #       ↓
+        #   才允许 record R1
+        # ==========================================================
+
+        unresolved_edge_steps = [
+            step
+            for step
+            in trace.routing_steps
+            if (
+                    step.action_type == "edge_dc"
+                    and not step.successor_resolved
+            )
+        ]
+
+        if unresolved_edge_steps:
+            raise RuntimeError(
+                "上一条 Edge Routing predecessor 尚未解析，"
+                "不能继续追加新的 Routing Step："
+                f"job={job_id}, "
+                f"current_agent={agent_id}, "
+                f"unresolved_count={len(unresolved_edge_steps)}"
+            )
+
+        # ==========================================================
+        # Action Semantic Validation
+        # ==========================================================
+
+        if action_type == "edge_dc":
+
+            if target_dc_id is None:
+                raise RuntimeError(
+                    "Edge Routing 缺少 target_dc_id："
+                    f"job={job_id}, "
+                    f"source={agent_id}"
+                )
+
+            # target == source 应该被编码为 Self，
+            # 不能被错误标记为 edge_dc。
+            if target_dc_id == agent_id:
+                raise RuntimeError(
+                    "edge_dc 的 target_dc_id "
+                    "不能等于当前 source DC："
+                    f"job={job_id}, "
+                    f"dc={agent_id}"
+                )
+
+        elif action_type == "self":
+
+            if target_dc_id != agent_id:
+                raise RuntimeError(
+                    "Self Routing 的 target_dc_id "
+                    "必须等于当前 DC："
+                    f"job={job_id}, "
+                    f"source={agent_id}, "
+                    f"target={target_dc_id}"
+                )
+
+        elif action_type == "cloud":
+
+            if target_dc_id is None:
+                raise RuntimeError(
+                    "Cloud Routing 缺少 target_dc_id："
+                    f"job={job_id}"
+                )
+
+        elif action_type == "drop":
+
+            if target_dc_id is not None:
+                raise RuntimeError(
+                    "Drop action 不应该存在 target_dc_id："
+                    f"job={job_id}, "
+                    f"target={target_dc_id}"
+                )
+
+        # ==========================================================
+        # Routing Step Sequence
+        # ==========================================================
+
         sequence_index = len(
             trace.routing_steps
         )
 
         trace.routing_steps.append(
             PendingRoutingStep(
-                job_id=str(job_id),
+                job_id=job_id,
+
                 sequence_index=(
                     sequence_index
                 ),
 
-                agent_id=str(agent_id),
-                agent_index=int(agent_index),
+                agent_id=agent_id,
 
-                env_time=float(env_time),
+                agent_index=int(
+                    agent_index
+                ),
+
+                env_time=float(
+                    env_time
+                ),
 
                 local_obs=np.asarray(
                     local_obs,
@@ -208,12 +369,15 @@ class PendingJobTraceStore:
                     dtype=np.float32,
                 ).copy(),
 
-                action=int(action),
-                action_type=str(
+                action=int(
+                    action
+                ),
+
+                action_type=(
                     action_type
                 ),
 
-                action_source=str(
+                action_source=(
                     action_source
                 ),
 
@@ -221,14 +385,12 @@ class PendingJobTraceStore:
                     immediate_reward
                 ),
 
-                source_dc_id=str(
+                source_dc_id=(
                     agent_id
                 ),
 
                 target_dc_id=(
-                    None
-                    if target_dc_id is None
-                    else str(target_dc_id)
+                    target_dc_id
                 ),
             )
         )
@@ -278,6 +440,56 @@ class PendingJobTraceStore:
             unresolved_steps[-1]
         )
 
+        next_agent_id = str(
+            next_agent_id
+        )
+
+        next_env_time = float(
+            next_env_time
+        )
+
+        expected_target_dc_id = (
+            previous_step.target_dc_id
+        )
+
+        if expected_target_dc_id is None:
+            raise RuntimeError(
+                "未解析 Edge predecessor 缺少 target_dc_id："
+                f"job={job_id}, "
+                f"sequence={previous_step.sequence_index}"
+            )
+
+        if next_agent_id != str(
+                expected_target_dc_id
+        ):
+            raise RuntimeError(
+                "Routing Causal Chain target 不一致："
+                f"job={job_id}, "
+                f"sequence={previous_step.sequence_index}, "
+                f"source={previous_step.source_dc_id}, "
+                f"expected_target={expected_target_dc_id}, "
+                f"actual_next_agent={next_agent_id}"
+            )
+
+        # ==========================================================
+        # 时间因果关系必须单调。
+        #
+        # successor 决策时间不能早于 predecessor 决策时间。
+        # ==========================================================
+
+        if (
+                next_env_time
+                < float(
+            previous_step.env_time
+        )
+        ):
+            raise RuntimeError(
+                "Routing Causal Chain 时间倒退："
+                f"job={job_id}, "
+                f"previous_time={previous_step.env_time}, "
+                f"next_time={next_env_time}"
+            )
+
         previous_step.next_agent_id = str(
             next_agent_id
         )
@@ -318,9 +530,60 @@ class PendingJobTraceStore:
             action_source: str,
     ) -> None:
 
-        trace = self._get_or_create(
+        job_id = str(
             job_id
         )
+
+        dc_id = str(
+            dc_id
+        )
+
+        # ==========================================================
+        # Host Step 绝不能凭空创建 Job Trace。
+        #
+        # 正确因果链必须已经存在：
+        #
+        #   Routing ... -> Self
+        #
+        # Host 才能发生。
+        # ==========================================================
+
+        trace = self.get_trace(
+            job_id
+        )
+
+        if not trace.routing_steps:
+            raise RuntimeError(
+                "Host Decision 出现时 Job 没有任何 Routing Step："
+                f"job={job_id}, "
+                f"dc={dc_id}"
+            )
+
+        last_routing_step = (
+            trace.routing_steps[-1]
+        )
+
+        if (
+                last_routing_step.action_type
+                != "self"
+        ):
+            raise RuntimeError(
+                "Host Decision 的上一因果节点不是 Self Routing："
+                f"job={job_id}, "
+                f"last_routing_action="
+                f"{last_routing_step.action_type}"
+            )
+
+        if (
+                last_routing_step.source_dc_id
+                != dc_id
+        ):
+            raise RuntimeError(
+                "Host Decision DC 与 Self Routing DC 不一致："
+                f"job={job_id}, "
+                f"self_dc={last_routing_step.source_dc_id}, "
+                f"host_dc={dc_id}"
+            )
 
         if trace.terminal:
             raise RuntimeError(
@@ -395,7 +658,19 @@ class PendingJobTraceStore:
             terminal: bool,
     ) -> None:
 
-        trace = self._get_or_create(
+        job_id = str(
+            job_id
+        )
+
+        # ==========================================================
+        # Environment terminal/delayed outcome 必须属于
+        # 一个已经存在的 Job Causal Trace。
+        #
+        # 不允许 terminal event 凭空创建 Trace，
+        # 否则会掩盖 Routing Decision 丢失问题。
+        # ==========================================================
+
+        trace = self.get_trace(
             job_id
         )
 
@@ -437,7 +712,11 @@ class PendingJobTraceStore:
             reason: str,
     ) -> None:
 
-        trace = self._get_or_create(
+        job_id = str(
+            job_id
+        )
+
+        trace = self.get_trace(
             job_id
         )
 

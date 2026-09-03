@@ -666,18 +666,37 @@ class TransitionCollector:
         # ==========================================================
 
         if action_type == "drop":
-            self.pending_trace_store.record_reward_event(
-                job_id=decision.job_id,
+            # ==========================================================
+            # Forced Drop
+            #
+            # Drop penalty 已经作为当前 Routing Step 的：
+            #
+            #     immediate_reward
+            #
+            # 保存。
+            #
+            # 因此这里仅标记 Job terminal，
+            # 不能再次把同一 penalty 保存成 RewardEvent。
+            #
+            # 否则后续 Finalize：
+            #
+            #     Routing immediate_reward
+            #           +
+            #     RewardEvent.reward_delta
+            #
+            # 会重复计算同一 Drop penalty。
+            # ==========================================================
+
+            self.pending_trace_store.mark_terminal(
+                job_id=(
+                    decision.job_id
+                ),
 
                 env_time=float(
                     self.env.current_time
                 ),
 
-                reward_delta=reward,
-
                 reason="forced_drop",
-
-                terminal=True,
             )
 
         # ==========================================================
@@ -1115,8 +1134,45 @@ class TransitionCollector:
             )
 
     # 返回活着的、当前决策的agent
-    def _get_live_selected_agent(self) -> str:
-        agent_id = str(self.env.agent_selection)
+    def _get_live_selected_agent(
+            self,
+    ) -> str:
+        """
+        返回当前真正处于 PettingZoo Routing Phase 的 Agent。
+
+        Host Phase 下：
+            agent_selection == None
+
+        因此必须立即拒绝，
+        不能把 None 转换成字符串 "None"。
+        """
+
+        if self.env.agent_selection is None:
+            raise RuntimeError(
+                "当前不存在 PettingZoo Routing Agent。"
+                "如果存在 pending Host decision，"
+                "应由 Local Host SAC 分支处理，"
+                "不能调用 Routing TransitionCollector。"
+            )
+
+        agent_id = str(
+            self.env.agent_selection
+        )
+
+        if agent_id not in self.env.possible_agents:
+            raise RuntimeError(
+                "当前 agent_selection 不是合法 Routing Agent："
+                f"agent={agent_id}, "
+                f"possible_agents={self.env.possible_agents}"
+            )
+
+        if agent_id not in self.env.agents:
+            raise RuntimeError(
+                "当前 Routing Agent 已不在活跃 agents 中："
+                f"agent={agent_id}, "
+                f"agents={self.env.agents}"
+            )
+
         return agent_id
 
     # 判断整个 episode 结束
