@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 from numpy.typing import NDArray
+from host_transition import HostTransition
 
 FloatArray = NDArray[np.float32]
 
@@ -95,27 +96,22 @@ class PendingJobTrace:
 @dataclass(frozen=True)
 class FinalizedJobTrace:
     """
-    一个 Job 已经完成生命周期闭环以后生成的不可继续扩展因果链。
+    一个 Job 完整生命周期已经闭合后的不可继续修改因果链。
 
-    本对象保存的是已经确认完成的事实：
+    FinalizedJobTrace 保存两种信息：
 
-        Routing Step 0
-            ↓
-        Routing Step 1
-            ↓
-        ...
-            ↓
-        Self / Cloud / Drop
-            ↓
-        Host（仅 Self）
-            ↓
-        Terminal Outcome
+        1. 原始 Causal Facts
+           - Routing Steps
+           - Host Step
+           - Reward Events
+           - Terminal Outcome
+
+        2. 从完整因果事实派生出的 Host terminal transition
+           - 仅 Routing 最终选择 Self 的 Job 存在
+           - Cloud / Drop Job 为 None
 
     注意：
-        1. FinalizedJobTrace 不是 Replay Transition；
-        2. 不参与 sample()；
-        3. 不直接参与 SAC update；
-        4. Reward attribution 将在后续步骤单独完成。
+        FinalizedJobTrace 本身仍然不是 ReplayBuffer。
     """
 
     job_id: str
@@ -132,6 +128,20 @@ class FinalizedJobTrace:
     reward_events: tuple[
         PendingRewardEvent,
         ...
+    ]
+
+    # ==========================================================
+    # Local Host SAC 的正式单步 terminal experience。
+    #
+    # Self:
+    #     HostTransition
+    #
+    # Cloud / Drop:
+    #     None
+    # ==========================================================
+
+    host_transition: Optional[
+        HostTransition
     ]
 
     terminal_reason: str
@@ -1172,6 +1182,333 @@ class PendingJobTraceStore:
                     f"terminal_time={terminal_time}"
                 )
 
+    def _build_terminal_host_transition(self, trace: PendingJobTrace,) -> Optional[HostTransition]:
+        """
+        从已经完整 terminal 的 Job Causal Trace
+        派生一条 Local Host SAC terminal transition。
+
+        规则：
+
+            final Routing != Self
+                -> None
+
+            final Routing == Self
+                -> 必须恰好存在一个 Host Decision
+                -> 构造恰好一条 HostTransition
+
+        Host 层不存在 same-job successor Host Decision，因此：
+
+            next_host_obs = zeros
+            terminated = True
+            truncated = False
+            done = True
+
+        本函数不会：
+            - 创建 HostReplayBuffer；
+            - 进行 SAC update；
+            - 人工构造下一 Host Observation；
+            - 把其他 Job 的 Host Observation 当作 next state。
+        """
+
+        job_id = str(
+            trace.job_id
+        )
+
+        # ==========================================================
+        # 1. 没有 Host Decision 的 Job 不产生 Host Transition。
+        #
+        # 正常对应：
+        #   Cloud
+        #   Forced Drop
+        # ==========================================================
+
+        host_step = trace.host_step
+
+        if host_step is None:
+            return None
+
+        # ==========================================================
+        # 2. 有 Host Step 时，最终 Routing 必须是 Self。
+        #
+        # _validate_trace_for_finalize() 已经检查过一次，
+        # 这里再次做防御性检查，避免未来调用路径发生改变。
+        # ==========================================================
+
+        if not trace.routing_steps:
+            raise RuntimeError(
+                "构造 HostTransition 时 "
+                "Job 没有 Routing Step："
+                f"job={job_id}"
+            )
+
+        final_routing_step = (
+            trace.routing_steps[-1]
+        )
+
+        if (
+                str(
+                    final_routing_step.action_type
+                )
+                != "self"
+        ):
+            raise RuntimeError(
+                "存在 Host Step，"
+                "但最终 Routing action 不是 Self："
+                f"job={job_id}, "
+                f"final_action="
+                f"{final_routing_step.action_type}"
+            )
+
+        # ==========================================================
+        # 3. Host Step 必须已经获得真实执行结果。
+        # ==========================================================
+
+        if host_step.execution_result is None:
+            raise RuntimeError(
+                "构造 HostTransition 时 "
+                "Host execution_result 尚未记录："
+                f"job={job_id}"
+            )
+
+        # ==========================================================
+        # 4. Job 必须已经真正 terminal。
+        # ==========================================================
+
+        if not trace.terminal:
+            raise RuntimeError(
+                "不能从未 terminal Job "
+                "构造 HostTransition："
+                f"job={job_id}"
+            )
+
+        if trace.terminal_reason is None:
+            raise RuntimeError(
+                "构造 HostTransition 时 "
+                "缺少 terminal_reason："
+                f"job={job_id}"
+            )
+
+        if trace.terminal_time is None:
+            raise RuntimeError(
+                "构造 HostTransition 时 "
+                "缺少 terminal_time："
+                f"job={job_id}"
+            )
+
+        host_decision_time = float(
+            host_step.env_time
+        )
+
+        terminal_time = float(
+            trace.terminal_time
+        )
+
+        if (
+                terminal_time
+                < host_decision_time
+        ):
+            raise RuntimeError(
+                "Host terminal_time 早于 Host decision_time："
+                f"job={job_id}, "
+                f"decision_time={host_decision_time}, "
+                f"terminal_time={terminal_time}"
+            )
+
+        # ==========================================================
+        # 5. Host-level Reward
+        #
+        # Host SAC 只有一个 decision，因此这条 terminal
+        # transition 的 reward 应表示：
+        #
+        #   从 Host decision 开始
+        #        ↓
+        #   到该 Job terminal
+        #
+        # 期间产生的全部 delayed Job reward。
+        #
+        # 特别注意：
+        # Host decision 以前由 Routing 产生的 reward
+        # 不应该重复归属于 Host SAC。
+        # ==========================================================
+
+        host_reward_events = [
+            event
+            for event
+            in trace.reward_events
+            if (
+                    float(event.env_time)
+                    + 1e-9
+                    >= host_decision_time
+            )
+        ]
+
+        # ==========================================================
+        # 6. Self -> Host Job 必须恰好有一个 terminal event。
+        #
+        # 当前环境可能是：
+        #
+        #   completed
+        #   waiting_timeout
+        #   local_host_arrival_timeout
+        #   local_host_resource_failure
+        #
+        # ==========================================================
+
+        host_terminal_events = [
+            event
+            for event
+            in host_reward_events
+            if bool(
+                event.terminal
+            )
+        ]
+
+        if len(
+                host_terminal_events
+        ) != 1:
+            raise RuntimeError(
+                "Host Job 必须恰好存在一个 "
+                "terminal RewardEvent："
+                f"job={job_id}, "
+                f"terminal_event_count="
+                f"{len(host_terminal_events)}"
+            )
+
+        terminal_event = (
+            host_terminal_events[0]
+        )
+
+        if (
+                str(terminal_event.reason)
+                != str(trace.terminal_reason)
+        ):
+            raise RuntimeError(
+                "Host terminal RewardEvent "
+                "与 Trace terminal_reason 不一致："
+                f"job={job_id}, "
+                f"event_reason={terminal_event.reason}, "
+                f"trace_reason={trace.terminal_reason}"
+            )
+
+        # ==========================================================
+        # 7. One-Job Host Return
+        #
+        # 当前 active 环境基本只有一个 terminal reward event，
+        # 因而现在通常等价于：
+        #
+        #     host_reward = terminal_event.reward_delta
+        #
+        # 这里仍采用 sum，是为了以后如果重新启用
+        # Host decision 后的 waiting cost 等 delayed cost，
+        # 不需要改变 HostTransition 定义。
+        # ==========================================================
+
+        host_reward = float(
+            sum(
+                float(event.reward_delta)
+                for event
+                in host_reward_events
+            )
+        )
+
+        # ==========================================================
+        # 8. 保存 Host 决策时的 Observation。
+        # ==========================================================
+
+        host_obs = np.asarray(
+            host_step.host_obs,
+            dtype=np.float32,
+        ).copy()
+
+        if host_obs.ndim != 1:
+            raise RuntimeError(
+                "HostTransition host_obs "
+                "必须是一维向量："
+                f"job={job_id}, "
+                f"shape={host_obs.shape}"
+            )
+
+        # ==========================================================
+        # 9. Host 层不存在 same-job 下一次 Host decision。
+        #
+        # 所以禁止使用：
+        #
+        #   下一个全局 Job 的 Host Observation
+        #
+        # 或：
+        #
+        #   started 后重新构造的 Host Observation
+        #
+        # 作为 next state。
+        #
+        # 标准 SAC 接口使用全 0 terminal next state。
+        # ==========================================================
+
+        next_host_obs = np.zeros_like(
+            host_obs,
+            dtype=np.float32,
+        )
+
+        # ==========================================================
+        # 10. 正式创建唯一 Host terminal transition。
+        # ==========================================================
+
+        return HostTransition(
+            job_id=job_id,
+
+            dc_id=str(
+                host_step.dc_id
+            ),
+
+            decision_time=(
+                host_decision_time
+            ),
+
+            host_obs=(
+                host_obs
+            ),
+
+            action=int(
+                host_step.action
+            ),
+
+            host_id=str(
+                host_step.host_id
+            ),
+
+            action_source=str(
+                host_step.action_source
+            ),
+
+            reward=(
+                host_reward
+            ),
+
+            next_host_obs=(
+                next_host_obs
+            ),
+
+            # 一个 Host Decision 对应一个完整 Job lifecycle，
+            # 因而 Host-level transition 永远 terminal。
+            terminated=True,
+
+            truncated=False,
+
+            done=True,
+
+            execution_result=str(
+                host_step.execution_result
+            ),
+
+            terminal_reason=str(
+                trace.terminal_reason
+            ),
+
+            terminal_time=(
+                terminal_time
+            ),
+        )
+
     def _build_finalized_trace(self,trace: PendingJobTrace, ) -> FinalizedJobTrace:
         """
         从已经通过结构验证的 PendingJobTrace
@@ -1214,6 +1551,12 @@ class PendingJobTraceStore:
             in trace.reward_events
         )
 
+        finalized_host_transition = (
+            self._build_terminal_host_transition(
+                trace
+            )
+        )
+
         return FinalizedJobTrace(
             job_id=str(
                 trace.job_id
@@ -1229,6 +1572,10 @@ class PendingJobTraceStore:
 
             reward_events=(
                 finalized_reward_events
+            ),
+
+            host_transition=(
+                finalized_host_transition
             ),
 
             terminal_reason=str(
@@ -1341,10 +1688,29 @@ class PendingJobTraceStore:
 
         return trace
 
-    def is_terminal(
-            self,
-            job_id: str,
-    ) -> bool:
+    def get_finalized_host_transition( self,job_id: str,) -> Optional[HostTransition]:
+        """
+        返回指定已 Finalize Job 对应的 Local Host SAC
+        terminal transition。
+
+        Self Job:
+            HostTransition
+
+        Cloud / Drop Job:
+            None
+        """
+
+        finalized_trace = (
+            self.get_finalized_trace(
+                job_id
+            )
+        )
+
+        return (
+            finalized_trace.host_transition
+        )
+
+    def is_terminal(self, job_id: str,) -> bool:
 
         job_id = str(
             job_id
@@ -1430,6 +1796,28 @@ class PendingJobTraceStore:
 
         return len(
             self._finalized_traces
+        )
+
+    @property
+    def finalized_host_transition_count( self,) -> int:
+        """
+        当前 Episode 已经形成的正式
+        Local Host SAC terminal transition 数量。
+
+        理论上应等于：
+            最终 Routing action == Self
+            且 Job 已 terminal
+            的 Job 数。
+        """
+
+        return sum(
+            1
+            for trace
+            in self._finalized_traces.values()
+            if (
+                    trace.host_transition
+                    is not None
+            )
         )
 
     @property
