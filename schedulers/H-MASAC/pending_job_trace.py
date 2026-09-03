@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 import numpy as np
 from numpy.typing import NDArray
 from host_transition import HostTransition
+from routing_transition import (RoutingTransition,)
 
 FloatArray = NDArray[np.float32]
 
@@ -118,6 +119,11 @@ class FinalizedJobTrace:
 
     routing_steps: tuple[
         PendingRoutingStep,
+        ...
+    ]
+
+    routing_transitions: tuple[
+        RoutingTransition,
         ...
     ]
 
@@ -1509,6 +1515,403 @@ class PendingJobTraceStore:
             ),
         )
 
+    def _build_finalized_routing_transitions(self,trace: PendingJobTrace,) -> tuple[RoutingTransition, ...]:
+        """
+        从已经 terminal 的完整 Job Causal Trace
+        一次性生成 Routing MASAC 正式训练经验。
+
+        核心规则：
+
+            1. forced Routing Step 不直接进入 Replay；
+            2. 每个正常 Edge action 的 next_state
+               必须来自 same-job successor；
+            3. Self / Cloud / Actor Drop 为 Routing terminal；
+            4. Terminal reward 只归属于最后一个
+               Actor-controlled Routing Transition；
+            5. Forced Drop penalty 归因到最近一次
+               Actor-controlled Routing Transition；
+            6. 不再修改已经进入 ReplayBuffer 的经验。
+        """
+
+        job_id = str(
+            trace.job_id
+        )
+
+        routing_steps = list(
+            trace.routing_steps
+        )
+
+        # ==========================================================
+        # 找出真正由 Actor 控制的 Routing Decisions。
+        #
+        # random：
+        #     虽然不是 policy 网络采样，
+        #     但属于正常探索经验，可以训练。
+        #
+        # policy：
+        #     正常策略经验。
+        #
+        # forced：
+        #     Environment 强制行为，不直接训练。
+        # ==========================================================
+
+        actor_step_indices = [
+            index
+            for index, step
+            in enumerate(routing_steps)
+            if step.action_source
+               in {
+                   "random",
+                   "policy",
+               }
+        ]
+
+        if not actor_step_indices:
+            return tuple()
+
+        # ==========================================================
+        # 初始 reward：
+        # 每一步先使用自己真正发生时的 immediate_reward。
+        # ==========================================================
+
+        final_rewards = {
+            index: float(
+                routing_steps[
+                    index
+                ].immediate_reward
+            )
+            for index
+            in actor_step_indices
+        }
+
+        # ==========================================================
+        # Environment delayed reward event：
+        #
+        # 将 reward 归给 event 发生之前最近一次
+        # Actor-controlled Routing Decision。
+        #
+        # Terminal event 因而自然归给最后一次 Actor Decision。
+        # ==========================================================
+
+        for event in trace.reward_events:
+
+            event_time = float(
+                event.env_time
+            )
+
+            candidate_indices = [
+                index
+                for index
+                in actor_step_indices
+                if (
+                        float(
+                            routing_steps[
+                                index
+                            ].env_time
+                        )
+                        <= event_time + 1e-9
+                )
+            ]
+
+            if not candidate_indices:
+                continue
+
+            target_index = (
+                candidate_indices[-1]
+            )
+
+            final_rewards[
+                target_index
+            ] += float(
+                event.reward_delta
+            )
+
+        # ==========================================================
+        # Forced action 自己不能训练。
+        #
+        # 但 forced drop 的真实 terminal penalty
+        # 必须归因到它之前最近一次 Actor-controlled action。
+        #
+        # 这实现第十七步已经确定的：
+        #
+        #   Actor Edge
+        #       ↓
+        #   Forced Drop
+        #
+        # 转化成：
+        #
+        #   Actor Edge
+        #   reward += drop penalty
+        #   done = True
+        # ==========================================================
+
+        for forced_index, forced_step in enumerate(
+                routing_steps
+        ):
+
+            if (
+                    forced_step.action_source
+                    != "forced"
+            ):
+                continue
+
+            forced_reward = float(
+                forced_step.immediate_reward
+            )
+
+            if abs(forced_reward) <= 1e-12:
+                continue
+
+            predecessor_indices = [
+                index
+                for index
+                in actor_step_indices
+                if index < forced_index
+            ]
+
+            if not predecessor_indices:
+                # Job 从一开始就只能 forced drop，
+                # 没有 Actor 决策，不产生训练经验。
+                continue
+
+            target_index = (
+                predecessor_indices[-1]
+            )
+
+            final_rewards[
+                target_index
+            ] += forced_reward
+
+        finalized_transitions = []
+
+        # ==========================================================
+        # 构造每一个 Actor-controlled Routing Transition。
+        # ==========================================================
+
+        for actor_position, step_index in enumerate(
+                actor_step_indices
+        ):
+
+            step = routing_steps[
+                step_index
+            ]
+
+            # ------------------------------------------------------
+            # 下一条原始 Routing Step。
+            #
+            # 注意不是下一个全局 Job。
+            # ------------------------------------------------------
+
+            next_raw_step = (
+                routing_steps[
+                    step_index + 1
+                    ]
+                if (
+                        step_index + 1
+                        < len(routing_steps)
+                )
+                else None
+            )
+
+            # ======================================================
+            # Edge -> 正常 Actor Routing：
+            #
+            # 可以通过 same-job successor bootstrap。
+            # ======================================================
+
+            has_normal_routing_successor = bool(
+                step.action_type == "edge_dc"
+                and next_raw_step is not None
+                and next_raw_step.action_source
+                in {
+                    "random",
+                    "policy",
+                }
+            )
+
+            if has_normal_routing_successor:
+
+                if not step.successor_resolved:
+                    raise RuntimeError(
+                        "Finalized Edge Routing "
+                        "缺少 same-job successor："
+                        f"job={job_id}, "
+                        f"sequence={step.sequence_index}"
+                    )
+
+                if step.next_local_obs is None:
+                    raise RuntimeError(
+                        "Finalized Edge Routing "
+                        "缺少 next_local_obs："
+                        f"job={job_id}"
+                    )
+
+                if step.next_global_state is None:
+                    raise RuntimeError(
+                        "Finalized Edge Routing "
+                        "缺少 next_global_state："
+                        f"job={job_id}"
+                    )
+
+                next_agent_id = str(
+                    step.next_agent_id
+                )
+
+                next_agent_index = int(
+                    step.next_agent_index
+                )
+
+                next_env_time = float(
+                    step.next_env_time
+                )
+
+                next_local_obs = np.asarray(
+                    step.next_local_obs,
+                    dtype=np.float32,
+                ).copy()
+
+                next_global_state = np.asarray(
+                    step.next_global_state,
+                    dtype=np.float32,
+                ).copy()
+
+                terminated = False
+                truncated = False
+                done = False
+
+                terminal_reason = None
+
+            else:
+
+                # ==================================================
+                # Routing terminal：
+                #
+                #   Self
+                #   Cloud
+                #   Actor Drop
+                #
+                # 或：
+                #
+                #   Edge -> Forced Drop
+                #
+                # 都不能继续 bootstrap。
+                # ==================================================
+
+                next_agent_id = None
+                next_agent_index = -1
+
+                next_env_time = float(
+                    trace.terminal_time
+                )
+
+                next_local_obs = np.zeros_like(
+                    np.asarray(
+                        step.local_obs,
+                        dtype=np.float32,
+                    )
+                )
+
+                next_global_state = np.zeros_like(
+                    np.asarray(
+                        step.global_state,
+                        dtype=np.float32,
+                    )
+                )
+
+                terminated = True
+                truncated = False
+                done = True
+
+                terminal_reason = str(
+                    trace.terminal_reason
+                )
+
+            finalized_transitions.append(
+                RoutingTransition(
+                    job_id=job_id,
+
+                    agent_id=str(
+                        step.agent_id
+                    ),
+
+                    agent_index=int(
+                        step.agent_index
+                    ),
+
+                    env_time=float(
+                        step.env_time
+                    ),
+
+                    local_obs=np.asarray(
+                        step.local_obs,
+                        dtype=np.float32,
+                    ).copy(),
+
+                    global_state=np.asarray(
+                        step.global_state,
+                        dtype=np.float32,
+                    ).copy(),
+
+                    action=int(
+                        step.action
+                    ),
+
+                    action_type=str(
+                        step.action_type
+                    ),
+
+                    action_source=str(
+                        step.action_source
+                    ),
+
+                    reward=float(
+                        final_rewards[
+                            step_index
+                        ]
+                    ),
+
+                    next_agent_id=(
+                        next_agent_id
+                    ),
+
+                    next_agent_index=(
+                        next_agent_index
+                    ),
+
+                    next_env_time=(
+                        next_env_time
+                    ),
+
+                    next_local_obs=(
+                        next_local_obs
+                    ),
+
+                    next_global_state=(
+                        next_global_state
+                    ),
+
+                    terminated=(
+                        terminated
+                    ),
+
+                    truncated=(
+                        truncated
+                    ),
+
+                    done=(
+                        done
+                    ),
+
+                    terminal_reason=(
+                        terminal_reason
+                    ),
+                )
+            )
+
+        return tuple(
+            finalized_transitions
+        )
+
     def _build_finalized_trace(self,trace: PendingJobTrace, ) -> FinalizedJobTrace:
         """
         从已经通过结构验证的 PendingJobTrace
@@ -1551,6 +1954,12 @@ class PendingJobTraceStore:
             in trace.reward_events
         )
 
+        finalized_routing_transitions = (
+            self._build_finalized_routing_transitions(
+                trace
+            )
+        )
+
         finalized_host_transition = (
             self._build_terminal_host_transition(
                 trace
@@ -1564,6 +1973,12 @@ class PendingJobTraceStore:
 
             routing_steps=(
                 finalized_routing_steps
+            ),
+
+            # 第十九步：
+            # Job terminal 后才生成的正式 Routing Replay experience。
+            routing_transitions=(
+                finalized_routing_transitions
             ),
 
             host_step=(
@@ -1685,6 +2100,40 @@ class PendingJobTraceStore:
                 "找不到 Finalized Job Trace："
                 f"job={job_id}"
             )
+
+        return trace
+
+    def pop_finalized_trace( self,job_id: str,) -> FinalizedJobTrace:
+        """
+        FinalizedJobTrace 已经成功写入：
+
+            RoutingReplayBuffer
+            HostReplayBuffer
+
+        后，才允许从 Trace Store 删除。
+
+        注意：
+            Finalize != Replay Flush
+
+        必须先：
+            finalize
+                ↓
+            replay add success
+                ↓
+            pop finalized trace
+        """
+
+        job_id = str(
+            job_id
+        )
+
+        trace = self.get_finalized_trace(
+            job_id
+        )
+
+        del self._finalized_traces[
+            job_id
+        ]
 
         return trace
 
@@ -1894,6 +2343,15 @@ class PendingJobTraceStore:
         # 下一 Episode 开始时清除。
         self._finalized_traces.clear()
 
+    def assert_no_unflushed_finalized_trace(self,) -> None:
 
+        if not self._finalized_traces:
+            return
+
+        raise RuntimeError(
+            "Episode 已结束，但仍存在已经 Finalize "
+            "却没有写入 ReplayBuffer 的 Job："
+            f"{list(self._finalized_traces.keys())[:20]}"
+        )
 
 

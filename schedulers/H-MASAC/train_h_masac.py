@@ -25,7 +25,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from h_masac_agent import (DiscreteMASAC,MASACConfig,LocalHostSAC,HostSACConfig,)
-from replay_buffer import ReplayBuffer
+from routing_replay_buffer import (RoutingReplayBuffer,)
+from host_replay_buffer import (HostReplayBuffer,)
+from pending_job_trace import (PendingJobTraceStore, FinalizedJobTrace,)
 from transition_collector import (DecisionSnapshot,TransitionCollector,)
 from environment.cloud_edge_env import CloudEdgeEnv
 import config as conf
@@ -57,7 +59,8 @@ UPDATE_TENSOR_METRIC_NAMES = ("critic_loss",
 @dataclass(frozen=True)
 class TrainConfig:
     num_episodes: int = conf.Episodes
-    replay_capacity: int = conf.ReplyBuffer_Capacity
+    routing_replay_capacity: int = (conf.ReplyBuffer_Capacity)
+    host_replay_capacity: int = (conf.ReplyBuffer_Capacity)
     batch_size: int = conf.Batch_Size
     random_warmup_steps: int = conf.Random_warmup_step
     learning_starts: int = conf.Learning_Starts
@@ -191,36 +194,125 @@ def record_update_block(stats: EpisodeStatistics, update_infos: list[ Dict[str, 
          }
         stats.record_update(cpu_update_info)
 
-def consume_environment_reward_corrections(
-    env: CloudEdgeEnv,
-    pending_trace_store: PendingJobTraceStore,
-    replay_buffer: ReplayBuffer,
-    stats: EpisodeStatistics,
-    train_config: TrainConfig,
+def flush_finalized_trace_to_replay(
+        finalized_trace: FinalizedJobTrace,
+        routing_replay_buffer:
+        RoutingReplayBuffer,
+        host_replay_buffers:
+        Dict[str, HostReplayBuffer],
 ) -> None:
     """
-    统一消费 Environment 事件推进期间产生的 delayed Job outcome。
+    把一个已经完整 Finalize 的 Job
+    一次性写入两个正式 Replay System。
 
-    第十七步以后：
+    顺序：
 
-        terminal reward
+        FinalizedJobTrace
             ↓
-        Finalize Job Causal Trace
+        RoutingTransitions
             ↓
-        只写到最后一个 Actor-controlled
-        Routing Transition
+        RoutingReplayBuffer
+
+    如果该 Job 最终 Routing=Self：
+
+        HostTransition
             ↓
-        前序 Routing Step 由 Bellman backup
-        自然获得长期 credit
+        对应 DC 的 HostReplayBuffer
 
-    不再：
-        - 按 Routing chain length 分配 reward；
-        - 使用 completion/failure credit decay；
-        - 人工把 terminal reward 切给全部历史动作。
+    Cloud / Drop：
+        不产生 HostTransition。
+    """
 
-    当前仍然保留 Legacy Routing ReplayBuffer；
-    后续双 ReplayBuffer 建成以后，
-    FinalizedJobTrace 会直接转换为新 Replay Transition。
+    # ==========================================================
+    # 先检查 Host Buffer 是否存在。
+    #
+    # 在真正写 Routing Replay 前先检查，
+    # 避免 Host buffer 配置错误造成半写入状态。
+    # ==========================================================
+
+    host_transition = (
+        finalized_trace
+        .host_transition
+    )
+
+    host_replay_buffer = None
+
+    if host_transition is not None:
+
+        host_dc_id = str(
+            host_transition.dc_id
+        )
+
+        host_replay_buffer = (
+            host_replay_buffers.get(
+                host_dc_id
+            )
+        )
+
+        if host_replay_buffer is None:
+            raise RuntimeError(
+                "找不到 HostTransition 对应的 "
+                "HostReplayBuffer："
+                f"job={finalized_trace.job_id}, "
+                f"dc={host_dc_id}"
+            )
+
+    # ==========================================================
+    # Routing Replay
+    # ==========================================================
+
+    for routing_transition in (
+        finalized_trace
+        .routing_transitions
+    ):
+
+        routing_replay_buffer.add(
+            routing_transition
+        )
+
+    # ==========================================================
+    # Host Replay
+    #
+    # 一个 Self Job 最多写一条。
+    # ==========================================================
+
+    if (
+        host_transition is not None
+        and host_replay_buffer is not None
+    ):
+
+        host_replay_buffer.add(
+            host_transition
+        )
+
+def consume_environment_reward_corrections(
+        env: CloudEdgeEnv,
+        pending_trace_store:
+        PendingJobTraceStore,
+        routing_replay_buffer:
+        RoutingReplayBuffer,
+        host_replay_buffers:
+        Dict[str, HostReplayBuffer],
+        stats: EpisodeStatistics,
+) -> None:
+    """
+    第十九步以后：
+
+        Environment delayed outcome
+                ↓
+        Pending Job Causal Trace
+                ↓
+        Job terminal
+                ↓
+        FinalizedJobTrace
+                ↓
+        ┌──────────────────────┐
+        │                      │
+        ▼                      ▼
+    RoutingReplay        HostReplay
+
+    Job 没有 terminal 前：
+        不允许修改正式 ReplayBuffer。
     """
 
     reward_corrections = (
@@ -232,26 +324,22 @@ def consume_environment_reward_corrections(
 
     for correction in reward_corrections:
 
-        correction_job_id = str(
-            correction[
-                "job_id"
-            ]
+        job_id = str(
+            correction["job_id"]
         )
 
         reward_delta = float(
-            correction[
-                "reward_delta"
-            ]
+            correction["reward_delta"]
         )
 
-        correction_reason = str(
+        reason = str(
             correction.get(
                 "reason",
                 "",
             )
         )
 
-        correction_env_time = float(
+        env_time = float(
             correction.get(
                 "env_time",
                 env.current_time,
@@ -259,116 +347,78 @@ def consume_environment_reward_corrections(
         )
 
         is_terminal = bool(
-            correction_reason
-            == "completed"
-            or correction_reason
+            reason == "completed"
+            or reason
             in TERMINAL_FAILURE_REASONS
         )
 
         # ======================================================
-        # 1. 所有 Environment outcome 首先写入
-        #    Job Causal Trace。
+        # 1. Reward Event 永远先进入因果链。
         # ======================================================
 
         pending_trace_store.record_reward_event(
-            job_id=(
-                correction_job_id
-            ),
-
-            env_time=(
-                correction_env_time
-            ),
-
-            reward_delta=(
-                reward_delta
-            ),
-
-            reason=(
-                correction_reason
-            ),
-
-            terminal=(
-                is_terminal
-            ),
+            job_id=job_id,
+            env_time=env_time,
+            reward_delta=reward_delta,
+            reason=reason,
+            terminal=is_terminal,
         )
 
         # ======================================================
-        # 2. Terminal Job 先完成完整因果链 Finalize。
+        # 2. Episode statistics：
         #
-        # Final Truth First：
-        #
-        #   terminal event
-        #       ↓
-        #   validate
-        #       ↓
-        #   FinalizedJobTrace
-        #
-        # 只有 Finalize 成功后才允许修改训练数据。
+        # 这里只做统计归因。
+        # 不再修改任何 ReplayBuffer。
         # ======================================================
 
-        finalized_trace = None
-
         if is_terminal:
+
             finalized_trace = (
                 pending_trace_store
                 .finalize_terminal_trace(
-                    job_id=(
-                        correction_job_id
-                    )
+                    job_id=job_id
                 )
             )
 
-        # ======================================================
-        # 3. Terminal reward：
-        #
-        # 只写最后一个 Actor-controlled
-        # Routing Transition。
-        #
-        # 不再人工分给整条链。
-        # ======================================================
-
-        if is_terminal:
-
-            correction_agent_id = (
-                replay_buffer
-                .apply_terminal_reward_to_last_actor_transition(
-                    job_id=(
-                        correction_job_id
-                    ),
-
-                    reward_delta=(
-                        reward_delta
-                    ),
-                )
-            )
-
-            # ==================================================
-            # Episode Return 中 terminal reward 仍然只统计一次。
-            #
-            # 如果 Legacy Replay 中对应 Transition
-            # 因环形覆盖而找不到，可以从已 Finalize Trace
-            # 找到最后一个 Actor Agent 用于日志归因。
-            # ==================================================
+            correction_agent_id = None
 
             if (
-                correction_agent_id
-                is None
-                and finalized_trace
-                is not None
+                finalized_trace
+                .routing_transitions
             ):
+                correction_agent_id = str(
+                    finalized_trace
+                    .routing_transitions[-1]
+                    .agent_id
+                )
 
-                for routing_step in reversed(
-                    finalized_trace.routing_steps
-                ):
+            # ==================================================
+            # 3. Job terminal 后，
+            #    一次性写入两个正式经验池。
+            # ==================================================
 
-                    if (
-                        routing_step.action_source
-                        != "forced"
-                    ):
-                        correction_agent_id = str(
-                            routing_step.agent_id
-                        )
-                        break
+            flush_finalized_trace_to_replay(
+                finalized_trace=(
+                    finalized_trace
+                ),
+
+                routing_replay_buffer=(
+                    routing_replay_buffer
+                ),
+
+                host_replay_buffers=(
+                    host_replay_buffers
+                ),
+            )
+
+            # ==================================================
+            # 4. Replay 写入成功以后，
+            #    才允许从 Finalized Trace Store 移除。
+            # ==================================================
+
+            pending_trace_store.pop_finalized_trace(
+                job_id
+            )
 
             if correction_agent_id is not None:
 
@@ -385,24 +435,35 @@ def consume_environment_reward_corrections(
             continue
 
         # ======================================================
-        # 4. 非 terminal delayed correction
+        # Non-terminal delayed reward：
         #
-        # 如果以后仍有这种事件，只修正最近一个
-        # Actor-controlled Routing Transition。
+        # 只记录在 Causal Trace。
+        # 不修改 Replay。
+        #
+        # Episode statistics 仍然正常记录。
         # ======================================================
 
-        correction_agent_id = (
-            replay_buffer
-            .apply_reward_correction(
-                job_id=(
-                    correction_job_id
-                ),
-
-                reward_delta=(
-                    reward_delta
-                ),
+        pending_trace = (
+            pending_trace_store
+            .get_trace(
+                job_id
             )
         )
+
+        correction_agent_id = None
+
+        for routing_step in reversed(
+            pending_trace.routing_steps
+        ):
+
+            if (
+                routing_step.action_source
+                != "forced"
+            ):
+                correction_agent_id = str(
+                    routing_step.agent_id
+                )
+                break
 
         if correction_agent_id is not None:
 
@@ -1666,7 +1727,11 @@ def append_csv_log(csv_path: Path, row: Dict[str, Any],) -> None:
 def build_episode_log_row(
     stats: EpisodeStatistics,
     env: Any,
-    replay_buffer: ReplayBuffer,
+        routing_replay_buffer:
+        RoutingReplayBuffer,
+
+        host_replay_buffers:
+        Dict[str, HostReplayBuffer],
     masac: DiscreteMASAC,
     global_decision_steps: int,
     global_normal_action_steps: int,
@@ -1740,9 +1805,10 @@ def build_episode_log_row(
         "episode_updates": int(stats.update_count),
         "global_decision_steps": int(global_decision_steps),
         "global_normal_action_steps": int(global_normal_action_steps),
-        "replay_size": int(len(replay_buffer)),
-        "replay_trainable_size": int(replay_buffer.num_trainable_actions),
-        "replay_forced_size": int(replay_buffer.num_forced_actions),
+        "routing_replay_size": int(len(routing_replay_buffer)),
+        "routing_replay_trainable_size": int(routing_replay_buffer.num_trainable_actions),
+        "host_replay_size_total": int(sum(len(buffer) for buffer in host_replay_buffers.values())),
+        "host_replay_size_by_dc": json.dumps({dc_id: int(len(buffer)) for dc_id, buffer in host_replay_buffers.items()},ensure_ascii=False,sort_keys=True,),
         "masac_update_step": int(masac.update_step),
         "critic_loss": stats.mean_metric("critic_loss"),
         "q1_loss": stats.mean_metric("q1_loss"),
@@ -2043,6 +2109,11 @@ def train(
 
     host_sac_agents: Dict[str, LocalHostSAC] = {}
 
+    host_replay_buffers: Dict[
+        str,
+        HostReplayBuffer,
+    ] = {}
+
     for host_dc_index, dc_id in enumerate(
             env.edge_dc_ids
     ):
@@ -2056,18 +2127,73 @@ def train(
             ),
         )
 
-        host_sac_agents[dc_id] = LocalHostSAC(
+        host_obs_dim = int(
+            host_observation_builder
+                .get_obs_dim(
+                dc_id
+            )
+        )
+
+        host_action_dim = int(
+            host_observation_builder
+                .get_action_dim(
+                dc_id
+            )
+        )
+
+        # ==========================================================
+        # 每个 DC 独立 Local Host SAC。
+        # ==========================================================
+
+        host_sac_agents[
+            dc_id
+        ] = LocalHostSAC(
             obs_dim=(
-                host_observation_builder
-                    .get_obs_dim(dc_id)
+                host_obs_dim
             ),
 
             action_dim=(
-                host_observation_builder
-                    .get_action_dim(dc_id)
+                host_action_dim
             ),
 
-            config=host_config,
+            config=(
+                host_config
+            ),
+        )
+
+        # ==========================================================
+        # 第十九步：
+        # 每个 Local Host SAC 对应自己的 Host ReplayBuffer。
+        #
+        # 不共享：
+        #   Actor
+        #   Critic
+        #   ReplayBuffer
+        # ==========================================================
+
+        host_replay_buffers[
+            dc_id
+        ] = HostReplayBuffer(
+            dc_id=dc_id,
+
+            capacity=int(
+                train_config
+                    .host_replay_capacity
+            ),
+
+            obs_dim=(
+                host_obs_dim
+            ),
+
+            action_dim=(
+                host_action_dim
+            ),
+
+            seed=(
+                    int(train_config.seed)
+                    + 20_000
+                    + host_dc_index
+            ),
         )
 
     routing_observation_builder = (
@@ -2120,11 +2246,19 @@ def train(
         ),
     )
 
-    # 创建经验回放池
-    replay_buffer = ReplayBuffer(
+    # ==============================================================
+    # Routing MASAC 专用 ReplayBuffer
+    #
+    # 与 Host Replay 完全独立。
+    #
+    # 这里只接收 Job terminal 后生成的
+    # Finalized RoutingTransition。
+    # ==============================================================
+
+    routing_replay_buffer = RoutingReplayBuffer(
         capacity=int(
             train_config
-                .replay_capacity
+                .routing_replay_capacity
         ),
 
         local_obs_dim=(
@@ -2138,11 +2272,8 @@ def train(
         seed=int(
             train_config.seed
         ),
-
-        forced_action_value=int(
-            env.drop_action
-        ),
     )
+
 
     # 没有传入算法配置时，使用 MASACConfig 默认值，但让算法随机种子与训练配置保持一致
     if masac_config is None:
@@ -2226,7 +2357,7 @@ def train(
             env.reset(seed=episode_seed)
 
             collector.reset_episode()
-            replay_buffer.reset_episode_job_tracking()
+
             # 为每个智能体创建奖励累计字典
             per_agent_returns = {}
             for agent_id in env.possible_agents:
@@ -2447,8 +2578,12 @@ def train(
                             pending_trace_store
                         ),
 
-                        replay_buffer=(
-                            replay_buffer
+                        routing_replay_buffer=(
+                            routing_replay_buffer
+                        ),
+
+                        host_replay_buffers=(
+                            host_replay_buffers
                         ),
 
                         stats=stats,
@@ -2526,11 +2661,6 @@ def train(
                     )
                 )
 
-                # 当前仍然是 Routing Replay。
-                replay_buffer.add(
-                    transition
-                )
-
                 decision = next_decision
 
                 # 记录这条经验的奖励和动作类型
@@ -2541,37 +2671,41 @@ def train(
                     action_source=action_source,
                 )
 
-                if (
-                        action_source == "forced"
-                        and action_type == "drop"
-                        and float(
-                    transition.reward
-                ) < 0.0
-                ):
-                    # ==========================================================
-                    # Forced Drop 是 Environment 强制动作，
-                    # 本身不参与 Actor/Critic 学习。
-                    #
-                    # Drop penalty 已经记录在 forced transition.reward 中，
-                    # 用于 Episode-level system return。
-                    #
-                    # 对训练 credit：
-                    # 只把这个 terminal failure 归因到最近一次
-                    # Actor-controlled Routing Transition。
-                    #
-                    # 不再将 penalty 分配到整条历史 Routing Chain。
-                    # ==========================================================
+                # ==========================================================
+                # Forced Drop / Actor Drop 会在 execute_and_collect()
+                # 内部直接完成 Job Finalize。
+                #
+                # 它不会产生后续 Environment reward correction，
+                # 所以这里必须检查并立即 Flush。
+                # ==========================================================
 
-                    replay_buffer.apply_terminal_reward_to_last_actor_transition(
-                        job_id=str(
+                if pending_trace_store.has_finalized_trace(
+                        transition.job_id
+                ):
+                    finalized_trace = (
+                        pending_trace_store
+                            .get_finalized_trace(
                             transition.job_id
+                        )
+                    )
+
+                    flush_finalized_trace_to_replay(
+                        finalized_trace=(
+                            finalized_trace
                         ),
 
-                        reward_delta=float(
-                            transition.reward
+                        routing_replay_buffer=(
+                            routing_replay_buffer
+                        ),
+
+                        host_replay_buffers=(
+                            host_replay_buffers
                         ),
                     )
 
+                    pending_trace_store.pop_finalized_trace(
+                        transition.job_id
+                    )
 
 
 
@@ -2582,8 +2716,12 @@ def train(
                         pending_trace_store
                     ),
 
-                    replay_buffer=(
-                        replay_buffer
+                    routing_replay_buffer=(
+                        routing_replay_buffer
+                    ),
+
+                    host_replay_buffers=(
+                        host_replay_buffers
                     ),
 
                     stats=stats,
@@ -2605,11 +2743,6 @@ def train(
                             "\n"
                             "============================================================\n"
                             "✅ 随机动作预热结束\n"
-                            f"普通动作步数: {global_normal_action_steps}\n"
-                            f"当前 Episode: {episode}\n"
-                            f"ReplayBuffer 大小: {len(replay_buffer)}\n"
-                            f"MASAC 更新次数: {masac.update_step}\n"
-                            "从下一条普通动作开始使用 Actor 策略进行动作采样。\n"
                             "============================================================\n"
                         )
 
@@ -2617,17 +2750,38 @@ def train(
                 # 1. 普通动作总数已经达到 learning_starts；
                 # 2. ReplayBuffer 中普通经验足够采样一个 batch。
                 ready_to_update = (
-                                    action_source != "forced" and
-                                    global_normal_action_steps >= int(train_config.learning_starts) and
-                                    global_normal_action_steps % int(train_config.train_every) == 0 and
-                                    replay_buffer.can_sample(batch_size=int(train_config.batch_size),include_forced_actions=False))
+                        action_source != "forced"
+                        and global_normal_action_steps
+                        >= int(
+                    train_config.learning_starts
+                )
+                        and global_normal_action_steps
+                        % int(
+                    train_config.train_every
+                )
+                        == 0
+                        and routing_replay_buffer.can_sample(
+                    batch_size=int(
+                        train_config.batch_size
+                    ),
+                    include_forced_actions=False,
+                )
+                )
 
                 # 网络更新
                 if ready_to_update:
                     update_info_block = []
                     for _ in range(int(train_config.updates_per_train)):
                         # 从 ReplayBuffer 采样并执行一次完整 SAC 更新
-                        update_info = masac.update(replay_buffer=replay_buffer, batch_size=int(train_config.batch_size))
+                        update_info = masac.update(
+                            replay_buffer=(
+                                routing_replay_buffer
+                            ),
+
+                            batch_size=int(
+                                train_config.batch_size
+                            ),
+                        )
                         # stats.record_update(update_info)
                         update_info_block.append(update_info)
                     record_update_block(stats=stats,update_infos=update_info_block,)
@@ -2642,22 +2796,19 @@ def train(
 
             consume_environment_reward_corrections(
                 env=env,
-
                 pending_trace_store=(
                     pending_trace_store
                 ),
-
-                replay_buffer=(
-                    replay_buffer
+                routing_replay_buffer=(
+                    routing_replay_buffer
                 ),
-
+                host_replay_buffers=(
+                    host_replay_buffers
+                ),
                 stats=stats,
-
-                train_config=(
-                    train_config
-                ),
             )
             pending_trace_store.assert_no_open_trace()
+            pending_trace_store.assert_no_unflushed_finalized_trace()
 
             # 计算当前 episode 的真实运行秒数。
             wall_time_seconds = (time.perf_counter() - episode_wall_start)
@@ -2665,12 +2816,44 @@ def train(
             # 日志记录
             log_row = build_episode_log_row(
                 stats=stats,
+
                 env=env,
-                replay_buffer=replay_buffer,
+
+                # ==========================================================
+                # 第十九步：
+                # Routing 与 Host 已经拆成两个独立 Replay System。
+                #
+                # 不再向日志函数传递旧：
+                #
+                #     replay_buffer
+                #
+                # 而是分别传递：
+                #
+                #     routing_replay_buffer
+                #     host_replay_buffers
+                # ==========================================================
+
+                routing_replay_buffer=(
+                    routing_replay_buffer
+                ),
+
+                host_replay_buffers=(
+                    host_replay_buffers
+                ),
+
                 masac=masac,
-                global_decision_steps=global_decision_steps,
-                global_normal_action_steps=global_normal_action_steps,
-                wall_time_seconds=wall_time_seconds,
+
+                global_decision_steps=(
+                    global_decision_steps
+                ),
+
+                global_normal_action_steps=(
+                    global_normal_action_steps
+                ),
+
+                wall_time_seconds=(
+                    wall_time_seconds
+                ),
             )
             append_csv_log(csv_path=log_csv_path, row=log_row,)
 
@@ -2732,7 +2915,8 @@ def train(
 def main() -> None:
     train_config = TrainConfig(
         num_episodes=conf.Episodes,
-        replay_capacity=conf.ReplyBuffer_Capacity,
+        routing_replay_capacity=(conf.ReplyBuffer_Capacity),
+        host_replay_capacity=(conf.ReplyBuffer_Capacity),
         batch_size=conf.Batch_Size,
         random_warmup_steps=conf.Random_warmup_step,
         learning_starts=conf.Learning_Starts,

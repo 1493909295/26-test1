@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from h_sac_model import (RoutingDiscreteActor, TwinDiscreteCritic,hard_update,soft_update,  LocalHostDiscreteActor,LocalHostTwinCritic,)
-from replay_buffer import ( ReplayBatch, ReplayBuffer,)
+from routing_replay_buffer import (RoutingReplayBatch,RoutingReplayBuffer,)
 
 
 # 超参数配置
@@ -249,7 +249,11 @@ class DiscreteMASAC:
         )
 
     # 从 ReplayBuffer 采样并执行一次完整 SAC 更新
-    def update(self,replay_buffer: ReplayBuffer,batch_size: int,) -> Dict[str, float]:
+    def update(
+            self,
+            replay_buffer: RoutingReplayBuffer,
+            batch_size: int,
+    ) -> Dict[str, float]:
         batch_size = int(batch_size)
 
         # 默认排除环境强制动作经验，并且不放回采样
@@ -469,7 +473,10 @@ class DiscreteMASAC:
         return device
 
     # 把 ReplayBatch 中的 NumPy 数组转换成张量
-    def _batch_to_tensors(self, batch: ReplayBatch,) -> TensorBatch:
+    def _batch_to_tensors(
+            self,
+            batch: RoutingReplayBatch,
+    ) -> TensorBatch:
 
         agent_indices = torch.as_tensor(
             batch.agent_indices,
