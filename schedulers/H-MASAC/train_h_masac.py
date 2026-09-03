@@ -32,11 +32,14 @@ import config as conf
 from routing_observation import (RoutingObservationBuilder,)
 from routing_centralized_state import (RoutingCentralizedStateBuilder,)
 from host_observation import (HostObservationBuilder,)
+from pending_job_trace import (PendingJobTraceStore,)
 
 TERMINAL_FAILURE_REASONS = frozenset({
     "waiting_timeout",
     "cloud_arrival_timeout",
     "cloud_resource_failure",
+    "local_host_arrival_timeout",
+    "local_host_resource_failure",
 })
 
 UPDATE_TENSOR_METRIC_NAMES = ("critic_loss",
@@ -187,6 +190,205 @@ def record_update_block(stats: EpisodeStatistics, update_infos: list[ Dict[str, 
             )
          }
         stats.record_update(cpu_update_info)
+
+def consume_environment_reward_corrections(
+    env: CloudEdgeEnv,
+    pending_trace_store: PendingJobTraceStore,
+    replay_buffer: ReplayBuffer,
+    stats: EpisodeStatistics,
+    train_config: TrainConfig,
+) -> None:
+    """
+    统一消费 Environment 在事件推进过程中产生的
+    delayed Job reward corrections。
+
+    第十四步采用双写过渡机制：
+
+        Environment delayed outcome
+                    │
+                    ├──> PendingJobTraceStore
+                    │      保存真实 Job 因果结果
+                    │
+                    └──> Legacy ReplayBuffer
+                           暂时继续旧 reward correction
+
+    后续完成：
+        Job terminal
+            ↓
+        Complete Trace Finalize
+            ↓
+        Routing / Host Replay
+
+    之后再删除 Legacy Replay correction 路径。
+    """
+
+    reward_corrections = (
+        env.pop_reward_corrections()
+    )
+
+    if not reward_corrections:
+        return
+
+    for correction in reward_corrections:
+
+        correction_job_id = str(
+            correction["job_id"]
+        )
+
+        reward_delta = float(
+            correction["reward_delta"]
+        )
+
+        correction_reason = str(
+            correction.get(
+                "reason",
+                "",
+            )
+        )
+
+        correction_env_time = float(
+            correction.get(
+                "env_time",
+                env.current_time,
+            )
+        )
+
+        is_terminal = bool(
+            correction_reason == "completed"
+            or correction_reason
+            in TERMINAL_FAILURE_REASONS
+        )
+
+        # ======================================================
+        # 1. 新 Pending Job Causal Trace
+        #
+        # Environment outcome 首先进入对应 Job 的真实因果链。
+        # ======================================================
+
+        pending_trace_store.record_reward_event(
+            job_id=correction_job_id,
+            env_time=correction_env_time,
+            reward_delta=reward_delta,
+            reason=correction_reason,
+            terminal=is_terminal,
+        )
+
+        # ======================================================
+        # 2. Legacy Replay compatibility
+        #
+        # 第十四步暂时继续旧 Replay reward correction。
+        # 后续完整 Trace -> 双 Replay 建成以后删除本部分。
+        # ======================================================
+
+        if correction_reason == "completed":
+
+            applied_credits = (
+                replay_buffer
+                .apply_discounted_terminal_reward(
+                    job_id=correction_job_id,
+                    reward_delta=reward_delta,
+                    credit_decay=float(
+                        train_config
+                        .completion_credit_decay
+                    ),
+                )
+            )
+
+            if not applied_credits:
+
+                correction_agent_id = (
+                    replay_buffer
+                    .apply_reward_correction(
+                        job_id=correction_job_id,
+                        reward_delta=reward_delta,
+                    )
+                )
+
+                if correction_agent_id is not None:
+                    stats.record_reward_correction(
+                        agent_id=correction_agent_id,
+                        reward_delta=reward_delta,
+                    )
+
+                continue
+
+            for (
+                correction_agent_id,
+                terminal_credit,
+            ) in applied_credits:
+
+                stats.record_reward_correction(
+                    agent_id=correction_agent_id,
+                    reward_delta=terminal_credit,
+                )
+
+            continue
+
+        if (
+            correction_reason
+            in TERMINAL_FAILURE_REASONS
+        ):
+
+            applied_penalties = (
+                replay_buffer
+                .apply_discounted_terminal_reward(
+                    job_id=correction_job_id,
+                    reward_delta=reward_delta,
+                    credit_decay=float(
+                        train_config
+                        .failure_credit_decay
+                    ),
+                )
+            )
+
+            if not applied_penalties:
+
+                correction_agent_id = (
+                    replay_buffer
+                    .apply_reward_correction(
+                        job_id=correction_job_id,
+                        reward_delta=reward_delta,
+                    )
+                )
+
+                if correction_agent_id is not None:
+                    stats.record_reward_correction(
+                        agent_id=correction_agent_id,
+                        reward_delta=reward_delta,
+                    )
+
+                continue
+
+            for (
+                correction_agent_id,
+                terminal_penalty,
+            ) in applied_penalties:
+
+                stats.record_reward_correction(
+                    agent_id=correction_agent_id,
+                    reward_delta=terminal_penalty,
+                )
+
+            continue
+
+        # ======================================================
+        # 普通非 terminal delayed correction
+        # ======================================================
+
+        correction_agent_id = (
+            replay_buffer
+            .apply_reward_correction(
+                job_id=correction_job_id,
+                reward_delta=reward_delta,
+            )
+        )
+
+        if correction_agent_id is not None:
+
+            stats.record_reward_correction(
+                agent_id=correction_agent_id,
+                reward_delta=reward_delta,
+            )
 
 def set_global_random_seeds(seed: int) -> None:
     """统一设置 Python、NumPy 和 PyTorch 随机种子。"""
@@ -2051,6 +2253,9 @@ def train(
                             deterministic=False,
                         )
                     )
+
+
+
 
                     # 非 PettingZoo Host execution。
                     host_result = (

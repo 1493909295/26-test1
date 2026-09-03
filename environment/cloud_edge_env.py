@@ -2217,12 +2217,24 @@ class CloudEdgeEnv(AECEnv):
     # 暂存一个与特定 Job 绑定的延迟奖励修正
     def _record_reward_correction(self, job_id: str, reward_delta: float, reason: str,) -> None:
         self.pending_reward_corrections.append(
-            {
-                "job_id": str(job_id),
-                "reward_delta": float(reward_delta),
-                "reason": str(reason),
-            }
-        )
+    {
+        "job_id": str(job_id),
+
+        "reward_delta": float(
+            reward_delta
+        ),
+
+        "reason": str(reason),
+
+        # ======================================================
+        # Causal Trace 使用真实物理事件时间，
+        # 不能用 Trainer 稍后 pop correction 的时间代替。
+        # ======================================================
+        "env_time": float(
+            self.current_time
+        ),
+    }
+)
 
     # 取走 env.step() 推进事件期间产生的全部延迟奖励
     def pop_reward_corrections(self,) -> List[Dict[str, Any]]:
