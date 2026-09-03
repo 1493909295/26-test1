@@ -24,7 +24,7 @@ if str(H_MASAC_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from h_masac_agent import (DiscreteMASAC,MASACConfig,)
+from h_masac_agent import (DiscreteMASAC,MASACConfig,LocalHostSAC,HostSACConfig,)
 from replay_buffer import ReplayBuffer
 from transition_collector import (DecisionSnapshot,TransitionCollector,)
 from environment.cloud_edge_env import CloudEdgeEnv
@@ -38,6 +38,18 @@ TERMINAL_FAILURE_REASONS = frozenset({
     "cloud_arrival_timeout",
     "cloud_resource_failure",
 })
+
+UPDATE_TENSOR_METRIC_NAMES = ("critic_loss",
+        "q1_loss",
+        "q2_loss",
+        "mean_q1",
+        "mean_q2",
+        "mean_target_q",
+        "actor_loss",
+        "alpha_loss",
+        "alpha",
+        "policy_entropy",
+        "target_entropy",)
 
 @dataclass(frozen=True)
 class TrainConfig:
@@ -142,19 +154,6 @@ class EpisodeStatistics:
             self.update_metric_sums[metric_name] / count
         )
 
-UPDATE_TENSOR_METRIC_NAMES = (
-        "critic_loss",
-        "q1_loss",
-        "q2_loss",
-        "mean_q1",
-        "mean_q2",
-        "mean_target_q",
-        "actor_loss",
-        "alpha_loss",
-        "alpha",
-        "policy_entropy",
-        "target_entropy",
-    )
 
 # 批量记录连续若干次 MASAC.update() 的训练指标，避免每次 update 内部执行大量 cuda_tensor.item()
 def record_update_block(stats: EpisodeStatistics, update_infos: list[ Dict[str, Union[float, torch.Tensor]]],) -> None:
@@ -1387,6 +1386,7 @@ def load_checkpoint_if_needed(
         global_normal_action_steps,
         best_episode_return,
     )
+
 # 写训练日志用的
 def build_run_log_path(base_log_path: str) -> Path:
     base_path = Path(base_log_path)
@@ -1402,8 +1402,6 @@ def build_run_log_path(base_log_path: str) -> Path:
         f"{base_path.suffix}"
     )
     return base_path.parent / log_file_name
-
-
 
 # 把一个 episode 的统计信息追加到 CSV 文件
 def append_csv_log(csv_path: Path, row: Dict[str, Any],) -> None:
@@ -1804,6 +1802,46 @@ def train(
             env=env,
         )
     )
+
+    # ==========================================================
+    # 每个 Edge DC 建立独立 Local Host SAC。
+    #
+    # Host 层：
+    #   - 不使用 PettingZoo
+    #   - 不共享 Actor
+    #   - 不共享 Critic
+    #   - 不使用 Mask
+    # ==========================================================
+
+    host_sac_agents: Dict[str, LocalHostSAC] = {}
+
+    for host_dc_index, dc_id in enumerate(
+            env.edge_dc_ids
+    ):
+        dc_id = str(dc_id)
+
+        host_config = HostSACConfig(
+            seed=(
+                    int(train_config.seed)
+                    + 10_000
+                    + host_dc_index
+            ),
+        )
+
+        host_sac_agents[dc_id] = LocalHostSAC(
+            obs_dim=(
+                host_observation_builder
+                    .get_obs_dim(dc_id)
+            ),
+
+            action_dim=(
+                host_observation_builder
+                    .get_action_dim(dc_id)
+            ),
+
+            config=host_config,
+        )
+
     routing_observation_builder = (
         RoutingObservationBuilder(
             env=env,
@@ -1970,65 +2008,135 @@ def train(
             # 只要 PettingZoo 的活跃智能体列表不为空，就继续循环
             while env.agents:
 
-                # 如果智能体状态标记是死（应该不存在情况才对），把它从 AEC 环境中清理掉，然后跳过本轮训练逻辑
+                # ==========================================================
+                # Phase 1：Host decision
+                #
+                # Host 必须优先于任何 PettingZoo 操作处理。
+                # Self Routing 后：
+                #
+                #   agent_selection == None
+                #   pending_host_job_id != None
+                #
+                # 因此此处绝对不能调用：
+                #   collector.capture_decision()
+                #   env.step()
+                # ==========================================================
+                if env.has_pending_host_decision():
+                    host_context = (
+                        env.get_pending_host_decision()
+                    )
+
+                    host_job_id = str(
+                        host_context["job_id"]
+                    )
+
+                    host_dc_id = str(
+                        host_context["dc_id"]
+                    )
+
+                    # Host Observation 完全独立于 PettingZoo。
+                    host_obs = (
+                        host_observation_builder.build(
+                            dc_id=host_dc_id,
+                            job_id=host_job_id,
+                        )
+                    )
+
+                    # 当前 DC 自己的 Local Host SAC 决策。
+                    host_action = (
+                        host_sac_agents[
+                            host_dc_id
+                        ].select_action(
+                            host_obs=host_obs,
+                            deterministic=False,
+                        )
+                    )
+
+                    # 非 PettingZoo Host execution。
+                    host_result = (
+                        env.execute_pending_host_action(
+                            host_action=host_action,
+                        )
+                    )
+
+                    # Host action 后环境已经推进到了：
+                    #
+                    #   下一 Routing decision
+                    #   或 Episode terminal
+                    #
+                    # 之前缓存的 Routing next_decision 不能继续复用。
+                    decision = None
+
+                    # 当前第十三步先只打通 Host decision channel。
+                    #
+                    # Host Transition / Host ReplayBuffer
+                    # 在后续经验池改造步骤再正式写入。
+                    continue
+
+                # ==========================================================
+                # Phase 2：PettingZoo Routing decision
+                # ==========================================================
+
                 if collector.drain_one_dead_agent():
                     decision = None
                     continue
 
-                # 获取当前决策状态
                 if decision is None:
                     decision = collector.capture_decision()
 
+                # ----------------------------------------------------------
+                # 以下继续保留现有 Routing：
+                #
+                # forced
+                # random warmup
+                # Routing MASAC policy
+                # ----------------------------------------------------------
 
-
-                # 处理超时任务
                 if decision.forced_action is not None:
-                    action = int(decision.forced_action)
+                    action = int(
+                        decision.forced_action
+                    )
                     action_source = "forced"
 
-                # 预热阶段的普通动作
                 elif (
                         global_normal_action_steps
                         < int(
-                    train_config
-                            .random_warmup_steps
+                    train_config.random_warmup_steps
                 )
                 ):
-
-                    # 无 Mask：
-                    # 对完整 Routing action space 均匀探索。
-                    action = (
-                        choose_random_routing_action(
-                            action_dim=(
-                                env.action_dim
-                            ),
-                            rng=action_rng,
-                        )
+                    action = choose_random_routing_action(
+                        action_dim=env.action_dim,
+                        rng=action_rng,
                     )
-
                     action_source = "random"
 
-                # 预热结束，actor根据概率分布采样动作
                 else:
                     action = masac.select_action(
-                        local_obs=(
-                            decision.local_obs
-                        ),
-
-                        agent_index=(
-                            decision.agent_index
-                        ),
-
+                        local_obs=decision.local_obs,
+                        agent_index=decision.agent_index,
                         deterministic=False,
                     )
                     action_source = "policy"
 
-                # 在环境执行前解码动作
-                action_type = infer_action_type(env=env, agent_id=decision.agent_id, action=action)
+                action_type = infer_action_type(
+                    env=env,
+                    agent_id=decision.agent_id,
+                    action=action,
+                )
 
-                # 执行动作、推进事件队列并构造一条经验放入经验池
-                transition, next_decision = collector.execute_and_collect(decision=decision, action=action,action_type=action_type,)
-                replay_buffer.add(transition)
+                transition, next_decision = (
+                    collector.execute_and_collect(
+                        decision=decision,
+                        action=action,
+                        action_type=action_type,
+                    )
+                )
+
+                # 当前仍然是 Routing Replay。
+                replay_buffer.add(
+                    transition
+                )
+
                 decision = next_decision
 
                 # 记录这条经验的奖励和动作类型

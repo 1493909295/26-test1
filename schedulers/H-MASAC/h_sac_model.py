@@ -147,7 +147,7 @@ class RoutingDiscreteActor(nn.Module):
             self,
             local_obs: torch.Tensor,
             agent_indices: torch.Tensor,
-            action_mask: torch.Tensor,
+
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -307,3 +307,213 @@ def soft_update(
             )
 
 
+
+
+
+class LocalHostDiscreteActor(nn.Module):
+    """
+    单个 Edge DC 的 Local Host SAC Actor。
+
+    输入：
+        当前 Job + 当前 Local DC + 当前 DC 全部真实 Host
+
+    输出：
+        当前 DC 内各 Host 的离散动作概率。
+
+    注意：
+        1. 不属于 PettingZoo；
+        2. 不使用 agent one-hot；
+        3. 不使用 global state；
+        4. 不使用 action mask；
+        5. 不使用 Host padding。
+    """
+
+    def __init__(
+            self,
+            obs_dim: int,
+            action_dim: int,
+            hidden_dim: int = conf.ACTOR_HIDDEN_DIM,
+    ) -> None:
+        super().__init__()
+
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
+        self.hidden_dim = int(hidden_dim)
+
+        self.fc1 = nn.Linear(
+            self.obs_dim,
+            self.hidden_dim,
+        )
+
+        self.fc2 = nn.Linear(
+            self.hidden_dim,
+            self.hidden_dim,
+        )
+
+        self.output_layer = nn.Linear(
+            self.hidden_dim,
+            self.action_dim,
+        )
+
+        initialize_linear_layer(
+            self.fc1,
+            gain=nn.init.calculate_gain("relu"),
+        )
+
+        initialize_linear_layer(
+            self.fc2,
+            gain=nn.init.calculate_gain("relu"),
+        )
+
+        initialize_linear_layer(
+            self.output_layer,
+            gain=conf.ACTOR_GAIN,
+        )
+
+    def forward(
+            self,
+            obs: torch.Tensor,
+    ) -> torch.Tensor:
+
+        hidden = F.relu(
+            self.fc1(obs)
+        )
+
+        hidden = F.relu(
+            self.fc2(hidden)
+        )
+
+        return self.output_layer(hidden)
+
+    def get_policy(
+            self,
+            obs: torch.Tensor,
+            eps: float = DEFAULT_EPS,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+
+        logits = self.forward(obs)
+
+        probabilities = F.softmax(
+            logits,
+            dim=-1,
+        )
+
+        log_probabilities = torch.log(
+            probabilities.clamp_min(
+                float(eps)
+            )
+        )
+
+        return (
+            probabilities,
+            log_probabilities,
+            logits,
+        )
+
+class LocalHostQNetwork(nn.Module):
+    """
+    Local Host SAC Critic。
+
+    输入仅为当前 DC 的 Host Observation；
+    输出当前 DC 所有 Host action 的 Q value。
+    """
+
+    def __init__(
+            self,
+            obs_dim: int,
+            action_dim: int,
+            hidden_dim: int = conf.Q_NET_HIDDEN_DIM,
+    ) -> None:
+        super().__init__()
+
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
+
+        self.fc1 = nn.Linear(
+            self.obs_dim,
+            hidden_dim,
+        )
+
+        self.fc2 = nn.Linear(
+            hidden_dim,
+            hidden_dim,
+        )
+
+        self.output_layer = nn.Linear(
+            hidden_dim,
+            self.action_dim,
+        )
+
+        initialize_linear_layer(
+            self.fc1,
+            gain=nn.init.calculate_gain("relu"),
+        )
+
+        initialize_linear_layer(
+            self.fc2,
+            gain=nn.init.calculate_gain("relu"),
+        )
+
+        initialize_linear_layer(
+            self.output_layer,
+            gain=conf.Q_NET_GAIN,
+        )
+
+    def forward(
+            self,
+            obs: torch.Tensor,
+    ) -> torch.Tensor:
+
+        hidden = F.relu(
+            self.fc1(obs)
+        )
+
+        hidden = F.relu(
+            self.fc2(hidden)
+        )
+
+        return self.output_layer(hidden)
+
+class LocalHostTwinCritic(nn.Module):
+    """
+    Local Host SAC 使用独立 Twin Q。
+
+    不与 Routing MASAC Critic 共享任何参数。
+    """
+
+    def __init__(
+            self,
+            obs_dim: int,
+            action_dim: int,
+            hidden_dim: int = conf.Q_NET_HIDDEN_DIM,
+    ) -> None:
+        super().__init__()
+
+        self.q1 = LocalHostQNetwork(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+        )
+
+        self.q2 = LocalHostQNetwork(
+            obs_dim=obs_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+        )
+
+    def forward(
+            self,
+            obs: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+
+        return (
+            self.q1(obs),
+            self.q2(obs),
+        )

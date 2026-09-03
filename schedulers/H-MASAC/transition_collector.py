@@ -23,6 +23,8 @@ class CloudEdgeEnvLike(Protocol):
     current_agent_id: Optional[str]
 
     current_job_id: Optional[str]
+    pending_host_job_id: Optional[str]
+    pending_host_dc_id: Optional[str]
     current_time: float
     # local_obs_dim: int
     # global_state_dim: int
@@ -280,6 +282,16 @@ class TransitionCollector:
         # next_global_state = np.asarray(self.env.state(), dtype=np.float32).copy()
 
         episode_done = self._is_episode_done()
+        routing_terminal = (
+                action_type in {
+            "self",
+            "cloud",
+            "drop",
+        }
+        )
+
+        transition_done = bool(episode_done or routing_terminal)
+
         if episode_done:
             next_decision = None
             next_agent_id = None
@@ -342,7 +354,7 @@ class TransitionCollector:
 
             terminated=terminated,
             truncated=truncated,
-            done=episode_done,
+            done=transition_done,
         )
         self.total_transition_count += 1
         self.episode_transition_count += 1

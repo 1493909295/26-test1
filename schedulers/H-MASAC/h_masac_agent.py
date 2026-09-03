@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from h_sac_model import (RoutingDiscreteActor, TwinDiscreteCritic,hard_update,soft_update,)
+from h_sac_model import (RoutingDiscreteActor, TwinDiscreteCritic,hard_update,soft_update,  LocalHostDiscreteActor,LocalHostTwinCritic,)
 from replay_buffer import ( ReplayBatch, ReplayBuffer,)
 
 
@@ -30,6 +30,26 @@ class MASACConfig:
     target_update_interval: int = 1
     device: Optional[str] = None
     # 宇宙的终极答案是42
+    seed: int = 42
+
+@dataclass(frozen=True)
+class HostSACConfig:
+    gamma: float = 0.99
+    tau: float = 0.005
+
+    actor_lr: float = 3e-4
+    critic_lr: float = 3e-4
+    alpha_lr: float = 3e-4
+
+    actor_hidden_dim: int = 256
+    critic_hidden_dim: int = 256
+
+    initial_alpha: float = 0.1
+    target_entropy_ratio: float = 0.2
+
+    max_grad_norm: Optional[float] = 10.0
+
+    device: Optional[str] = None
     seed: int = 42
 
 # 把 ReplayBatch 中 NumPy 数组转换后的张量
@@ -813,3 +833,137 @@ class DiscreteMASAC:
             "alpha_loss": (alpha_loss.detach()),
             "target_entropy": (target_entropy.detach().mean()),
         }
+
+class LocalHostSAC:
+    """
+    单个 Edge DC 的独立 Local Host SAC。
+
+    本类不依赖：
+        PettingZoo
+        agent_index
+        centralized global state
+        action_mask
+    """
+
+    def __init__(
+            self,
+            obs_dim: int,
+            action_dim: int,
+            config: Optional[HostSACConfig] = None,
+    ) -> None:
+
+        if config is None:
+            config = HostSACConfig()
+
+        self.config = config
+
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
+
+        self.device = DiscreteMASAC._resolve_device(
+            config.device
+        )
+
+        self.actor = LocalHostDiscreteActor(
+            obs_dim=self.obs_dim,
+            action_dim=self.action_dim,
+            hidden_dim=config.actor_hidden_dim,
+        ).to(self.device)
+
+        self.critic = LocalHostTwinCritic(
+            obs_dim=self.obs_dim,
+            action_dim=self.action_dim,
+            hidden_dim=config.critic_hidden_dim,
+        ).to(self.device)
+
+        self.target_critic = LocalHostTwinCritic(
+            obs_dim=self.obs_dim,
+            action_dim=self.action_dim,
+            hidden_dim=config.critic_hidden_dim,
+        ).to(self.device)
+
+        hard_update(
+            target_network=self.target_critic,
+            source_network=self.critic,
+        )
+
+        for parameter in self.target_critic.parameters():
+            parameter.requires_grad_(False)
+
+        self.actor_optimizer = torch.optim.Adam(
+            self.actor.parameters(),
+            lr=float(config.actor_lr),
+        )
+
+        self.critic_optimizer = torch.optim.Adam(
+            self.critic.parameters(),
+            lr=float(config.critic_lr),
+        )
+
+        self.log_alpha = torch.tensor(
+            math.log(float(config.initial_alpha)),
+            dtype=torch.float32,
+            device=self.device,
+            requires_grad=True,
+        )
+
+        self.alpha_optimizer = torch.optim.Adam(
+            [self.log_alpha],
+            lr=float(config.alpha_lr),
+        )
+
+        self.update_step = 0
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return self.log_alpha.exp()
+
+    def select_action(
+            self,
+            host_obs: np.ndarray,
+            deterministic: bool = False,
+    ) -> int:
+
+        obs = np.asarray(
+            host_obs,
+            dtype=np.float32,
+        )
+
+        if obs.shape != (self.obs_dim,):
+            raise ValueError(
+                "Host Observation shape 错误："
+                f"expected={(self.obs_dim,)}, "
+                f"actual={obs.shape}"
+            )
+
+        obs_tensor = torch.as_tensor(
+            obs,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+
+        with torch.no_grad():
+
+            probabilities, _, _ = (
+                self.actor.get_policy(
+                    obs_tensor
+                )
+            )
+
+            if deterministic:
+                action_tensor = torch.argmax(
+                    probabilities,
+                    dim=-1,
+                )
+            else:
+                distribution = (
+                    torch.distributions.Categorical(
+                        probs=probabilities
+                    )
+                )
+
+                action_tensor = distribution.sample()
+
+        return int(
+            action_tensor.item()
+        )

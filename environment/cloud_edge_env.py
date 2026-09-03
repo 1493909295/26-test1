@@ -678,7 +678,7 @@ class CloudEdgeEnv(AECEnv):
                 "agent_index": self.agent_name_mapping[agent_id],
                 "dc_id": agent_id,
                 "global_state": self._cached_global_state,
-                "action_mask": self._get_action_mask(agent_id),
+                # "action_mask": self._get_action_mask(agent_id),
             }
             for agent_id in self.possible_agents
         }
@@ -718,7 +718,7 @@ class CloudEdgeEnv(AECEnv):
 
         return {
             "observation": local_observation,
-            "action_mask": action_mask,
+            # "action_mask": action_mask,
         }
 
     #
@@ -859,6 +859,155 @@ class CloudEdgeEnv(AECEnv):
         # 完成动作的收尾
         self.rewards[acting_agent] = float(action_reward)
         self._clear_current_decision()
+
+
+
+
+
+
+        global_state = np.asarray(self._get_global_state(), dtype=np.float32)
+        self._cached_global_state = global_state.copy()
+
+        for agent_id in self.possible_agents:
+            # episode 结束后不应再提供普通合法动作，终止智能体 mask 全置零。
+            # if (
+            #         self.terminations.get(agent_id, False)
+            #         or self.truncations.get(agent_id, False)
+            # ):
+            #     updated_action_mask = np.zeros(
+            #         self.action_dim,
+            #         dtype=np.int8,
+            #     )
+            # else:
+            #     updated_action_mask = self._get_action_mask(agent_id)
+
+            self.infos[agent_id] = {
+                "agent_index": self.agent_name_mapping[agent_id],
+                "dc_id": agent_id,
+                "global_state": self._cached_global_state,
+                # "action_mask": updated_action_mask,
+            }
+
+        # 将本次即时奖励累积到 PettingZoo 的 _cumulative_rewards 中。
+        self._advance_until_next_routing_decision_or_episode_end()
+        self._refresh_pettingzoo_routing_infos()
+        self._accumulate_rewards()
+
+    def has_pending_host_decision(self) -> bool:
+        return (
+                self.pending_host_job_id is not None
+                and self.pending_host_dc_id is not None
+        )
+
+    def get_pending_host_decision(self) -> Dict[str, str]:
+        """
+        返回当前等待 Local Host SAC 处理的 Host-level decision。
+
+        Host 层不是 PettingZoo Agent，因此这里不修改：
+            possible_agents
+            agents
+            agent_selection
+        """
+
+        if not self.has_pending_host_decision():
+            raise RuntimeError(
+                "当前不存在等待处理的 Host decision。"
+            )
+
+        return {
+            "job_id": str(self.pending_host_job_id),
+            "dc_id": str(self.pending_host_dc_id),
+        }
+
+    def execute_pending_host_action(self, host_action: int,) -> Dict[str, Any]:
+        """
+        执行 Local Host SAC 给出的 Host action。
+
+        重要：
+            本函数不是 PettingZoo step()。
+            Host action 永远不能进入 env.step()。
+        """
+
+        if not self.has_pending_host_decision():
+            raise RuntimeError(
+                "当前不存在 pending Host decision，"
+                "不能执行 Host action。"
+            )
+
+        if self.agent_selection is not None:
+            raise RuntimeError(
+                "执行 Host action 时 agent_selection 必须为 None。"
+                "Host 层不属于 PettingZoo。"
+            )
+
+        job_id = str(self.pending_host_job_id)
+        dc_id = str(self.pending_host_dc_id)
+        host_action = int(host_action)
+
+        if dc_id not in self.dc_map:
+            raise KeyError(
+                f"Host decision 找不到 DC：{dc_id}"
+            )
+
+        target_dc = self.dc_map[dc_id]
+
+        if not (
+                0 <= host_action < len(target_dc.host_list)
+        ):
+            raise ValueError(
+                f"非法 Host action："
+                f"dc={dc_id}, "
+                f"action={host_action}, "
+                f"host_count={len(target_dc.host_list)}"
+            )
+
+        target_host = target_dc.host_list[host_action]
+        host_id = str(target_host.host_id)
+
+        # ==========================================================
+        # 真正执行 Host placement。
+        #
+        # 这里复用现有环境物理执行逻辑：
+        # started / queued / dropped
+        # ==========================================================
+        execution_result = self._execute_job_on_host(
+            job_id=job_id,
+            dc_id=dc_id,
+            host_idx=host_action,
+        )
+
+        # ==========================================================
+        # Host decision 已消费。
+        #
+        # 必须先清除 pending 状态，
+        # 否则 episode-finished 检查永远不会成立。
+        # ==========================================================
+        self.pending_host_job_id = None
+        self.pending_host_dc_id = None
+
+        # Host placement 完成以后，
+        # 继续推进事件系统，直到：
+        #
+        #   1. 出现新的 Routing decision；
+        #   2. 或 Episode 结束。
+        self._advance_until_next_routing_decision_or_episode_end()
+
+        return {
+            "job_id": job_id,
+            "dc_id": dc_id,
+            "host_action": host_action,
+            "host_id": host_id,
+            "execution_result": str(execution_result),
+            "env_time": float(self.current_time),
+        }
+
+    ################################### 辅助函数部分 ####################################
+
+    def _advance_until_next_routing_decision_or_episode_end(self,) -> None:
+
+        self.agent_selection = None
+
+        next_decision_found = False
 
         # 推进事件队列
         next_decision_found = False
@@ -1039,37 +1188,30 @@ class CloudEdgeEnv(AECEnv):
             if self._check_episode_finished():
                 self._terminate_episode()
 
-        # 更新 infos
-        # global_state = self._get_global_state()
-        global_state = np.asarray(self._get_global_state(), dtype=np.float32)
+    def _refresh_pettingzoo_routing_infos(self,) -> None:
+        """
+        刷新 PettingZoo Routing Agent 的辅助信息。
+
+        Host 层不使用 PettingZoo infos。
+        """
+
+        global_state = np.asarray(
+            self._get_global_state(),
+            dtype=np.float32,
+        )
+
         self._cached_global_state = global_state.copy()
 
         for agent_id in self.possible_agents:
-            # episode 结束后不应再提供普通合法动作，终止智能体 mask 全置零。
-            if (
-                    self.terminations.get(agent_id, False)
-                    or self.truncations.get(agent_id, False)
-            ):
-                updated_action_mask = np.zeros(
-                    self.action_dim,
-                    dtype=np.int8,
-                )
-            else:
-                updated_action_mask = self._get_action_mask(agent_id)
-
             self.infos[agent_id] = {
                 "agent_index": self.agent_name_mapping[agent_id],
                 "dc_id": agent_id,
                 "global_state": self._cached_global_state,
-                "action_mask": updated_action_mask,
             }
 
-        # 将本次即时奖励累积到 PettingZoo 的 _cumulative_rewards 中。
-        self._accumulate_rewards()
-
-    ################################### 辅助函数部分 ####################################
-
     # 不需要掩码了
+
+
     def _get_action_mask(self, agent_id: str) -> np.ndarray:
         agent_id = str(agent_id)
 
@@ -2266,6 +2408,16 @@ class CloudEdgeEnv(AECEnv):
         self.current_agent_id = None
         self.pending_host_job_id = None
         self.pending_host_dc_id = None
+        # Host direct path 可能在 agent_selection=None 的情况下
+        # 触发 Episode terminal。
+        #
+        # PettingZoo AEC 后续仍需要一个 dead agent 作为
+        # agent_selection，以便通过 step(None) 清理 agents。
+        if (
+                self.agents
+                and self.agent_selection is None
+        ):
+            self.agent_selection = self.agents[0]
 
     # 判断两个浮点事件时间是否属于同一个仿真时刻
     @classmethod
