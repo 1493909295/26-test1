@@ -669,22 +669,14 @@ class TransitionCollector:
             # ==========================================================
             # Forced Drop
             #
-            # Drop penalty 已经作为当前 Routing Step 的：
+            # Drop penalty 已经保存在当前 Routing Step 的
+            # immediate_reward 中。
             #
-            #     immediate_reward
+            # 所以：
+            #   1. mark terminal
+            #   2. 立即 Finalize 整条 Job Trace
             #
-            # 保存。
-            #
-            # 因此这里仅标记 Job terminal，
-            # 不能再次把同一 penalty 保存成 RewardEvent。
-            #
-            # 否则后续 Finalize：
-            #
-            #     Routing immediate_reward
-            #           +
-            #     RewardEvent.reward_delta
-            #
-            # 会重复计算同一 Drop penalty。
+            # 不再额外创建 RewardEvent。
             # ==========================================================
 
             self.pending_trace_store.mark_terminal(
@@ -697,6 +689,19 @@ class TransitionCollector:
                 ),
 
                 reason="forced_drop",
+            )
+
+            # ==========================================================
+            # Forced Drop 本身就是最终 Job outcome。
+            #
+            # 此时完整 Routing Chain 已经结束，
+            # 不需要等待 Environment reward correction。
+            # ==========================================================
+
+            self.pending_trace_store.finalize_terminal_trace(
+                job_id=(
+                    decision.job_id
+                )
             )
 
         # ==========================================================

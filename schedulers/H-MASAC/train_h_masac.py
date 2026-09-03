@@ -273,6 +273,31 @@ def consume_environment_reward_corrections(
             terminal=is_terminal,
         )
 
+        # ==========================================================
+        # Job Terminal -> Finalize Complete Causal Trace
+        #
+        # terminal reward event 已经写入 Trace 后，
+        # 整条 Job 生命周期事实已经完整。
+        #
+        # 立即一次性：
+        #
+        #   validate
+        #      ↓
+        #   finalize
+        #      ↓
+        #   move Pending -> Finalized
+        #
+        # 注意：
+        # 当前第十六步仍然不写新的 ReplayBuffer。
+        # ==========================================================
+
+        if is_terminal:
+            pending_trace_store.finalize_terminal_trace(
+                job_id=(
+                    correction_job_id
+                )
+            )
+
         # ======================================================
         # 2. Legacy Replay compatibility
         #
@@ -2533,7 +2558,7 @@ def train(
                     )
 
 
-                
+
 
                 consume_environment_reward_corrections(
                     env=env,

@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import copy
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -92,6 +92,50 @@ class PendingJobTrace:
     terminal_reason: Optional[str] = None
     terminal_time: Optional[float] = None
 
+@dataclass(frozen=True)
+class FinalizedJobTrace:
+    """
+    一个 Job 已经完成生命周期闭环以后生成的不可继续扩展因果链。
+
+    本对象保存的是已经确认完成的事实：
+
+        Routing Step 0
+            ↓
+        Routing Step 1
+            ↓
+        ...
+            ↓
+        Self / Cloud / Drop
+            ↓
+        Host（仅 Self）
+            ↓
+        Terminal Outcome
+
+    注意：
+        1. FinalizedJobTrace 不是 Replay Transition；
+        2. 不参与 sample()；
+        3. 不直接参与 SAC update；
+        4. Reward attribution 将在后续步骤单独完成。
+    """
+
+    job_id: str
+
+    routing_steps: tuple[
+        PendingRoutingStep,
+        ...
+    ]
+
+    host_step: Optional[
+        PendingHostStep
+    ]
+
+    reward_events: tuple[
+        PendingRewardEvent,
+        ...
+    ]
+
+    terminal_reason: str
+    terminal_time: float
 
 class PendingJobTraceStore:
     """
@@ -106,9 +150,32 @@ class PendingJobTraceStore:
     """
 
     def __init__(self) -> None:
+        # ==========================================================
+        # 尚未 Finalize 的 Job。
+        #
+        # Job 从第一次 Routing Decision 开始进入这里。
+        # ==========================================================
+
         self._traces: Dict[
             str,
             PendingJobTrace,
+        ] = {}
+
+        # ==========================================================
+        # 已完成 terminal + structural validation 的 Job。
+        #
+        # 注意：
+        # 这里仍然不是 ReplayBuffer。
+        #
+        # 后续步骤会把 FinalizedJobTrace 转换为：
+        #
+        #   Routing Replay Transition
+        #   Host Replay Transition
+        # ==========================================================
+
+        self._finalized_traces: Dict[
+            str,
+            FinalizedJobTrace,
         ] = {}
 
     def _get_or_create(
@@ -736,10 +803,545 @@ class PendingJobTraceStore:
             env_time
         )
 
-    def is_terminal(
-            self,
-            job_id: str,
-    ) -> bool:
+    def _validate_trace_for_finalize(self, trace: PendingJobTrace,) -> None:
+        """
+        Job Terminal 后，在真正 Finalize 之前，
+        对整条 Job Causal Trace 做一次最终结构验证。
+
+        本函数只验证“因果事实是否完整”，
+        不进行 Reward Credit Assignment。
+        """
+
+        job_id = str(
+            trace.job_id
+        )
+
+        # ==========================================================
+        # 1. Job 必须已经 terminal
+        # ==========================================================
+
+        if not trace.terminal:
+            raise RuntimeError(
+                "不能 Finalize 尚未 terminal 的 Job："
+                f"job={job_id}"
+            )
+
+        if trace.terminal_reason is None:
+            raise RuntimeError(
+                "Terminal Job 缺少 terminal_reason："
+                f"job={job_id}"
+            )
+
+        if trace.terminal_time is None:
+            raise RuntimeError(
+                "Terminal Job 缺少 terminal_time："
+                f"job={job_id}"
+            )
+
+        terminal_time = float(
+            trace.terminal_time
+        )
+
+        # ==========================================================
+        # 2. 必须至少发生过一次 Routing Decision
+        # ==========================================================
+
+        if not trace.routing_steps:
+            raise RuntimeError(
+                "Terminal Job 没有任何 Routing Step："
+                f"job={job_id}"
+            )
+
+        routing_steps = (
+            trace.routing_steps
+        )
+
+        # ==========================================================
+        # 3. 逐条验证 Routing Chain
+        # ==========================================================
+
+        for index, step in enumerate(
+                routing_steps
+        ):
+            if (
+                    str(step.job_id)
+                    != job_id
+            ):
+                raise RuntimeError(
+                    "Routing Step job_id 与 Trace 不一致："
+                    f"trace_job={job_id}, "
+                    f"step_job={step.job_id}, "
+                    f"sequence={index}"
+                )
+
+            if (
+                    int(step.sequence_index)
+                    != index
+            ):
+                raise RuntimeError(
+                    "Routing sequence_index 不连续："
+                    f"job={job_id}, "
+                    f"expected={index}, "
+                    f"actual={step.sequence_index}"
+                )
+
+            # ======================================================
+            # Edge -> Edge 必须已经拥有真实 same-job successor
+            # ======================================================
+
+            if step.action_type == "edge_dc":
+
+                if not step.successor_resolved:
+                    raise RuntimeError(
+                        "Finalize 时仍存在未解析的 "
+                        "Edge Routing predecessor："
+                        f"job={job_id}, "
+                        f"sequence={index}, "
+                        f"source={step.source_dc_id}, "
+                        f"target={step.target_dc_id}"
+                    )
+
+                if step.next_agent_id is None:
+                    raise RuntimeError(
+                        "Edge Routing 已标记 resolved，"
+                        "但 next_agent_id 为 None："
+                        f"job={job_id}, "
+                        f"sequence={index}"
+                    )
+
+                if step.next_env_time is None:
+                    raise RuntimeError(
+                        "Edge Routing 缺少 next_env_time："
+                        f"job={job_id}, "
+                        f"sequence={index}"
+                    )
+
+                if step.next_local_obs is None:
+                    raise RuntimeError(
+                        "Edge Routing 缺少 next_local_obs："
+                        f"job={job_id}, "
+                        f"sequence={index}"
+                    )
+
+                if step.next_global_state is None:
+                    raise RuntimeError(
+                        "Edge Routing 缺少 next_global_state："
+                        f"job={job_id}, "
+                        f"sequence={index}"
+                    )
+
+                if (
+                        str(step.next_agent_id)
+                        != str(step.target_dc_id)
+                ):
+                    raise RuntimeError(
+                        "Edge Routing target 与 successor 不一致："
+                        f"job={job_id}, "
+                        f"sequence={index}, "
+                        f"target={step.target_dc_id}, "
+                        f"next_agent={step.next_agent_id}"
+                    )
+
+                # Terminal Job 不允许最后一条还是 Edge forwarding。
+                if index + 1 >= len(
+                        routing_steps
+                ):
+                    raise RuntimeError(
+                        "Terminal Job 的 Routing Chain "
+                        "不能以 edge_dc 结束："
+                        f"job={job_id}, "
+                        f"sequence={index}"
+                    )
+
+                next_step = (
+                    routing_steps[
+                        index + 1
+                        ]
+                )
+
+                if (
+                        str(next_step.agent_id)
+                        != str(step.next_agent_id)
+                ):
+                    raise RuntimeError(
+                        "相邻 Routing Step 因果断裂："
+                        f"job={job_id}, "
+                        f"sequence={index}, "
+                        f"resolved_next={step.next_agent_id}, "
+                        f"next_step_agent={next_step.agent_id}"
+                    )
+
+            else:
+                # ==================================================
+                # Self / Cloud / Drop 都是 Routing terminal action。
+                #
+                # 后面不能再有同 Job Routing Step。
+                # ==================================================
+
+                if (
+                        index
+                        != len(routing_steps) - 1
+                ):
+                    raise RuntimeError(
+                        "Routing terminal action 后 "
+                        "仍然存在新的 Routing Step："
+                        f"job={job_id}, "
+                        f"sequence={index}, "
+                        f"action_type={step.action_type}"
+                    )
+
+        # ==========================================================
+        # 4. 最后一条 Routing 必须明确终止 Routing
+        # ==========================================================
+
+        final_routing_step = (
+            routing_steps[-1]
+        )
+
+        final_action_type = str(
+            final_routing_step.action_type
+        )
+
+        if final_action_type not in {
+            "self",
+            "cloud",
+            "drop",
+        }:
+            raise RuntimeError(
+                "Terminal Job 的最后一条 Routing action "
+                "不是 Routing terminal action："
+                f"job={job_id}, "
+                f"action_type={final_action_type}"
+            )
+
+        # ==========================================================
+        # 5. Self -> Host 因果关系
+        # ==========================================================
+
+        if final_action_type == "self":
+
+            if trace.host_step is None:
+                raise RuntimeError(
+                    "Self Routing 后 Job 已 terminal，"
+                    "但缺少 Host Step："
+                    f"job={job_id}"
+                )
+
+            host_step = (
+                trace.host_step
+            )
+
+            if (
+                    str(host_step.job_id)
+                    != job_id
+            ):
+                raise RuntimeError(
+                    "Host Step job_id 不一致："
+                    f"trace_job={job_id}, "
+                    f"host_job={host_step.job_id}"
+                )
+
+            if (
+                    str(host_step.dc_id)
+                    != str(
+                final_routing_step
+                        .source_dc_id
+            )
+            ):
+                raise RuntimeError(
+                    "Host Step DC 与最终 Self DC 不一致："
+                    f"job={job_id}, "
+                    f"self_dc="
+                    f"{final_routing_step.source_dc_id}, "
+                    f"host_dc={host_step.dc_id}"
+                )
+
+            if (
+                    host_step.execution_result
+                    is None
+            ):
+                raise RuntimeError(
+                    "Host Step 尚未记录 execution_result："
+                    f"job={job_id}"
+                )
+
+            if (
+                    host_step.result_time
+                    is None
+            ):
+                raise RuntimeError(
+                    "Host Step 尚未记录 result_time："
+                    f"job={job_id}"
+                )
+
+        # ==========================================================
+        # 6. Cloud / Drop 不允许存在 Host Step
+        # ==========================================================
+
+        elif final_action_type in {
+            "cloud",
+            "drop",
+        }:
+
+            if trace.host_step is not None:
+                raise RuntimeError(
+                    "Cloud/Drop Routing 后不应该出现 Host Step："
+                    f"job={job_id}, "
+                    f"action_type={final_action_type}"
+                )
+
+        # ==========================================================
+        # 7. Terminal Event 一致性
+        #
+        # Forced Drop 特殊：
+        #   penalty 已经保存在 Routing immediate_reward 中，
+        #   所以没有 terminal RewardEvent。
+        #
+        # 其他完成/失败：
+        #   必须恰好有一个 terminal RewardEvent。
+        # ==========================================================
+
+        terminal_events = [
+            event
+            for event
+            in trace.reward_events
+            if event.terminal
+        ]
+
+        if final_action_type == "drop":
+
+            if (
+                    str(trace.terminal_reason)
+                    != "forced_drop"
+            ):
+                raise RuntimeError(
+                    "Drop Routing 的 terminal_reason "
+                    "不是 forced_drop："
+                    f"job={job_id}, "
+                    f"reason={trace.terminal_reason}"
+                )
+
+            if terminal_events:
+                raise RuntimeError(
+                    "Forced Drop 不应该重复存在 "
+                    "terminal RewardEvent："
+                    f"job={job_id}, "
+                    f"count={len(terminal_events)}"
+                )
+
+        else:
+
+            if len(terminal_events) != 1:
+                raise RuntimeError(
+                    "非 Forced-Drop Terminal Job "
+                    "必须恰好有一个 terminal RewardEvent："
+                    f"job={job_id}, "
+                    f"count={len(terminal_events)}"
+                )
+
+            terminal_event = (
+                terminal_events[0]
+            )
+
+            if (
+                    str(terminal_event.reason)
+                    != str(trace.terminal_reason)
+            ):
+                raise RuntimeError(
+                    "Terminal Event reason "
+                    "与 Trace terminal_reason 不一致："
+                    f"job={job_id}, "
+                    f"event_reason={terminal_event.reason}, "
+                    f"trace_reason={trace.terminal_reason}"
+                )
+
+        # ==========================================================
+        # 8. 所有 Reward Event 都不能发生在 terminal 以后
+        # ==========================================================
+
+        for event in trace.reward_events:
+
+            if (
+                    float(event.env_time)
+                    > terminal_time + 1e-9
+            ):
+                raise RuntimeError(
+                    "Reward Event 时间晚于 Job terminal："
+                    f"job={job_id}, "
+                    f"event_time={event.env_time}, "
+                    f"terminal_time={terminal_time}"
+                )
+
+    def _build_finalized_trace(self,trace: PendingJobTrace, ) -> FinalizedJobTrace:
+        """
+        从已经通过结构验证的 PendingJobTrace
+        生成完全独立的 FinalizedJobTrace 副本。
+
+        使用 deepcopy 的原因：
+            Finalized Trace 不应该继续引用 Pending 对象中的
+            numpy array / Step 实例。
+        """
+
+        if trace.terminal_reason is None:
+            raise RuntimeError(
+                "Finalized Trace 缺少 terminal_reason："
+                f"job={trace.job_id}"
+            )
+
+        if trace.terminal_time is None:
+            raise RuntimeError(
+                "Finalized Trace 缺少 terminal_time："
+                f"job={trace.job_id}"
+            )
+
+        finalized_routing_steps = tuple(
+            copy.deepcopy(step)
+            for step
+            in trace.routing_steps
+        )
+
+        finalized_host_step = (
+            None
+            if trace.host_step is None
+            else copy.deepcopy(
+                trace.host_step
+            )
+        )
+
+        finalized_reward_events = tuple(
+            copy.deepcopy(event)
+            for event
+            in trace.reward_events
+        )
+
+        return FinalizedJobTrace(
+            job_id=str(
+                trace.job_id
+            ),
+
+            routing_steps=(
+                finalized_routing_steps
+            ),
+
+            host_step=(
+                finalized_host_step
+            ),
+
+            reward_events=(
+                finalized_reward_events
+            ),
+
+            terminal_reason=str(
+                trace.terminal_reason
+            ),
+
+            terminal_time=float(
+                trace.terminal_time
+            ),
+        )
+
+    def finalize_terminal_trace(self,job_id: str,) -> FinalizedJobTrace:
+        """
+        对一个已经 terminal 的 Job 一次性完成 Finalize。
+
+        原子流程：
+
+            Pending Trace
+                ↓
+            Structural Validation
+                ↓
+            Deep Copy
+                ↓
+            FinalizedJobTrace
+                ↓
+            从 Pending 区删除
+                ↓
+            写入 Finalized 区
+
+        本函数不写 ReplayBuffer。
+        """
+
+        job_id = str(
+            job_id
+        )
+
+        if (
+                job_id
+                in self._finalized_traces
+        ):
+            raise RuntimeError(
+                "同一个 Job 被重复 Finalize："
+                f"job={job_id}"
+            )
+
+        trace = self.get_trace(
+            job_id
+        )
+
+        # ==========================================================
+        # 第一阶段：
+        # 必须先保证完整链结构正确。
+        # ==========================================================
+
+        self._validate_trace_for_finalize(
+            trace
+        )
+
+        # ==========================================================
+        # 第二阶段：
+        # 创建 Finalized 副本。
+        # ==========================================================
+
+        finalized_trace = (
+            self._build_finalized_trace(
+                trace
+            )
+        )
+
+        # ==========================================================
+        # 第三阶段：
+        # 只有前面全部成功以后才移动。
+        #
+        # 这样如果 validation / deepcopy 出错，
+        # 原 Pending Trace 仍完整保留，便于调试。
+        # ==========================================================
+
+        self._finalized_traces[
+            job_id
+        ] = finalized_trace
+
+        del self._traces[
+            job_id
+        ]
+
+        return finalized_trace
+
+    def has_finalized_trace(self,job_id: str,) -> bool:
+
+        return (
+                str(job_id)
+                in self._finalized_traces
+        )
+
+    def get_finalized_trace(self,job_id: str,) -> FinalizedJobTrace:
+
+        job_id = str(
+            job_id
+        )
+
+        trace = self._finalized_traces.get(
+            job_id
+        )
+
+        if trace is None:
+            raise KeyError(
+                "找不到 Finalized Job Trace："
+                f"job={job_id}"
+            )
+
+        return trace
+
+    def is_terminal(self,job_id: str,) -> bool:
 
         trace = self._traces.get(
             str(job_id)
@@ -752,10 +1354,7 @@ class PendingJobTraceStore:
             trace.terminal
         )
 
-    def pop_terminal_trace(
-            self,
-            job_id: str,
-    ) -> PendingJobTrace:
+    def pop_terminal_trace(self,job_id: str,) -> PendingJobTrace:
 
         job_id = str(job_id)
 
@@ -773,10 +1372,7 @@ class PendingJobTraceStore:
             job_id
         )
 
-    def remove_trace(
-            self,
-            job_id: str,
-    ) -> Optional[PendingJobTrace]:
+    def remove_trace(self,job_id: str,) -> Optional[PendingJobTrace]:
 
         return self._traces.pop(
             str(job_id),
@@ -784,7 +1380,11 @@ class PendingJobTraceStore:
         )
 
     @property
-    def open_trace_count(self) -> int:
+    def open_trace_count(self,) -> int:
+        """
+        尚未 terminal 的 Pending Trace 数。
+        """
+
         return sum(
             1
             for trace
@@ -793,42 +1393,122 @@ class PendingJobTraceStore:
         )
 
     @property
-    def terminal_trace_count(self) -> int:
-        return sum(
+    def pending_trace_count(self,) -> int:
+        """
+        尚未完成 Finalize 的 Trace 总数。
+
+        包括：
+            open
+            terminal-but-not-finalized
+        """
+
+        return len(
+            self._traces
+        )
+
+    @property
+    def terminal_trace_count(self,) -> int:
+        """
+        已经 terminal 的 Job 总数。
+
+        正常情况下 terminal 后会立即 Finalize，
+        因而主要来自 _finalized_traces。
+        """
+
+        pending_terminal_count = sum(
             1
             for trace
             in self._traces.values()
             if trace.terminal
         )
 
-    @property
-    def total_trace_count(self) -> int:
-        return len(
-            self._traces
+        return (
+                pending_terminal_count
+                + len(
+            self._finalized_traces
+        )
         )
 
-    def assert_no_open_trace(self) -> None:
+    @property
+    def finalized_trace_count(self,) -> int:
 
-        unfinished = [
-            job_id
+        return len(
+            self._finalized_traces
+        )
+
+    @property
+    def total_trace_count(self,) -> int:
+
+        return (
+                len(self._traces)
+                + len(
+            self._finalized_traces
+        )
+        )
+
+    def assert_no_open_trace(self,) -> None:
+        """
+        Episode 结束以后，Pending 区必须完全为空。
+
+        因为：
+
+            open Job
+                → 错误
+
+            terminal 但未 Finalize
+                → 同样错误
+        """
+
+        if not self._traces:
+            return
+
+        remaining_details = [
+            {
+                "job_id": job_id,
+                "terminal": bool(
+                    trace.terminal
+                ),
+                "terminal_reason": (
+                    trace.terminal_reason
+                ),
+                "routing_steps": len(
+                    trace.routing_steps
+                ),
+                "has_host_step": (
+                        trace.host_step
+                        is not None
+                ),
+            }
             for job_id, trace
             in self._traces.items()
-            if not trace.terminal
         ]
 
-        if unfinished:
-            raise RuntimeError(
-                "Episode 已结束，但仍存在未闭合 "
-                "Pending Job Causal Trace："
-                f"{unfinished[:20]}"
-            )
+        raise RuntimeError(
+            "Episode 已结束，但仍存在未 Finalize 的 "
+            "Pending Job Causal Trace："
+            f"{remaining_details[:20]}"
+        )
 
-    def reset_episode(self) -> None:
+    def reset_episode(self,) -> None:
+        """
+        开始新 Episode 前清理上一 Episode Trace。
 
+        当前第十六步 Finalized Trace 只保留到 Episode 边界。
+
+        后续双 ReplayBuffer 建成以后，
+        Finalized Trace 会在这里之前被 pop 并写入经验池。
+        """
+
+        # Pending 区只要还有任何内容，都说明上一轮
+        # 有 Job 没有完成 Finalize。
         if self._traces:
             self.assert_no_open_trace()
 
         self._traces.clear()
+
+        # 当前 Finalized Trace 暂时作为本 Episode 的完整结果归档。
+        # 下一 Episode 开始时清除。
+        self._finalized_traces.clear()
 
 
 

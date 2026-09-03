@@ -965,11 +965,26 @@ class CloudEdgeEnv(AECEnv):
         host_id = str(target_host.host_id)
 
         # ==========================================================
-        # 真正执行 Host placement。
+        # 在真正执行 Host placement 前先判断：
         #
-        # 这里复用现有环境物理执行逻辑：
-        # started / queued / dropped
+        # 如果当前直接执行该任务，
+        # 是否已经超过 Arrival/Execution Drop Budget。
+        #
+        # _execute_job_on_host() 内部同样会做这个判断，
+        # 这里提前保存只是为了区分：
+        #
+        #   timeout
+        #   resource failure
+        #
+        # 两种 terminal 原因。
         # ==========================================================
+
+        host_arrival_timeout = (
+            self._should_drop_arrival_job(
+                job_id
+            )
+        )
+
         execution_result = self._execute_job_on_host(
             job_id=job_id,
             dc_id=dc_id,
@@ -977,11 +992,70 @@ class CloudEdgeEnv(AECEnv):
         )
 
         # ==========================================================
-        # Host decision 已消费。
+        # Local Host immediate drop 必须产生 Terminal Reward Event。
         #
-        # 必须先清除 pending 状态，
-        # 否则 episode-finished 检查永远不会成立。
+        # 当前 _execute_job_on_host() 返回 "dropped" 的原因只有：
+        #
+        #   1. 已超过允许执行时间；
+        #   2. 所选 Host 总资源永远无法容纳该 Job。
+        #
+        # 之前这里只记录 dropped_jobs_info，
+        # 没有产生 reward correction，
+        # 会导致 Pending Job Trace 永远无法 terminal。
         # ==========================================================
+
+        if execution_result == "dropped":
+
+            dropped_job = (
+                self.job_map[
+                    job_id
+                ]
+            )
+
+            task_energy_cost = (
+                self._calculate_task_energy_cost(
+                    job=dropped_job
+                )
+            )
+
+            energy_penalty = float(
+                self.energy_cost_weight
+                * task_energy_cost
+            )
+
+            if host_arrival_timeout:
+
+                reward_delta = -float(
+                    self.timeout_drop_penalty
+                    + energy_penalty
+                )
+
+                reason = (
+                    "local_host_arrival_timeout"
+                )
+
+            else:
+
+                reward_delta = -float(
+                    self.resource_drop_penalty
+                    + energy_penalty
+                )
+
+                reason = (
+                    "local_host_resource_failure"
+                )
+
+            self._record_reward_correction(
+                job_id=job_id,
+
+                reward_delta=(
+                    reward_delta
+                ),
+
+                reason=reason,
+            )
+
+        # Host decision 已消费。
         self.pending_host_job_id = None
         self.pending_host_dc_id = None
 
