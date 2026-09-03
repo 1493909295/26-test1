@@ -73,8 +73,8 @@ class TrainConfig:
     old_env_path: Optional[str] = conf.Old_Env_Path
     resume_checkpoint: Optional[str] = conf.Resume_Checkpoint
     vary_episode_seed: bool = conf.Vary_Episode_Seed
-    completion_credit_decay: float = conf.COMPLETION_CREDIT_DECAY
-    failure_credit_decay: float = (conf.FAILURE_CREDIT_DECAY)
+    # completion_credit_decay: float = conf.COMPLETION_CREDIT_DECAY
+    # failure_credit_decay: float = (conf.FAILURE_CREDIT_DECAY)
     use_neighbor_historical_feedback: bool = (conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK)
 
 # 统计一个 episode 运行期间的统计信息
@@ -199,27 +199,28 @@ def consume_environment_reward_corrections(
     train_config: TrainConfig,
 ) -> None:
     """
-    统一消费 Environment 在事件推进过程中产生的
-    delayed Job reward corrections。
+    统一消费 Environment 事件推进期间产生的 delayed Job outcome。
 
-    第十四步采用双写过渡机制：
+    第十七步以后：
 
-        Environment delayed outcome
-                    │
-                    ├──> PendingJobTraceStore
-                    │      保存真实 Job 因果结果
-                    │
-                    └──> Legacy ReplayBuffer
-                           暂时继续旧 reward correction
-
-    后续完成：
-        Job terminal
+        terminal reward
             ↓
-        Complete Trace Finalize
+        Finalize Job Causal Trace
             ↓
-        Routing / Host Replay
+        只写到最后一个 Actor-controlled
+        Routing Transition
+            ↓
+        前序 Routing Step 由 Bellman backup
+        自然获得长期 credit
 
-    之后再删除 Legacy Replay correction 路径。
+    不再：
+        - 按 Routing chain length 分配 reward；
+        - 使用 completion/failure credit decay；
+        - 人工把 terminal reward 切给全部历史动作。
+
+    当前仍然保留 Legacy Routing ReplayBuffer；
+    后续双 ReplayBuffer 建成以后，
+    FinalizedJobTrace 会直接转换为新 Replay Transition。
     """
 
     reward_corrections = (
@@ -232,11 +233,15 @@ def consume_environment_reward_corrections(
     for correction in reward_corrections:
 
         correction_job_id = str(
-            correction["job_id"]
+            correction[
+                "job_id"
+            ]
         )
 
         reward_delta = float(
-            correction["reward_delta"]
+            correction[
+                "reward_delta"
+            ]
         )
 
         correction_reason = str(
@@ -254,165 +259,161 @@ def consume_environment_reward_corrections(
         )
 
         is_terminal = bool(
-            correction_reason == "completed"
+            correction_reason
+            == "completed"
             or correction_reason
             in TERMINAL_FAILURE_REASONS
         )
 
         # ======================================================
-        # 1. 新 Pending Job Causal Trace
-        #
-        # Environment outcome 首先进入对应 Job 的真实因果链。
+        # 1. 所有 Environment outcome 首先写入
+        #    Job Causal Trace。
         # ======================================================
 
         pending_trace_store.record_reward_event(
-            job_id=correction_job_id,
-            env_time=correction_env_time,
-            reward_delta=reward_delta,
-            reason=correction_reason,
-            terminal=is_terminal,
+            job_id=(
+                correction_job_id
+            ),
+
+            env_time=(
+                correction_env_time
+            ),
+
+            reward_delta=(
+                reward_delta
+            ),
+
+            reason=(
+                correction_reason
+            ),
+
+            terminal=(
+                is_terminal
+            ),
         )
 
-        # ==========================================================
-        # Job Terminal -> Finalize Complete Causal Trace
+        # ======================================================
+        # 2. Terminal Job 先完成完整因果链 Finalize。
         #
-        # terminal reward event 已经写入 Trace 后，
-        # 整条 Job 生命周期事实已经完整。
+        # Final Truth First：
         #
-        # 立即一次性：
-        #
+        #   terminal event
+        #       ↓
         #   validate
-        #      ↓
-        #   finalize
-        #      ↓
-        #   move Pending -> Finalized
+        #       ↓
+        #   FinalizedJobTrace
         #
-        # 注意：
-        # 当前第十六步仍然不写新的 ReplayBuffer。
-        # ==========================================================
+        # 只有 Finalize 成功后才允许修改训练数据。
+        # ======================================================
+
+        finalized_trace = None
 
         if is_terminal:
-            pending_trace_store.finalize_terminal_trace(
-                job_id=(
-                    correction_job_id
+            finalized_trace = (
+                pending_trace_store
+                .finalize_terminal_trace(
+                    job_id=(
+                        correction_job_id
+                    )
                 )
             )
 
         # ======================================================
-        # 2. Legacy Replay compatibility
+        # 3. Terminal reward：
         #
-        # 第十四步暂时继续旧 Replay reward correction。
-        # 后续完整 Trace -> 双 Replay 建成以后删除本部分。
+        # 只写最后一个 Actor-controlled
+        # Routing Transition。
+        #
+        # 不再人工分给整条链。
         # ======================================================
 
-        if correction_reason == "completed":
+        if is_terminal:
 
-            applied_credits = (
+            correction_agent_id = (
                 replay_buffer
-                .apply_discounted_terminal_reward(
-                    job_id=correction_job_id,
-                    reward_delta=reward_delta,
-                    credit_decay=float(
-                        train_config
-                        .completion_credit_decay
+                .apply_terminal_reward_to_last_actor_transition(
+                    job_id=(
+                        correction_job_id
+                    ),
+
+                    reward_delta=(
+                        reward_delta
                     ),
                 )
             )
 
-            if not applied_credits:
+            # ==================================================
+            # Episode Return 中 terminal reward 仍然只统计一次。
+            #
+            # 如果 Legacy Replay 中对应 Transition
+            # 因环形覆盖而找不到，可以从已 Finalize Trace
+            # 找到最后一个 Actor Agent 用于日志归因。
+            # ==================================================
 
-                correction_agent_id = (
-                    replay_buffer
-                    .apply_reward_correction(
-                        job_id=correction_job_id,
-                        reward_delta=reward_delta,
-                    )
-                )
+            if (
+                correction_agent_id
+                is None
+                and finalized_trace
+                is not None
+            ):
 
-                if correction_agent_id is not None:
-                    stats.record_reward_correction(
-                        agent_id=correction_agent_id,
-                        reward_delta=reward_delta,
-                    )
+                for routing_step in reversed(
+                    finalized_trace.routing_steps
+                ):
 
-                continue
+                    if (
+                        routing_step.action_source
+                        != "forced"
+                    ):
+                        correction_agent_id = str(
+                            routing_step.agent_id
+                        )
+                        break
 
-            for (
-                correction_agent_id,
-                terminal_credit,
-            ) in applied_credits:
+            if correction_agent_id is not None:
 
                 stats.record_reward_correction(
-                    agent_id=correction_agent_id,
-                    reward_delta=terminal_credit,
-                )
-
-            continue
-
-        if (
-            correction_reason
-            in TERMINAL_FAILURE_REASONS
-        ):
-
-            applied_penalties = (
-                replay_buffer
-                .apply_discounted_terminal_reward(
-                    job_id=correction_job_id,
-                    reward_delta=reward_delta,
-                    credit_decay=float(
-                        train_config
-                        .failure_credit_decay
+                    agent_id=(
+                        correction_agent_id
                     ),
-                )
-            )
 
-            if not applied_penalties:
-
-                correction_agent_id = (
-                    replay_buffer
-                    .apply_reward_correction(
-                        job_id=correction_job_id,
-                        reward_delta=reward_delta,
-                    )
-                )
-
-                if correction_agent_id is not None:
-                    stats.record_reward_correction(
-                        agent_id=correction_agent_id,
-                        reward_delta=reward_delta,
-                    )
-
-                continue
-
-            for (
-                correction_agent_id,
-                terminal_penalty,
-            ) in applied_penalties:
-
-                stats.record_reward_correction(
-                    agent_id=correction_agent_id,
-                    reward_delta=terminal_penalty,
+                    reward_delta=(
+                        reward_delta
+                    ),
                 )
 
             continue
 
         # ======================================================
-        # 普通非 terminal delayed correction
+        # 4. 非 terminal delayed correction
+        #
+        # 如果以后仍有这种事件，只修正最近一个
+        # Actor-controlled Routing Transition。
         # ======================================================
 
         correction_agent_id = (
             replay_buffer
             .apply_reward_correction(
-                job_id=correction_job_id,
-                reward_delta=reward_delta,
+                job_id=(
+                    correction_job_id
+                ),
+
+                reward_delta=(
+                    reward_delta
+                ),
             )
         )
 
         if correction_agent_id is not None:
 
             stats.record_reward_correction(
-                agent_id=correction_agent_id,
-                reward_delta=reward_delta,
+                agent_id=(
+                    correction_agent_id
+                ),
+
+                reward_delta=(
+                    reward_delta
+                ),
             )
 
 def set_global_random_seeds(seed: int) -> None:
@@ -2543,17 +2544,31 @@ def train(
                 if (
                         action_source == "forced"
                         and action_type == "drop"
-                        and float(transition.reward) < 0.0
+                        and float(
+                    transition.reward
+                ) < 0.0
                 ):
-                    replay_buffer.apply_discounted_terminal_reward(
+                    # ==========================================================
+                    # Forced Drop 是 Environment 强制动作，
+                    # 本身不参与 Actor/Critic 学习。
+                    #
+                    # Drop penalty 已经记录在 forced transition.reward 中，
+                    # 用于 Episode-level system return。
+                    #
+                    # 对训练 credit：
+                    # 只把这个 terminal failure 归因到最近一次
+                    # Actor-controlled Routing Transition。
+                    #
+                    # 不再将 penalty 分配到整条历史 Routing Chain。
+                    # ==========================================================
+
+                    replay_buffer.apply_terminal_reward_to_last_actor_transition(
                         job_id=str(
                             transition.job_id
                         ),
+
                         reward_delta=float(
                             transition.reward
-                        ),
-                        credit_decay=float(
-                            train_config.failure_credit_decay
                         ),
                     )
 

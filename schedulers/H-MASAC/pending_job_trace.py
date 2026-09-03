@@ -1341,10 +1341,24 @@ class PendingJobTraceStore:
 
         return trace
 
-    def is_terminal(self,job_id: str,) -> bool:
+    def is_terminal(
+            self,
+            job_id: str,
+    ) -> bool:
+
+        job_id = str(
+            job_id
+        )
+
+        # 已 Finalize 的 Job 必然已经 terminal。
+        if (
+                job_id
+                in self._finalized_traces
+        ):
+            return True
 
         trace = self._traces.get(
-            str(job_id)
+            job_id
         )
 
         if trace is None:
@@ -1352,24 +1366,6 @@ class PendingJobTraceStore:
 
         return bool(
             trace.terminal
-        )
-
-    def pop_terminal_trace(self,job_id: str,) -> PendingJobTrace:
-
-        job_id = str(job_id)
-
-        trace = self.get_trace(
-            job_id
-        )
-
-        if not trace.terminal:
-            raise RuntimeError(
-                "不能 pop 尚未 terminal 的 Job Trace："
-                f"job={job_id}"
-            )
-
-        return self._traces.pop(
-            job_id
         )
 
     def remove_trace(self,job_id: str,) -> Optional[PendingJobTrace]:

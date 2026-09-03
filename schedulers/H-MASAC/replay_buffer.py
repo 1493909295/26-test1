@@ -214,11 +214,19 @@ class ReplayBuffer:
         self.job_ids: list[Optional[str]] = [None] * capacity
         self.next_agent_ids: list[Optional[str]] = [None] * capacity
         self.next_job_ids: list[Optional[str]] = [None] * capacity
-        self.latest_job_transition_index: Dict[str, int,] = {}
-        # 记录调度链用于奖励分配
-        self.job_transition_indices: Dict[str, list[int]] = {}
+
+        self.latest_actor_transition_index: Dict[
+            str,
+            int,
+        ] = {}
+
+        self.pending_edge_transition_index: Dict[
+            str,
+            int,
+        ] = {}
+
         # 保存未获得后续决策状态的边边调度转移
-        self.pending_edge_transition_index: Dict[str, int] = {}
+
         self.action_types: list[Optional[str]] = [None] * capacity
 
     def __len__(self) -> int:
@@ -226,8 +234,8 @@ class ReplayBuffer:
 
     # 重置当前 episode 的任务级信用分配索引
     def reset_episode_job_tracking(self) -> None:
-        self.job_transition_indices.clear()
-        self.latest_job_transition_index.clear()
+
+        self.latest_actor_transition_index.clear()
         self.pending_edge_transition_index.clear()
 
 
@@ -486,24 +494,13 @@ class ReplayBuffer:
 
             if old_job_id is not None:
                 old_job_id = str(old_job_id)
-                old_job_chain = self.job_transition_indices.get(old_job_id)
 
-                if old_job_chain is not None:
-                    try:
-                        old_job_chain.remove(index)
-                    except ValueError:
-                        # 当前 index 已经不在映射中时无需处理。
-                        pass
-
-                        # 该 Job 已经没有任何仍被跟踪的 Transition，
-                        # 删除空映射，避免字典不断积累空列表。
-                    if len(old_job_chain) == 0:
-                        self.job_transition_indices.pop(
-                            old_job_id,
-                            None,
-                        )
-                if (self.latest_job_transition_index.get(old_job_id) == index):
-                    self.latest_job_transition_index.pop(
+                if (
+                        self.latest_actor_transition_index
+                                .get(old_job_id)
+                        == index
+                ):
+                    self.latest_actor_transition_index.pop(
                         old_job_id,
                         None,
                     )
@@ -543,11 +540,26 @@ class ReplayBuffer:
         self.agent_ids[index] = str(transition.agent_id)
 
         # current_job_id = str(transition.job_id)
-        self.job_ids[index] = current_job_id
-        self.latest_job_transition_index[str(transition.job_id)] = index
-        self.job_transition_indices.setdefault(current_job_id, [],).append(index)
+        self.job_ids[index] = (
+            current_job_id
+        )
 
-        self.action_types[index] = current_action_type
+        # ==========================================================
+        # 只跟踪 Actor 真正选择的 Transition。
+        #
+        # forced action：
+        #   - 可以保存到 ReplayBuffer 作为环境记录；
+        #   - 但不应该成为 terminal reward 的训练归因目标。
+        # ==========================================================
+
+        if not is_forced_action:
+            self.latest_actor_transition_index[
+                current_job_id
+            ] = index
+
+        self.action_types[index] = (
+            current_action_type
+        )
 
         self.next_agent_ids[index] = (
             None
@@ -580,205 +592,382 @@ class ReplayBuffer:
 
         self.total_added += 1
 
-    # 把一个延迟出现的任务结果奖励，修正到该 Job 最后一次调度 Transition 上。
-    def apply_reward_correction(self, job_id: str, reward_delta: float,) -> Optional[str]:
-        job_id = str(job_id)
-        reward_delta = float(reward_delta)
+    # ==============================================================
+    # Delayed Non-Terminal Reward Correction
+    # ==============================================================
+    def apply_reward_correction(
+            self,
+            job_id: str,
+            reward_delta: float,
+    ) -> Optional[str]:
+        """
+        把一个非 terminal 的 delayed reward correction
+        修正到该 Job 最近一次真正由 Actor 选择的
+        Routing Transition 上。
 
-        # O(1) 找到这个 Job 最新经验的位置。
-        buffer_index = (self.latest_job_transition_index.get(job_id))
+        第十七步以后，本函数不再承担 terminal credit assignment。
 
-        # 经验可能已经被 ReplayBuffer 覆盖。
+        也就是说：
+
+            普通 delayed correction
+                -> apply_reward_correction()
+
+            Job terminal reward
+                -> apply_terminal_reward_to_last_actor_transition()
+
+        本函数不会：
+            1. 沿 Routing Chain 分配奖励；
+            2. 修改 done；
+            3. 修改 next_state；
+            4. 修改 transition trainable 状态；
+            5. 处理 forced action。
+
+        它只修改最近一个 Actor-controlled Transition 的 reward。
+        """
+
+        job_id = str(
+            job_id
+        )
+
+        reward_delta = float(
+            reward_delta
+        )
+
+        # ==========================================================
+        # 1. 找到该 Job 最近一次真正由 Actor 选择的 Transition。
+        #
+        # 这里不能再使用：
+        #
+        #     latest_job_transition_index
+        #
+        # 因为它可能指向 forced drop。
+        #
+        # 第十七步以后必须使用：
+        #
+        #     latest_actor_transition_index
+        # ==========================================================
+
+        buffer_index = (
+            self.latest_actor_transition_index.get(
+                job_id
+            )
+        )
+
+        # ==========================================================
+        # 2. 当前 Job 没有可归因的 Actor Transition。
+        #
+        # 可能原因：
+        #
+        #   - 这个 Job 没有产生 Actor-controlled action；
+        #   - 对应 Replay 槽位已经被环形 Buffer 覆盖；
+        #   - Episode tracking 已经清理。
+        #
+        # 这里不创建假 Transition，也不抛异常。
+        # ==========================================================
+
         if buffer_index is None:
             return None
 
-        buffer_index = int(buffer_index)
+        buffer_index = int(
+            buffer_index
+        )
 
-        # 真正修正 SAC 将来采样到的 reward
-        self.rewards[buffer_index] = np.float32(float(self.rewards[buffer_index]) + reward_delta)
+        # ==========================================================
+        # 3. 环形 ReplayBuffer 防御性验证。
+        #
+        # ReplayBuffer 是固定容量循环覆盖结构。
+        #
+        # 即使字典里还留着：
+        #
+        #     Job42 -> index 100
+        #
+        # index 100 也有可能已经被 Job99 覆盖。
+        #
+        # 所以在修改 reward 前必须再次验证：
+        #
+        #     self.job_ids[index] == job_id
+        # ==========================================================
 
-        agent_id = self.agent_ids[buffer_index]
+        if (
+                self.job_ids[
+                    buffer_index
+                ]
+                != job_id
+        ):
+            # 发现 stale index 后立即删除，
+            # 防止以后再次误修改其他 Job 的 reward。
+            self.latest_actor_transition_index.pop(
+                job_id,
+                None,
+            )
+
+            return None
+
+        # ==========================================================
+        # 4. 防御性检查：
+        #
+        # latest_actor_transition_index 理论上绝不能指向
+        # forced transition。
+        #
+        # 如果发生，说明 add() 中 Actor/Forced tracking 有 Bug。
+        # ==========================================================
+
+        if bool(
+                self.is_forced_action[
+                    buffer_index
+                ]
+        ):
+            raise RuntimeError(
+                "latest_actor_transition_index "
+                "错误指向 forced transition："
+                f"job={job_id}, "
+                f"buffer_index={buffer_index}"
+            )
+
+        # ==========================================================
+        # 5. 真正进行普通 delayed reward correction。
+        #
+        # 注意：
+        # 这里只修改 reward。
+        #
+        # 不修改：
+        #
+        #     done
+        #     terminated
+        #     truncated
+        #     next_state
+        #     trainable index
+        #
+        # 因为本函数处理的是普通 non-terminal correction。
+        # ==========================================================
+
+        self.rewards[
+            buffer_index
+        ] = np.float32(
+            float(
+                self.rewards[
+                    buffer_index
+                ]
+            )
+            + reward_delta
+        )
+
+        # ==========================================================
+        # 6. 返回发生 reward correction 的 Routing Agent。
+        #
+        # train_h_masac.py 使用这个返回值进行 Episode
+        # reward statistics。
+        # ==========================================================
+
+        agent_id = (
+            self.agent_ids[
+                buffer_index
+            ]
+        )
 
         if agent_id is None:
             return None
 
-        return str(agent_id)
+        return str(
+            agent_id
+        )
 
-    # 反向折扣奖励分配机制
-    def apply_discounted_terminal_reward(
+    # ==============================================================
+    # Job Terminal Reward Assignment
+    # ==============================================================
+    def apply_terminal_reward_to_last_actor_transition(
             self,
             job_id: str,
             reward_delta: float,
-            credit_decay: float,
-    ) -> list[tuple[str, float]]:
+    ) -> Optional[str]:
+        """
+        Job terminal 后，把最终 outcome 只归因到该 Job
+        最后一次真正由 Actor 选择的 Routing Transition。
 
-        job_id = str(job_id)
-        reward_delta = float(reward_delta)
-        credit_decay = float(credit_decay)
+        不再：
 
-        # ============================================================
-        # 核心：
-        # 只要进入 terminal reward 分配函数，
-        # 就说明当前 Job 生命周期已经结束。
+            1. 根据 Routing chain length 计算权重；
+            2. 使用 credit_decay；
+            3. 把 terminal reward 人工切分给所有历史动作。
+
+        前序 Routing Step 的长期 credit 通过：
+
+            r_t + gamma * V(s_{t+1})
+
+        自然向前传播。
+
+        特殊情况：
+            如果 Job 在 Edge forwarding 后直接 terminal，
+            或下一次决策只是 forced drop，
+            则最后一个 Actor-controlled Edge Transition
+            被直接收口为 terminal transition。
+        """
+
+        job_id = str(
+            job_id
+        )
+
+        reward_delta = float(
+            reward_delta
+        )
+
+        # ==========================================================
+        # 如果最后一个 Edge action 尚未得到 same-job successor，
+        # 说明 Job 在下一次正常 Routing Decision 之前已经终止。
         #
-        # 正常情况下：
-        # Edge transition 应该早已通过同 Job successor 完成回填，
-        # 此处不会找到 pending Edge。
-        #
-        # 如果此时仍存在 pending Edge，
-        # 说明任务在产生下一次普通 Actor 决策前就终止了。
-        # 这条 Edge transition 必须：
-        #   1. 标记 done=True；
-        #   2. 禁止 bootstrap；
-        #   3. 加入 trainable replay。
-        #
-        # 这样无论成功还是失败，都不会留下永久悬挂的 Edge experience。
-        # ============================================================
+        # 将它收口成 terminal transition。
+        # ==========================================================
+
         self._finalize_pending_edge_as_terminal(
             job_id=job_id
         )
 
-        # 找出当前 Job 的完整调度链。
-        candidate_indices = list(
-            self.job_transition_indices.get(
-                job_id,
-                [],
-            )
+        buffer_index = (
+            self.latest_actor_transition_index
+                .get(job_id)
         )
 
-        if not candidate_indices:
-            # 当前 Job 已经 terminal，
-            # 即使没有普通 Actor transition，也必须清理任务级索引。
-            self.job_transition_indices.pop(
-                job_id,
-                None,
-            )
-            self.latest_job_transition_index.pop(
+        if buffer_index is None:
+            # 当前 Job 没有任何 Actor-controlled transition。
+            # 例如首次状态就被环境强制 Drop。
+            self.pending_edge_transition_index.pop(
                 job_id,
                 None,
             )
 
-            return []
+            return None
 
-        valid_indices: list[int] = []
-
-        for buffer_index in candidate_indices:
-
-            buffer_index = int(buffer_index)
-
-            if self.job_ids[buffer_index] != job_id:
-                continue
-
-            # forced action 不由 Actor 选择，
-            # 不直接拿来训练 Actor/Critic。
-            if bool(
-                    self.is_forced_action[buffer_index]
-            ):
-                continue
-
-            if self.agent_ids[buffer_index] is None:
-                continue
-
-            valid_indices.append(
-                buffer_index
-            )
-
-        if not valid_indices:
-            # 即使整个 Job 只有 forced transition，
-            # terminal 后也不能继续保留任务级映射。
-            self.job_transition_indices.pop(
-                job_id,
-                None,
-            )
-
-            self.latest_job_transition_index.pop(
-                job_id,
-                None,
-            )
-
-            return []
-
-        chain_length = len(
-            valid_indices
+        buffer_index = int(
+            buffer_index
         )
 
-        raw_weights = np.asarray(
-            [
-                credit_decay ** (
-                        chain_length - 1 - position
-                )
-                for position in range(
-                chain_length
-            )
-            ],
-            dtype=np.float64,
-        )
+        # ==========================================================
+        # 环形 Replay 防御。
+        # ==========================================================
 
-        normalized_weights = (
-                raw_weights
-                / float(raw_weights.sum())
-        )
-
-        applied_credits: list[
-            tuple[str, float]
-        ] = []
-
-        for (
-                buffer_index,
-                weight,
-        ) in zip(
-            valid_indices,
-            normalized_weights,
+        if (
+                self.job_ids[
+                    buffer_index
+                ]
+                != job_id
         ):
-            terminal_credit = (
-                    reward_delta
-                    * float(weight)
+            self.latest_actor_transition_index.pop(
+                job_id,
+                None,
             )
 
-            self.rewards[
-                buffer_index
-            ] = np.float32(
-                float(
-                    self.rewards[
+            self.pending_edge_transition_index.pop(
+                job_id,
+                None,
+            )
+
+            return None
+
+        if bool(
+                self.is_forced_action[
+                    buffer_index
+                ]
+        ):
+            raise RuntimeError(
+                "latest_actor_transition_index "
+                "错误指向 forced transition："
+                f"job={job_id}, "
+                f"buffer_index={buffer_index}"
+            )
+
+        # ==========================================================
+        # Job 已经 terminal：
+        #
+        # 最后一个 Actor-controlled transition
+        # 不允许再 bootstrap。
+        #
+        # 对 Self / Cloud：
+        #     本来就应该是 done=True。
+        #
+        # 对 Edge -> forced-drop：
+        #     这里把先前已 resolve 的 Edge successor
+        #     收口成真正 terminal。
+        # ==========================================================
+
+        self.next_agent_indices[
+            buffer_index
+        ] = -1
+
+        self.next_local_obs[
+            buffer_index
+        ].fill(
+            0.0
+        )
+
+        self.next_global_states[
+            buffer_index
+        ].fill(
+            0.0
+        )
+
+        self.next_agent_ids[
+            buffer_index
+        ] = None
+
+        self.next_job_ids[
+            buffer_index
+        ] = None
+
+        self.done[
+            buffer_index
+        ] = True
+
+        # ==========================================================
+        # Terminal reward 只加到最后一个 Actor transition。
+        # ==========================================================
+
+        self.rewards[
+            buffer_index
+        ] = np.float32(
+            float(
+                self.rewards[
+                    buffer_index
+                ]
+            )
+            + reward_delta
+        )
+
+        # 确保它可以被 SAC 采样。
+        if (
+                int(
+                    self._trainable_positions[
                         buffer_index
                     ]
                 )
-                + terminal_credit
+                == -1
+        ):
+            self._add_trainable_index(
+                buffer_index
             )
 
-            applied_credits.append(
-                (
-                    str(
-                        self.agent_ids[
-                            buffer_index
-                        ]
-                    ),
-                    terminal_credit,
-                )
-            )
+        agent_id = (
+            self.agent_ids[
+                buffer_index
+            ]
+        )
 
-        # Job 生命周期已经结束，
-        # 删除本 Job 的临时追踪结构。
-        self.job_transition_indices.pop(
+        # Job terminal 后，不再需要这些临时索引。
+        self.latest_actor_transition_index.pop(
             job_id,
             None,
         )
 
-        self.latest_job_transition_index.pop(
-            job_id,
-            None,
-        )
-
-        # pending Edge 已在函数开头处理，
-        # 理论上这里应该不存在。
         self.pending_edge_transition_index.pop(
             job_id,
             None,
         )
 
-        return applied_credits
+        if agent_id is None:
+            return None
 
-
+        return str(
+            agent_id
+        )
 
     # 判断当前是否有足够经验采样一个 batch
     def can_sample(self, batch_size: int, include_forced_actions: bool = False,) -> bool:
@@ -885,40 +1074,180 @@ class ReplayBuffer:
             next_env_times=self.next_env_times[sampled_indices].copy(),
         )
 
+
     # 清空全部经验
     def clear(self) -> None:
+        """
+        完全清空 ReplayBuffer。
+
+        清理内容包括：
+
+            1. ReplayBuffer 基本位置与数量统计；
+            2. 所有数值 Transition 数组；
+            3. 所有字符串 ID 元数据；
+            4. trainable / forced action 索引；
+            5. Job -> 最近 Actor Transition 临时索引；
+            6. Edge -> same-job successor 临时索引。
+
+        第十七步以后不再维护：
+
+            latest_job_transition_index
+            job_transition_indices
+
+        因为 terminal reward 不再按照整条 Routing Chain
+        进行人工 credit allocation。
+        """
+
+        # ==========================================================
+        # 1. ReplayBuffer 基本状态
+        # ==========================================================
+
         self._position = 0
         self._size = 0
+
         self.total_added = 0
+
+        # ==========================================================
+        # 2. Trainable / Forced Action 统计
+        # ==========================================================
+
         self._num_trainable = 0
         self._num_forced_actions = 0
-        self._trainable_indices.fill(-1)
-        self._trainable_positions.fill(-1)
-        self.agent_indices.fill(-1)
-        self.local_obs.fill(0.0)
-        self.global_states.fill(0.0)
 
-        self.actions.fill(self.forced_action_value)
-        self.rewards.fill(0.0)
-        self.next_agent_indices.fill(-1)
-        self.next_local_obs.fill(0.0)
-        self.next_global_states.fill(0.0)
+        self._trainable_indices.fill(
+            -1
+        )
 
-        self.terminated.fill(False)
-        self.truncated.fill(False)
-        self.done.fill(False)
-        self.is_forced_action.fill(False)
-        self.env_times.fill(0.0)
-        self.next_env_times.fill(0.0)
-        self.agent_ids = [None] * self.capacity
-        self.job_ids = [None] * self.capacity
-        self.next_agent_ids = [None] * self.capacity
-        self.next_job_ids = [None] * self.capacity
-        self.latest_job_transition_index.clear()
-        self.job_transition_indices.clear()
-        self.action_types = [None] * self.capacity
-        self.latest_job_transition_index.clear()
-        self.job_transition_indices.clear()
+        self._trainable_positions.fill(
+            -1
+        )
+
+        # ==========================================================
+        # 3. 当前状态
+        # ==========================================================
+
+        self.agent_indices.fill(
+            -1
+        )
+
+        self.local_obs.fill(
+            0.0
+        )
+
+        self.global_states.fill(
+            0.0
+        )
+
+        # ==========================================================
+        # 4. Action / Reward
+        # ==========================================================
+
+        self.actions.fill(
+            self.forced_action_value
+        )
+
+        self.rewards.fill(
+            0.0
+        )
+
+        # ==========================================================
+        # 5. Next State
+        # ==========================================================
+
+        self.next_agent_indices.fill(
+            -1
+        )
+
+        self.next_local_obs.fill(
+            0.0
+        )
+
+        self.next_global_states.fill(
+            0.0
+        )
+
+        # ==========================================================
+        # 6. Terminal Flags
+        # ==========================================================
+
+        self.terminated.fill(
+            False
+        )
+
+        self.truncated.fill(
+            False
+        )
+
+        self.done.fill(
+            False
+        )
+
+        # ==========================================================
+        # 7. Forced Action Flags
+        # ==========================================================
+
+        self.is_forced_action.fill(
+            False
+        )
+
+        # ==========================================================
+        # 8. Environment Time
+        # ==========================================================
+
+        self.env_times.fill(
+            0.0
+        )
+
+        self.next_env_times.fill(
+            0.0
+        )
+
+        # ==========================================================
+        # 9. String Metadata
+        #
+        # 这些是 Python list，
+        # 不能使用 numpy.fill()。
+        # ==========================================================
+
+        self.agent_ids = (
+                [None] * self.capacity
+        )
+
+        self.job_ids = (
+                [None] * self.capacity
+        )
+
+        self.next_agent_ids = (
+                [None] * self.capacity
+        )
+
+        self.next_job_ids = (
+                [None] * self.capacity
+        )
+
+        self.action_types = (
+                [None] * self.capacity
+        )
+
+        # ==========================================================
+        # 10. Job-level Temporary Tracking
+        #
+        # 第十七步以后只保留两类临时索引：
+        #
+        # latest_actor_transition_index
+        #     -> 最近一次真正由 Actor 选择的 Routing Transition
+        #
+        # pending_edge_transition_index
+        #     -> Edge action 等待同 Job successor 回填
+        #
+        # 不再存在：
+        #
+        # latest_job_transition_index
+        # job_transition_indices
+        # ==========================================================
+
+        self.latest_actor_transition_index.clear()
+
         self.pending_edge_transition_index.clear()
 
 

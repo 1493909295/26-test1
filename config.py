@@ -93,8 +93,8 @@ SLA_RISK_COST_WEIGHT = 1.0              # 违约风险参数
 EDGE_DEADLINE_RISK_COST_WEIGHT = 1.0    # Edge 转发行为对任务剩余 deadline 的侵蚀
 TIMEOUT_DROP_PENALTY = 4.0              # 超时惩罚
 RESOURCE_DROP_PENALTY = 2.0             # 资源不足惩罚，其实已经不会触发了，因为后面搞了掩码
-COMPLETION_CREDIT_DECAY = 0.8           # 调度链奖励衰减参数
-FAILURE_CREDIT_DECAY = 0.8              # 调度链惩罚衰减参数
+# COMPLETION_CREDIT_DECAY = 0.8           # 调度链奖励衰减参数
+# FAILURE_CREDIT_DECAY = 0.8              # 调度链惩罚衰减参数
 
 ENERGY_NORMALIZATION_J = 170000.0       # 将真实物理能耗 J 缩放到适合 Reward 学习的数值范围
 ENERGY_COST_WEIGHT = 0.30               #  控制 Energy objective 在联合 Reward 中的相对权重
