@@ -42,6 +42,11 @@ from routing_observation import (RoutingObservationBuilder,)
 from routing_centralized_state import (RoutingCentralizedStateBuilder,)
 from host_observation import (HostObservationBuilder,)
 
+CHECKPOINT_SCHEMA_VERSION = 2
+
+CHECKPOINT_ARCHITECTURE = (
+    "h_masac_two_layer_routing_host_v1"
+)
 
 TERMINAL_FAILURE_REASONS = frozenset({
     "waiting_timeout",
@@ -2055,6 +2060,430 @@ def calculate_episode_energy_metrics(env: Any,) -> Dict[str, float]:
             ),
     }
 
+def build_checkpoint_structure_metadata(
+        env: CloudEdgeEnv,
+        routing_masac: RoutingMASAC,
+        host_sac_agents: Dict[
+            str,
+            LocalHostSAC,
+        ],
+) -> Dict[str, Any]:
+    """
+    构造 H-MASAC checkpoint 的结构身份信息。
+
+    这些信息不是训练指标，而是判断：
+        “当前运行环境是否仍然与该 checkpoint 兼容”
+
+    的硬结构约束。
+
+    特别需要保护：
+        1. Cloud ON/OFF；
+        2. Edge DC 数量及顺序；
+        3. Routing action 语义及维度；
+        4. Routing Observation / Global State 维度；
+        5. 每个 DC 的 Host 数量及顺序；
+        6. 每个 Host SAC 的 observation/action dimension。
+    """
+
+    edge_dc_ids = [
+        str(dc_id)
+        for dc_id
+        in env.edge_dc_ids
+    ]
+
+    base_dc_map = {
+        str(dc.dc_id): dc
+        for dc
+        in env.base_datacenters
+    }
+
+    host_ids_per_dc: Dict[
+        str,
+        list,
+    ] = {}
+
+    host_count_per_dc: Dict[
+        str,
+        int,
+    ] = {}
+
+    for dc_id in edge_dc_ids:
+        dc = base_dc_map.get(
+            dc_id
+        )
+
+        if dc is None:
+            raise RuntimeError(
+                "构造 checkpoint metadata 时 "
+                "找不到 Edge DC："
+                f"{dc_id}"
+            )
+
+        host_ids = [
+            str(host.host_id)
+            for host
+            in dc.host_list
+        ]
+
+        host_ids_per_dc[
+            dc_id
+        ] = host_ids
+
+        host_count_per_dc[
+            dc_id
+        ] = len(
+            host_ids
+        )
+
+    host_model_metadata = {
+        str(dc_id): {
+            "obs_dim": int(
+                host_agent.obs_dim
+            ),
+
+            "action_dim": int(
+                host_agent.action_dim
+            ),
+        }
+        for dc_id, host_agent
+        in host_sac_agents.items()
+    }
+
+    return {
+        "cloud_enabled": bool(
+            env.enable_cloud_action
+        ),
+
+        # 顺序必须保存。
+        # Routing Actor 中 agent one-hot 和 action index
+        # 都依赖这些顺序。
+        "edge_dc_ids": edge_dc_ids,
+
+        "routing_action_target_dc_ids": [
+            str(dc_id)
+            for dc_id
+            in env.routing_action_target_dc_ids
+        ],
+
+        # Host action index 同样依赖 host_list 顺序，
+        # 不能只比较 Host 数量。
+        "host_count_per_dc":
+            host_count_per_dc,
+
+        "host_ids_per_dc":
+            host_ids_per_dc,
+
+        "routing": {
+            "local_obs_dim": int(
+                routing_masac.local_obs_dim
+            ),
+
+            "global_state_dim": int(
+                routing_masac.global_state_dim
+            ),
+
+            "action_dim": int(
+                routing_masac.action_dim
+            ),
+
+            "num_agents": int(
+                routing_masac.num_agents
+            ),
+        },
+
+        "hosts":
+            host_model_metadata,
+    }
+
+def validate_checkpoint_structure_metadata(
+        checkpoint_metadata:
+        Dict[str, Any],
+
+        env: CloudEdgeEnv,
+
+        routing_masac: RoutingMASAC,
+
+        host_sac_agents:
+        Dict[str, LocalHostSAC],
+) -> None:
+    """
+    在真正加载任何网络参数以前，
+    检查 checkpoint 与当前双层调度结构是否兼容。
+
+    结构不一致时立即 fail-fast，
+    禁止把语义不同的权重强行加载进当前模型。
+    """
+
+    schema_version = int(
+        checkpoint_metadata.get(
+            "schema_version",
+            -1,
+        )
+    )
+
+    if (
+            schema_version
+            != CHECKPOINT_SCHEMA_VERSION
+    ):
+        raise RuntimeError(
+            "Checkpoint schema version 不兼容："
+            f"saved={schema_version}, "
+            f"current="
+            f"{CHECKPOINT_SCHEMA_VERSION}"
+        )
+
+    architecture = str(
+        checkpoint_metadata.get(
+            "architecture",
+            "",
+        )
+    )
+
+    if (
+            architecture
+            != CHECKPOINT_ARCHITECTURE
+    ):
+        raise RuntimeError(
+            "Checkpoint architecture 不兼容："
+            f"saved={architecture!r}, "
+            f"current="
+            f"{CHECKPOINT_ARCHITECTURE!r}"
+        )
+
+    saved_structure = (
+        checkpoint_metadata.get(
+            "structure",
+            {}
+        )
+    )
+
+    current_structure = (
+        build_checkpoint_structure_metadata(
+            env=env,
+            routing_masac=(
+                routing_masac
+            ),
+            host_sac_agents=(
+                host_sac_agents
+            ),
+        )
+    )
+
+    # ==========================================================
+    # Cloud Action
+    #
+    # Cloud ON/OFF 会直接改变 Routing action space，
+    # 因此不允许跨配置恢复。
+    # ==========================================================
+
+    saved_cloud_enabled = bool(
+        saved_structure.get(
+            "cloud_enabled",
+            False,
+        )
+    )
+
+    current_cloud_enabled = bool(
+        current_structure[
+            "cloud_enabled"
+        ]
+    )
+
+    if (
+            saved_cloud_enabled
+            != current_cloud_enabled
+    ):
+        raise RuntimeError(
+            "Checkpoint Cloud 配置不兼容："
+            f"saved={saved_cloud_enabled}, "
+            f"current={current_cloud_enabled}"
+        )
+
+    # ==========================================================
+    # Edge DC identity / order
+    # ==========================================================
+
+    saved_edge_dc_ids = list(
+        saved_structure.get(
+            "edge_dc_ids",
+            [],
+        )
+    )
+
+    current_edge_dc_ids = list(
+        current_structure[
+            "edge_dc_ids"
+        ]
+    )
+
+    if (
+            saved_edge_dc_ids
+            != current_edge_dc_ids
+    ):
+        raise RuntimeError(
+            "Checkpoint Edge DC 列表或顺序不兼容："
+            f"saved={saved_edge_dc_ids}, "
+            f"current={current_edge_dc_ids}"
+        )
+
+    # ==========================================================
+    # Routing action semantic mapping
+    # ==========================================================
+
+    saved_targets = list(
+        saved_structure.get(
+            "routing_action_target_dc_ids",
+            [],
+        )
+    )
+
+    current_targets = list(
+        current_structure[
+            "routing_action_target_dc_ids"
+        ]
+    )
+
+    if (
+            saved_targets
+            != current_targets
+    ):
+        raise RuntimeError(
+            "Checkpoint Routing action mapping 不兼容："
+            f"saved={saved_targets}, "
+            f"current={current_targets}"
+        )
+
+    # ==========================================================
+    # Routing dimensions
+    # ==========================================================
+
+    saved_routing = (
+        saved_structure.get(
+            "routing",
+            {}
+        )
+    )
+
+    current_routing = (
+        current_structure[
+            "routing"
+        ]
+    )
+
+    for field_name in (
+        "local_obs_dim",
+        "global_state_dim",
+        "action_dim",
+        "num_agents",
+    ):
+        if (
+                int(
+                    saved_routing.get(
+                        field_name,
+                        -1,
+                    )
+                )
+                != int(
+                    current_routing[
+                        field_name
+                    ]
+                )
+        ):
+            raise RuntimeError(
+                "Checkpoint Routing 结构不兼容："
+                f"field={field_name}, "
+                f"saved="
+                f"{saved_routing.get(field_name)}, "
+                f"current="
+                f"{current_routing[field_name]}"
+            )
+
+    # ==========================================================
+    # Host physical mapping
+    # ==========================================================
+
+    saved_host_ids = (
+        saved_structure.get(
+            "host_ids_per_dc",
+            {}
+        )
+    )
+
+    current_host_ids = (
+        current_structure[
+            "host_ids_per_dc"
+        ]
+    )
+
+    if (
+            saved_host_ids
+            != current_host_ids
+    ):
+        raise RuntimeError(
+            "Checkpoint Host ID / action mapping "
+            "与当前环境不兼容。"
+        )
+
+    # ==========================================================
+    # Host SAC dimensions
+    # ==========================================================
+
+    saved_hosts = (
+        saved_structure.get(
+            "hosts",
+            {}
+        )
+    )
+
+    current_hosts = (
+        current_structure[
+            "hosts"
+        ]
+    )
+
+    if (
+            set(saved_hosts.keys())
+            != set(current_hosts.keys())
+    ):
+        raise RuntimeError(
+            "Checkpoint Host SAC DC 集合不兼容："
+            f"saved={sorted(saved_hosts.keys())}, "
+            f"current={sorted(current_hosts.keys())}"
+        )
+
+    for dc_id in current_hosts.keys():
+        for field_name in (
+            "obs_dim",
+            "action_dim",
+        ):
+            if (
+                    int(
+                        saved_hosts[
+                            dc_id
+                        ].get(
+                            field_name,
+                            -1,
+                        )
+                    )
+                    != int(
+                        current_hosts[
+                            dc_id
+                        ][
+                            field_name
+                        ]
+                    )
+            ):
+                raise RuntimeError(
+                    "Checkpoint Local Host SAC "
+                    "结构不兼容："
+                    f"dc={dc_id}, "
+                    f"field={field_name}, "
+                    f"saved="
+                    f"{saved_hosts[dc_id].get(field_name)}, "
+                    f"current="
+                    f"{current_hosts[dc_id][field_name]}"
+                )
+
 # 根据模型文件路径生成配套的训练器状态 JSON 路径
 def checkpoint_state_path(model_path: Path) -> Path:
     return model_path.with_suffix(".trainer.json")
@@ -2070,23 +2499,29 @@ def host_checkpoint_dir(
 
 # 同时保存 MASAC 模型和训练主循环状态
 def save_two_layer_checkpoint(
-    routing_masac: RoutingMASAC,
+        env: CloudEdgeEnv,
 
-    host_sac_agents:
-    Dict[str, LocalHostSAC],
+        routing_masac: RoutingMASAC,
 
-    model_path: Path,
+        host_sac_agents:
+        Dict[str, LocalHostSAC],
 
-    next_episode: int,
+        model_path: Path,
 
-    global_decision_steps: int,
+        training_stage: TrainingStage,
 
-    routing_normal_action_steps: int,
+        train_config: TrainConfig,
 
-    host_training_action_steps:
-    Dict[str, int],
+        next_episode: int,
 
-    best_episode_return: float,
+        global_decision_steps: int,
+
+        routing_normal_action_steps: int,
+
+        host_training_action_steps:
+        Dict[str, int],
+
+        best_episode_return: float,
 ) -> None:
 
 
@@ -2111,41 +2546,95 @@ def save_two_layer_checkpoint(
             host_dir / f"{dc_id}.pt"
         )
 
-    trainer_state = {
-        "next_episode": int(
-            next_episode
+    checkpoint_metadata = {
+        "schema_version": int(
+            CHECKPOINT_SCHEMA_VERSION
         ),
 
-        "global_decision_steps": int(
-            global_decision_steps
-        ),
+        "architecture":
+            CHECKPOINT_ARCHITECTURE,
 
-        # ==========================================================
-        # Routing 层真正参与 random / policy 的动作总数。
-        #
-        # Stage 1 的 orchestrator Self 不计入这里。
-        # ==========================================================
-        "routing_normal_action_steps": int(
-            routing_normal_action_steps
-        ),
+        "saved_training_stage":
+            str(
+                training_stage.value
+            ),
 
-        # ==========================================================
-        # 每个 DC 自己的 Host training step。
-        #
-        # Resume 后必须恢复，否则 Host SAC 会重新进入
-        # random warmup。
-        # ==========================================================
-        "host_training_action_steps": {
-            str(dc_id): int(
-                step_count
-            )
-            for dc_id, step_count
-            in host_training_action_steps.items()
+        "structure":
+            build_checkpoint_structure_metadata(
+                env=env,
+
+                routing_masac=(
+                    routing_masac
+                ),
+
+                host_sac_agents=(
+                    host_sac_agents
+                ),
+            ),
+
+        # 训练阶段长度保存下来主要用于实验追溯。
+        # 不把它作为神经网络结构兼容性的硬约束，
+        # 因为后续可能人为延长 Joint Fine-tune。
+        "training_schedule": {
+            "num_episodes": int(
+                train_config.num_episodes
+            ),
+
+            "host_pretrain_episodes": int(
+                train_config
+                    .host_pretrain_episodes
+            ),
+
+            "routing_train_episodes": int(
+                train_config
+                    .routing_train_episodes
+            ),
+
+            "joint_finetune_episodes": int(
+                train_config
+                    .joint_finetune_episodes
+            ),
         },
 
-        "best_episode_return": float(
-            best_episode_return
-        ),
+        "trainer_state": {
+            "next_episode": int(
+                next_episode
+            ),
+
+            "global_decision_steps": int(
+                global_decision_steps
+            ),
+
+            "routing_normal_action_steps":
+                int(
+                    routing_normal_action_steps
+                ),
+
+            # 作为全局诊断量保存。
+            "routing_global_steps": int(
+                routing_normal_action_steps
+            ),
+
+            "host_training_action_steps": {
+                str(dc_id): int(
+                    step_count
+                )
+                for dc_id, step_count
+                in host_training_action_steps.items()
+            },
+
+            "host_global_steps": int(
+                sum(
+                    int(step_count)
+                    for step_count
+                    in host_training_action_steps.values()
+                )
+            ),
+
+            "best_episode_return": float(
+                best_episode_return
+            ),
+        },
     }
 
     state_path = (
@@ -2156,7 +2645,7 @@ def save_two_layer_checkpoint(
 
     state_path.write_text(
         json.dumps(
-            trainer_state,
+            checkpoint_metadata,
             ensure_ascii=False,
             indent=2,
         ),
@@ -2164,6 +2653,10 @@ def save_two_layer_checkpoint(
     )
 
 def load_two_layer_checkpoint_if_needed(
+        env: CloudEdgeEnv,
+
+        train_config: TrainConfig,
+
         routing_masac: RoutingMASAC,
 
         host_sac_agents: Dict[
@@ -2173,23 +2666,58 @@ def load_two_layer_checkpoint_if_needed(
 
         resume_checkpoint: Optional[str],
 ) -> Tuple[
-    int,
-    int,
-    int,
-    Dict[str, int],
-    float,
+        int,
+        int,
+        int,
+        Dict[str, int],
+        float,
 ]:
     """
     恢复完整 Two-Level Scheduler checkpoint。
 
-    返回：
+    新的 Resume 顺序严格为：
 
+        1. 检查 Routing checkpoint 是否存在；
+        2. 检查 Host checkpoint 目录是否存在；
+        3. 检查每个 DC 的 Host checkpoint 是否完整；
+        4. 检查 trainer metadata 是否存在；
+        5. 读取 checkpoint metadata；
+        6. 检查 checkpoint schema / architecture；
+        7. 检查当前 Environment 与 checkpoint 的结构兼容性；
+        8. 检查 Trainer State；
+        9. 所有检查通过后，才真正加载 Routing MASAC；
+       10. 加载每个 DC 的 Local Host SAC；
+       11. 恢复训练计数。
+
+    这样可以避免：
+
+        - Cloud ON/OFF 不一致；
+        - Edge DC 数量或顺序变化；
+        - Routing action mapping 变化；
+        - Observation / Global State 维度变化；
+        - Host 数量或顺序变化；
+        - Host SAC action_dim 变化；
+        - Trainer metadata 丢失；
+
+    时仍然静默恢复旧 checkpoint。
+
+    返回：
         start_episode
         global_decision_steps
         routing_normal_action_steps
         host_training_action_steps
         best_episode_return
     """
+
+    # ==========================================================
+    # 默认 Host Training Step
+    #
+    # 只有在“完全没有指定 Resume checkpoint”的情况下，
+    # 才允许使用这些默认值开始全新训练。
+    #
+    # 一旦用户明确指定 checkpoint，
+    # 就不允许因为 metadata 缺失而偷偷回到 0。
+    # ==========================================================
 
     default_host_steps = {
         str(dc_id): 0
@@ -2198,25 +2726,568 @@ def load_two_layer_checkpoint_if_needed(
     }
 
     # ==========================================================
-    # 没有指定 checkpoint：
-    # 从全新训练状态开始。
+    # 0. 没有指定 Resume checkpoint
+    #
+    # 这是唯一允许从 Episode 1 / Step 0 开始的情况。
     # ==========================================================
 
     if resume_checkpoint is None:
         return (
-            1,
-            0,
-            0,
+            1,                  # start_episode
+            0,                  # global_decision_steps
+            0,                  # routing_normal_action_steps
             default_host_steps,
-            float("-inf"),
+            float("-inf"),      # best_episode_return
         )
+
+    # ==========================================================
+    # 1. Routing checkpoint 路径
+    # ==========================================================
 
     model_path = Path(
         resume_checkpoint
     )
 
+    if not model_path.exists():
+        raise FileNotFoundError(
+            "找不到 Routing MASAC checkpoint："
+            f"{model_path}"
+        )
+
+    if not model_path.is_file():
+        raise FileNotFoundError(
+            "Routing MASAC checkpoint 不是有效文件："
+            f"{model_path}"
+        )
+
     # ==========================================================
-    # 1. Routing MASAC
+    # 2. Host checkpoint 目录
+    #
+    # 例如：
+    #
+    #   latest.pt
+    #
+    # 对应：
+    #
+    #   latest_hosts/
+    #       DC1.pt
+    #       DC2.pt
+    #       ...
+    # ==========================================================
+
+    host_dir = host_checkpoint_dir(
+        model_path
+    )
+
+    if not host_dir.exists():
+        raise FileNotFoundError(
+            "恢复 Two-Level checkpoint 时找不到 "
+            "Local Host SAC checkpoint 目录："
+            f"{host_dir}"
+        )
+
+    if not host_dir.is_dir():
+        raise FileNotFoundError(
+            "Local Host SAC checkpoint 路径不是目录："
+            f"{host_dir}"
+        )
+
+    # ==========================================================
+    # 3. 在加载任何模型参数以前，
+    #    先检查所有 DC 的 Host checkpoint 是否完整。
+    #
+    # 不能出现：
+    #
+    #   Routing 已经 load
+    #       ↓
+    #   DC3 Host checkpoint 不存在
+    #       ↓
+    #   当前进程模型进入“半恢复”状态
+    #
+    # 因此这里首先只检查文件，不修改模型。
+    # ==========================================================
+
+    expected_host_paths: Dict[
+        str,
+        Path,
+    ] = {}
+
+    for dc_id in host_sac_agents.keys():
+
+        dc_id = str(
+            dc_id
+        )
+
+        host_path = (
+            host_dir
+            / f"{dc_id}.pt"
+        )
+
+        expected_host_paths[
+            dc_id
+        ] = host_path
+
+        if not host_path.exists():
+            raise FileNotFoundError(
+                "缺少 Local Host SAC checkpoint："
+                f"dc={dc_id}, "
+                f"path={host_path}"
+            )
+
+        if not host_path.is_file():
+            raise FileNotFoundError(
+                "Local Host SAC checkpoint "
+                "不是有效文件："
+                f"dc={dc_id}, "
+                f"path={host_path}"
+            )
+
+    # ==========================================================
+    # 4. Trainer Metadata
+    #
+    # 新 checkpoint 中：
+    #
+    #   *.trainer.json
+    #
+    # 不再是“可有可无”的辅助文件，
+    # 而是整个 Two-Level checkpoint 的结构声明与
+    # 完整写入标志。
+    #
+    # 因此缺少它时必须 fail-fast。
+    # ==========================================================
+
+    state_path = (
+        checkpoint_state_path(
+            model_path
+        )
+    )
+
+    if not state_path.exists():
+        raise FileNotFoundError(
+            "Two-Level checkpoint 缺少必要的 "
+            "trainer metadata："
+            f"{state_path}"
+        )
+
+    if not state_path.is_file():
+        raise FileNotFoundError(
+            "Trainer metadata 不是有效文件："
+            f"{state_path}"
+        )
+
+    # ==========================================================
+    # 5. 读取完整 checkpoint metadata
+    # ==========================================================
+
+    try:
+        checkpoint_metadata = json.loads(
+            state_path.read_text(
+                encoding="utf-8"
+            )
+        )
+    except (
+            json.JSONDecodeError,
+            OSError,
+    ) as exc:
+        raise RuntimeError(
+            "无法读取 Two-Level checkpoint "
+            "trainer metadata："
+            f"{state_path}"
+        ) from exc
+
+    if not isinstance(
+            checkpoint_metadata,
+            dict,
+    ):
+        raise RuntimeError(
+            "Two-Level checkpoint metadata "
+            "根节点必须是 dict："
+            f"{state_path}"
+        )
+
+    # ==========================================================
+    # 6. 验证 checkpoint 的结构身份
+    #
+    # validate_checkpoint_structure_metadata() 应检查：
+    #
+    #   schema_version
+    #   architecture
+    #   cloud_enabled
+    #   edge_dc_ids
+    #   routing_action_target_dc_ids
+    #   Routing observation/state/action dimensions
+    #   num_agents
+    #   host_ids_per_dc
+    #   每个 Host SAC obs_dim/action_dim
+    #
+    # 注意：
+    # 这里仍然没有真正 load_state_dict()。
+    # ==========================================================
+
+    validate_checkpoint_structure_metadata(
+        checkpoint_metadata=(
+            checkpoint_metadata
+        ),
+
+        env=env,
+
+        routing_masac=(
+            routing_masac
+        ),
+
+        host_sac_agents=(
+            host_sac_agents
+        ),
+    )
+
+    # ==========================================================
+    # 7. 检查 saved_training_stage
+    #
+    # 它主要用于：
+    #   - checkpoint provenance；
+    #   - Resume 日志；
+    #   - 判断 checkpoint 是在哪个训练阶段产生的。
+    #
+    # Stage 本身不在这里强制要求与当前 TrainConfig
+    # 完全相同，因为后续可能人为延长 Joint Fine-tune。
+    # ==========================================================
+
+    saved_training_stage_raw = (
+        checkpoint_metadata.get(
+            "saved_training_stage"
+        )
+    )
+
+    if saved_training_stage_raw is None:
+        raise RuntimeError(
+            "Checkpoint metadata 缺少 "
+            "saved_training_stage。"
+        )
+
+    try:
+        saved_training_stage = (
+            TrainingStage(
+                str(
+                    saved_training_stage_raw
+                )
+            )
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "Checkpoint 中存在未知 Training Stage："
+            f"{saved_training_stage_raw!r}"
+        ) from exc
+
+    # ==========================================================
+    # 8. 检查 Training Schedule metadata
+    #
+    # Schedule 主要用于实验追溯。
+    #
+    # 不作为网络结构的硬兼容条件：
+    # 例如可以在已有 checkpoint 基础上延长
+    # JOINT_FINETUNE_EPISODES。
+    #
+    # 如果与当前配置不同，只给出明确警告。
+    # ==========================================================
+
+    saved_training_schedule = (
+        checkpoint_metadata.get(
+            "training_schedule"
+        )
+    )
+
+    if not isinstance(
+            saved_training_schedule,
+            dict,
+    ):
+        raise RuntimeError(
+            "Checkpoint metadata 缺少有效的 "
+            "training_schedule。"
+        )
+
+    current_training_schedule = {
+        "num_episodes": int(
+            train_config.num_episodes
+        ),
+
+        "host_pretrain_episodes": int(
+            train_config
+                .host_pretrain_episodes
+        ),
+
+        "routing_train_episodes": int(
+            train_config
+                .routing_train_episodes
+        ),
+
+        "joint_finetune_episodes": int(
+            train_config
+                .joint_finetune_episodes
+        ),
+    }
+
+    saved_schedule_normalized = {
+        "num_episodes": int(
+            saved_training_schedule.get(
+                "num_episodes",
+                -1,
+            )
+        ),
+
+        "host_pretrain_episodes": int(
+            saved_training_schedule.get(
+                "host_pretrain_episodes",
+                -1,
+            )
+        ),
+
+        "routing_train_episodes": int(
+            saved_training_schedule.get(
+                "routing_train_episodes",
+                -1,
+            )
+        ),
+
+        "joint_finetune_episodes": int(
+            saved_training_schedule.get(
+                "joint_finetune_episodes",
+                -1,
+            )
+        ),
+    }
+
+    if (
+            saved_schedule_normalized
+            != current_training_schedule
+    ):
+        print(
+            "\n"
+            "============================================================\n"
+            "⚠️ Checkpoint Training Schedule 与当前配置不同\n"
+            f"Saved   : {saved_schedule_normalized}\n"
+            f"Current : {current_training_schedule}\n"
+            "\n"
+            "模型结构兼容，因此允许继续恢复；\n"
+            "但请确认这是有意修改三阶段 Episode 配置。\n"
+            "============================================================\n",
+            flush=True,
+        )
+
+    # ==========================================================
+    # 9. Trainer State 必须完整存在
+    # ==========================================================
+
+    trainer_state = (
+        checkpoint_metadata.get(
+            "trainer_state"
+        )
+    )
+
+    if not isinstance(
+            trainer_state,
+            dict,
+    ):
+        raise RuntimeError(
+            "Checkpoint metadata 缺少有效的 "
+            "trainer_state。"
+        )
+
+    required_trainer_fields = {
+        "next_episode",
+        "global_decision_steps",
+        "routing_normal_action_steps",
+        "host_training_action_steps",
+        "best_episode_return",
+    }
+
+    missing_trainer_fields = (
+        required_trainer_fields
+        - set(
+            trainer_state.keys()
+        )
+    )
+
+    if missing_trainer_fields:
+        raise RuntimeError(
+            "Checkpoint trainer_state 缺少必要字段："
+            f"{sorted(missing_trainer_fields)}"
+        )
+
+    # ==========================================================
+    # 10. 先解析 Trainer counters。
+    #
+    # 仍然没有加载模型。
+    #
+    # 目的是保证 metadata 有问题时，
+    # 当前 Routing / Host 网络保持原始初始化状态。
+    # ==========================================================
+
+    start_episode = int(
+        trainer_state[
+            "next_episode"
+        ]
+    )
+
+    global_decision_steps = int(
+        trainer_state[
+            "global_decision_steps"
+        ]
+    )
+
+    routing_normal_action_steps = int(
+        trainer_state[
+            "routing_normal_action_steps"
+        ]
+    )
+
+    best_episode_return = float(
+        trainer_state[
+            "best_episode_return"
+        ]
+    )
+
+    # ==========================================================
+    # next_episode 合法性检查
+    #
+    # num_episodes + 1 是允许的：
+    #
+    #   例如加载已经完成 Episode 1000 的 final checkpoint，
+    #   next_episode 可以为 1001。
+    # ==========================================================
+
+    if start_episode < 1:
+        raise RuntimeError(
+            "Checkpoint next_episode 非法："
+            f"{start_episode}"
+        )
+
+    if (
+            start_episode
+            > int(
+                train_config.num_episodes
+            ) + 1
+    ):
+        raise RuntimeError(
+            "Checkpoint next_episode 超出当前训练范围："
+            f"next_episode={start_episode}, "
+            f"num_episodes="
+            f"{train_config.num_episodes}"
+        )
+
+    if global_decision_steps < 0:
+        raise RuntimeError(
+            "Checkpoint global_decision_steps "
+            "不能为负数："
+            f"{global_decision_steps}"
+        )
+
+    if routing_normal_action_steps < 0:
+        raise RuntimeError(
+            "Checkpoint routing_normal_action_steps "
+            "不能为负数："
+            f"{routing_normal_action_steps}"
+        )
+
+    # ==========================================================
+    # 11. Host Training Steps
+    #
+    # 每个 DC 的 counter 都必须存在。
+    #
+    # 不能像旧实现一样：
+    #
+    #   missing -> 0
+    #
+    # 因为这样 Resume 后某个 Host SAC 会错误地
+    # 重新进入 random warmup。
+    # ==========================================================
+
+    saved_host_steps = (
+        trainer_state[
+            "host_training_action_steps"
+        ]
+    )
+
+    if not isinstance(
+            saved_host_steps,
+            dict,
+    ):
+        raise RuntimeError(
+            "Checkpoint "
+            "host_training_action_steps "
+            "必须是 dict。"
+        )
+
+    expected_host_dc_ids = {
+        str(dc_id)
+        for dc_id
+        in host_sac_agents.keys()
+    }
+
+    saved_host_dc_ids = {
+        str(dc_id)
+        for dc_id
+        in saved_host_steps.keys()
+    }
+
+    if (
+            saved_host_dc_ids
+            != expected_host_dc_ids
+    ):
+        raise RuntimeError(
+            "Checkpoint Host training counter "
+            "的 DC 集合与当前环境不一致："
+            f"saved="
+            f"{sorted(saved_host_dc_ids)}, "
+            f"current="
+            f"{sorted(expected_host_dc_ids)}"
+        )
+
+    host_training_action_steps: Dict[
+        str,
+        int,
+    ] = {}
+
+    for dc_id in sorted(
+            expected_host_dc_ids
+    ):
+
+        step_count = int(
+            saved_host_steps[
+                dc_id
+            ]
+        )
+
+        if step_count < 0:
+            raise RuntimeError(
+                "Checkpoint Host training step "
+                "不能为负数："
+                f"dc={dc_id}, "
+                f"steps={step_count}"
+            )
+
+        host_training_action_steps[
+            dc_id
+        ] = step_count
+
+    # ==========================================================
+    # 到这里为止：
+    #
+    #   文件完整性
+    #   Metadata
+    #   Schema
+    #   Environment structure
+    #   Routing structure
+    #   Host structure
+    #   Training stage
+    #   Trainer counters
+    #
+    # 已经全部验证成功。
+    #
+    # 从下面开始才允许真正修改当前模型参数。
+    # ==========================================================
+
+    # ==========================================================
+    # 12. 加载 Routing MASAC
     # ==========================================================
 
     routing_masac.load(
@@ -2228,130 +3299,53 @@ def load_two_layer_checkpoint_if_needed(
     )
 
     # ==========================================================
-    # 2. Local Host SAC × DC
+    # 13. 加载全部 Local Host SAC
     # ==========================================================
-
-    host_dir = host_checkpoint_dir(
-        model_path
-    )
-
-    if not host_dir.exists():
-        raise FileNotFoundError(
-            "恢复双层 checkpoint 时找不到 "
-            "Host checkpoint 目录："
-            f"{host_dir}"
-        )
 
     for dc_id, host_agent in (
         host_sac_agents.items()
     ):
 
-        host_path = (
-            host_dir
-            / f"{dc_id}.pt"
+        dc_id = str(
+            dc_id
         )
 
-        if not host_path.exists():
-            raise FileNotFoundError(
-                "缺少 Local Host SAC checkpoint："
-                f"dc={dc_id}, "
-                f"path={host_path}"
-            )
+        host_path = (
+            expected_host_paths[
+                dc_id
+            ]
+        )
 
         host_agent.load(
             host_path,
+
             load_optimizers=True,
         )
 
     # ==========================================================
-    # 3. Trainer State
+    # 14. Resume 成功信息
     # ==========================================================
 
-    state_path = (
-        checkpoint_state_path(
-            model_path
-        )
-    )
-
-    if not state_path.exists():
-
-        print(
-            "已恢复 Routing / Host 模型，"
-            "但没有找到 Trainer 状态文件："
-            f"{state_path}。"
-            "训练计数将从默认值重新开始。"
-        )
-
-        return (
-            1,
-            0,
-            0,
-            default_host_steps,
-            float("-inf"),
-        )
-
-    trainer_state = json.loads(
-        state_path.read_text(
-            encoding="utf-8"
-        )
-    )
-
-    start_episode = int(
-        trainer_state.get(
-            "next_episode",
-            1,
-        )
-    )
-
-    global_decision_steps = int(
-        trainer_state.get(
-            "global_decision_steps",
-            0,
-        )
+    print(
+        "\n"
+        "============================================================\n"
+        "✅ Two-Level H-MASAC checkpoint 恢复成功\n"
+        f"Routing checkpoint : {model_path}\n"
+        f"Host directory     : {host_dir}\n"
+        f"Trainer metadata   : {state_path}\n"
+        f"Saved stage        : {saved_training_stage.value}\n"
+        f"Next episode       : {start_episode}\n"
+        f"Global decisions   : {global_decision_steps}\n"
+        f"Routing steps      : {routing_normal_action_steps}\n"
+        f"Host steps         : {host_training_action_steps}\n"
+        f"Best return        : {best_episode_return}\n"
+        "============================================================\n",
+        flush=True,
     )
 
     # ==========================================================
-    # 新 checkpoint 使用 routing_normal_action_steps。
-    #
-    # 为兼容旧 Routing-only Trainer State，
-    # 同时读取旧 global_normal_action_steps。
+    # 15. 返回 Trainer Resume State
     # ==========================================================
-
-    routing_normal_action_steps = int(
-        trainer_state.get(
-            "routing_normal_action_steps",
-
-            trainer_state.get(
-                "global_normal_action_steps",
-                0,
-            ),
-        )
-    )
-
-    saved_host_steps = (
-        trainer_state.get(
-            "host_training_action_steps",
-            {},
-        )
-    )
-
-    host_training_action_steps = {
-        str(dc_id): int(
-            saved_host_steps.get(
-                str(dc_id),
-                0,
-            )
-        )
-        for dc_id
-        in host_sac_agents.keys()
-    }
-
-    best_episode_return = float(
-        trainer_state.get(
-            "best_episode_return",
-            float("-inf"),
-        )
-    )
 
     return (
         start_episode,
@@ -3216,6 +4210,18 @@ def train(
         host_training_action_steps,
         best_episode_return,
     ) = load_two_layer_checkpoint_if_needed(
+        # ==========================================================
+        # Resume 前需要当前 Environment / TrainConfig，
+        # 用于验证 Cloud、DC、Host、Observation、
+        # Action 以及三阶段训练 metadata。
+        # ==========================================================
+
+        env=env,
+
+        train_config=(
+            train_config
+        ),
+
         routing_masac=(
             routing_masac
         ),
@@ -4113,6 +5119,15 @@ def train(
             )
             ):
                 save_two_layer_checkpoint(
+                    env=env,
+
+                    training_stage=(
+                        training_stage
+                    ),
+
+                    train_config=(
+                        train_config
+                    ),
                     routing_masac=routing_masac,
                     host_sac_agents=host_sac_agents,
 
@@ -4159,6 +5174,15 @@ def train(
                 )
 
                 save_two_layer_checkpoint(
+                    env=env,
+
+                    training_stage=(
+                        training_stage
+                    ),
+
+                    train_config=(
+                        train_config
+                    ),
                     routing_masac=(
                         routing_masac
                     ),
@@ -4194,6 +5218,15 @@ def train(
                 )
             # 断点恢复
             save_two_layer_checkpoint(
+                env=env,
+
+                training_stage=(
+                    training_stage
+                ),
+
+                train_config=(
+                    train_config
+                ),
                 routing_masac=(
                     routing_masac
                 ),
@@ -4235,6 +5268,15 @@ def train(
                     == 0
             ):
                 save_two_layer_checkpoint(
+                    env=env,
+
+                    training_stage=(
+                        training_stage
+                    ),
+
+                    train_config=(
+                        train_config
+                    ),
                     routing_masac=(
                         routing_masac
                     ),
@@ -4276,6 +5318,24 @@ def train(
 
     # 全部 episode 完成后保存 final checkpoint
     save_two_layer_checkpoint(
+        env=env,
+
+        training_stage=(
+            resolve_training_stage(
+                episode=int(
+                    train_config.num_episodes
+                ),
+
+                train_config=(
+                    train_config
+                ),
+            )
+        ),
+
+        train_config=(
+            train_config
+        ),
+
         routing_masac=(
             routing_masac
         ),
@@ -4398,48 +5458,59 @@ def main() -> None:
 
     host_sac_config = (
         HostSACConfig(
-            gamma=conf.GAMMA,
+            # ======================================================
+            # Host SAC 使用完全独立的算法超参数。
+            #
+            # 正常 main() 入口与 train() fallback 必须保持一致，
+            # 防止 Host 又退回旧 Flat-MASAC 公共参数。
+            # ======================================================
 
-            tau=conf.TUA,
+            gamma=(
+                conf.HOST_GAMMA
+            ),
+
+            tau=(
+                conf.HOST_TAU
+            ),
 
             actor_lr=(
-                conf.ACTOR_LR
+                conf.HOST_ACTOR_LR
             ),
 
             critic_lr=(
-                conf.CRITIC_LR
+                conf.HOST_CRITIC_LR
             ),
 
             alpha_lr=(
-                conf.ALPHA_LR
+                conf.HOST_ALPHA_LR
             ),
 
             actor_hidden_dim=(
-                conf.ACTOR_HIDDEN_DIM
+                conf.HOST_ACTOR_HIDDEN_DIM
             ),
 
             critic_hidden_dim=(
-                conf.Q_NET_HIDDEN_DIM
+                conf.HOST_CRITIC_HIDDEN_DIM
             ),
 
             initial_alpha=(
-                conf.INITIAL_ALPHA
+                conf.HOST_INITIAL_ALPHA
             ),
 
             target_entropy_ratio=(
-                conf.TARGET_ENTROPY_RATIO
+                conf.HOST_TARGET_ENTROPY_RATIO
             ),
 
             max_grad_norm=(
-                conf.MAX_GRAD_NORM
+                conf.HOST_MAX_GRAD_NORM
             ),
 
             policy_update_interval=(
-                conf.Policy_Updata_Interval
+                conf.HOST_POLICY_UPDATE_INTERVAL
             ),
 
             target_update_interval=(
-                conf.Target_Update_Interval
+                conf.HOST_TARGET_UPDATE_INTERVAL
             ),
 
             device=(

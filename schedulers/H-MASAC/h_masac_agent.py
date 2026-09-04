@@ -473,6 +473,65 @@ class RoutingMASAC:
             weights_only=False,
         )
 
+        # ==============================================================
+        # Routing checkpoint identity validation
+        #
+        # 禁止：
+        #   - Host checkpoint 错载进 Routing；
+        #   - 不同 Observation 结构；
+        #   - 不同 Routing action space；
+        #   - 不同 Agent 数量
+        #     的 checkpoint 被静默恢复。
+        # ==============================================================
+
+        role = checkpoint.get(
+            "algorithm_role"
+        )
+
+        if (
+                role
+                != "routing_masac_ctde"
+        ):
+            raise RuntimeError(
+                "当前 checkpoint 不是 "
+                "Routing MASAC + CTDE："
+                f"{role!r}"
+            )
+
+        dimension_checks = {
+            "local_obs_dim":
+                self.local_obs_dim,
+
+            "global_state_dim":
+                self.global_state_dim,
+
+            "action_dim":
+                self.action_dim,
+
+            "num_agents":
+                self.num_agents,
+        }
+
+        for field_name, current_value in (
+                dimension_checks.items()
+        ):
+            saved_value = checkpoint.get(
+                field_name
+            )
+
+            if (
+                    saved_value is None
+                    or int(saved_value)
+                    != int(current_value)
+            ):
+                raise RuntimeError(
+                    "Routing checkpoint "
+                    "结构不兼容："
+                    f"field={field_name}, "
+                    f"saved={saved_value}, "
+                    f"current={current_value}"
+                )
+
         # 加载 Actor 参数。
         self.actor.load_state_dict(
             checkpoint["actor_state_dict"]
@@ -1581,8 +1640,7 @@ class LocalHostSAC:
         )
 
         if (
-                role is not None
-                and role
+                role
                 != "local_host_sac"
         ):
             raise RuntimeError(
@@ -1590,6 +1648,41 @@ class LocalHostSAC:
                 "不是 Local Host SAC："
                 f"{role!r}"
             )
+
+        # ==============================================================
+        # Host checkpoint dimension validation
+        #
+        # 每个 DC 的 Host 数可能不同，
+        # 因此 action_dim 必须逐 DC 严格一致。
+        # ==============================================================
+
+        dimension_checks = {
+            "obs_dim":
+                self.obs_dim,
+
+            "action_dim":
+                self.action_dim,
+        }
+
+        for field_name, current_value in (
+                dimension_checks.items()
+        ):
+            saved_value = checkpoint.get(
+                field_name
+            )
+
+            if (
+                    saved_value is None
+                    or int(saved_value)
+                    != int(current_value)
+            ):
+                raise RuntimeError(
+                    "Local Host SAC checkpoint "
+                    "结构不兼容："
+                    f"field={field_name}, "
+                    f"saved={saved_value}, "
+                    f"current={current_value}"
+                )
 
         self.actor.load_state_dict(
             checkpoint[
