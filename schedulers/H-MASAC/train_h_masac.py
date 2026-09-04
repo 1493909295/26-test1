@@ -402,6 +402,88 @@ def resolve_training_stage(
         .JOINT_FINETUNE
     )
 
+def training_stage_start_episode(
+        stage: TrainingStage,
+        train_config: TrainConfig,
+) -> int:
+    """
+    返回某个 Training Stage 的第一个 Episode。
+
+    Episode 使用 1-based 编号：
+        Stage 1: 1
+        Stage 2: HOST_PRETRAIN_EPISODES + 1
+        Stage 3: HOST_PRETRAIN_EPISODES
+                 + ROUTING_TRAIN_EPISODES + 1
+    """
+
+    host_end = int(
+        train_config.host_pretrain_episodes
+    )
+
+    routing_end = (
+        host_end
+        + int(
+            train_config.routing_train_episodes
+        )
+    )
+
+    if stage == TrainingStage.HOST_PRETRAIN:
+        return 1
+
+    if stage == TrainingStage.ROUTING_TRAIN:
+        return host_end + 1
+
+    return routing_end + 1
+
+
+def training_stage_end_episode(
+        stage: TrainingStage,
+        train_config: TrainConfig,
+) -> int:
+    """
+    返回某个 Training Stage 的最后一个 Episode。
+    """
+
+    host_end = int(
+        train_config.host_pretrain_episodes
+    )
+
+    routing_end = (
+        host_end
+        + int(
+            train_config.routing_train_episodes
+        )
+    )
+
+    if stage == TrainingStage.HOST_PRETRAIN:
+        return host_end
+
+    if stage == TrainingStage.ROUTING_TRAIN:
+        return routing_end
+
+    return int(
+        train_config.num_episodes
+    )
+
+
+def training_stage_boundary_checkpoint_name(
+        stage: TrainingStage,
+) -> Optional[str]:
+    """
+    为前两个训练阶段生成固定的阶段结束 checkpoint。
+
+    Stage 3 已经由训练器最终的 final.pt 保存，
+    因此这里不重复保存。
+    """
+
+    if stage == TrainingStage.HOST_PRETRAIN:
+        return "host_pretrain_final.pt"
+
+    if stage == TrainingStage.ROUTING_TRAIN:
+        return "routing_train_final.pt"
+
+    return None
+
 def stage_trains_routing(
         stage: TrainingStage,
 ) -> bool:
@@ -2006,13 +2088,7 @@ def save_two_layer_checkpoint(
 
     best_episode_return: float,
 ) -> None:
-    """
-    保存 Routing MASAC checkpoint 与 Trainer 状态。
 
-    注意：
-    当前函数不保存每个 DC 的 LocalHostSAC。
-    Host checkpoint 将在后续 Host 训练阶段单独处理。
-    """
 
     model_path.parent.mkdir(
         parents=True,
@@ -2022,6 +2098,18 @@ def save_two_layer_checkpoint(
     routing_masac.save(
         model_path
     )
+
+    host_dir = host_checkpoint_dir(model_path)
+
+    host_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    for dc_id, host_agent in host_sac_agents.items():
+        host_agent.save(
+            host_dir / f"{dc_id}.pt"
+        )
 
     trainer_state = {
         "next_episode": int(
@@ -3102,6 +3190,27 @@ def train(
                 )
             )
 
+            if (
+                    episode
+                    == training_stage_start_episode(
+                stage=training_stage,
+                train_config=train_config,
+            )
+            ):
+                best_episode_return = float("-inf")
+
+                print(
+                    "\n"
+                    "============================================================\n"
+                    f"🚦 Training Stage Start: {training_stage.value}\n"
+                    f"Episode Range: "
+                    f"{training_stage_start_episode(training_stage, train_config)}"
+                    f" -> "
+                    f"{training_stage_end_episode(training_stage, train_config)}\n"
+                    "============================================================\n",
+                    flush=True,
+                )
+
             apply_training_stage_modes(
                 stage=(
                     training_stage
@@ -3900,6 +4009,60 @@ def train(
             # 到达日志打印间隔时，在终端输出摘要。
             if episode % int(train_config.log_interval) == 0:
                 print_episode_summary(log_row)
+
+            stage_boundary_checkpoint_name = (
+                training_stage_boundary_checkpoint_name(
+                    training_stage
+                )
+            )
+
+            if (
+                    stage_boundary_checkpoint_name is not None
+                    and episode
+                    == training_stage_end_episode(
+                stage=training_stage,
+                train_config=train_config,
+            )
+            ):
+                save_two_layer_checkpoint(
+                    routing_masac=routing_masac,
+                    host_sac_agents=host_sac_agents,
+
+                    model_path=(
+                            checkpoint_dir
+                            / stage_boundary_checkpoint_name
+                    ),
+
+                    next_episode=(
+                            episode + 1
+                    ),
+
+                    global_decision_steps=(
+                        global_decision_steps
+                    ),
+
+                    routing_normal_action_steps=(
+                        routing_normal_action_steps
+                    ),
+
+                    host_training_action_steps=(
+                        host_training_action_steps
+                    ),
+
+                    best_episode_return=(
+                        best_episode_return
+                    ),
+                )
+
+                print(
+                    "\n"
+                    "============================================================\n"
+                    f"✅ Training Stage Finished: {training_stage.value}\n"
+                    f"Checkpoint: "
+                    f"{checkpoint_dir / stage_boundary_checkpoint_name}\n"
+                    "============================================================\n",
+                    flush=True,
+                )
 
             # 当前 episode return 高于历史最佳值时保存 best checkpoint
             if stats.episode_return > best_episode_return:
