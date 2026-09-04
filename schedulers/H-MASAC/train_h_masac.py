@@ -2071,8 +2071,12 @@ def print_episode_summary(row: Dict[str, Any]) -> None:
     # MASAC 本身训练状态。
     print(
         f"  MASAC  | "
-        f"buffer={int(row['replay_trainable_size']):7d} | "
-        f"updates={int(row['episode_updates']):5d} | "
+        f"routing_buffer="
+        f"{int(row['routing_replay_trainable_size']):7d} | "
+        f"host_buffer="
+        f"{int(row['host_replay_size_total']):7d} | "
+        f"updates="
+        f"{int(row['episode_updates']):5d} | "
         f"critic_loss={critic_loss_text} | "
         f"alpha={float(row['alpha']):.5f}"
     )
@@ -2588,9 +2592,7 @@ def train(
 
                         stats=stats,
 
-                        train_config=(
-                            train_config
-                        ),
+
                     )
 
                     # Host action 后之前缓存的 Routing snapshot 已失效。
@@ -2726,9 +2728,7 @@ def train(
 
                     stats=stats,
 
-                    train_config=(
-                        train_config
-                    ),
+
                 )
 
                 # 增加计数
