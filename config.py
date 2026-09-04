@@ -52,6 +52,36 @@ TARGET_ENTROPY_RATIO = 0.2  # 随机性保留
 MAX_GRAD_NORM = 3.0         # 梯度裁剪阈值
 Policy_Updata_Interval = 2  # Actor 相对 Critic 的更新频率
 Target_Update_Interval = 1  # Target Critic 更新频率
+
+ROUTING_ACTOR_HIDDEN_DIM = 256
+ROUTING_CRITIC_HIDDEN_DIM = 256
+ROUTING_ACTOR_GAIN = 0.01
+ROUTING_CRITIC_GAIN = 0.01
+ROUTING_GAMMA = 0.99
+ROUTING_TAU = 0.005
+ROUTING_ACTOR_LR = 1e-4
+ROUTING_CRITIC_LR = 2e-4
+ROUTING_ALPHA_LR = 1e-4
+ROUTING_INITIAL_ALPHA = 0.1
+ROUTING_TARGET_ENTROPY_RATIO = 0.2
+ROUTING_MAX_GRAD_NORM = 3.0
+ROUTING_POLICY_UPDATE_INTERVAL = 2
+ROUTING_TARGET_UPDATE_INTERVAL = 1
+
+HOST_ACTOR_HIDDEN_DIM = 256
+HOST_CRITIC_HIDDEN_DIM = 256
+HOST_ACTOR_GAIN = 0.01
+HOST_CRITIC_GAIN = 0.01
+HOST_GAMMA = 0.99
+HOST_TAU = 0.005
+HOST_ACTOR_LR = 1e-4
+HOST_CRITIC_LR = 2e-4
+HOST_ALPHA_LR = 1e-4
+HOST_INITIAL_ALPHA = 0.1
+HOST_TARGET_ENTROPY_RATIO = 0.2
+HOST_MAX_GRAD_NORM = 3.0
+HOST_POLICY_UPDATE_INTERVAL = 2
+HOST_TARGET_UPDATE_INTERVAL = 1
 DEVICE = "cuda:0"
 
 
@@ -67,11 +97,21 @@ Random_warmup_step = 5000           # 前期随机预热启动
 Learning_Starts = 5000          # 至少积累多少个普通动作后再开始更新网络
 Train_Every = 4                 # 收集多少经验训一次网络
 Updates_Per_Train = 2            # 每条经验最多执行多少次网络更新
-HOST_BATCH_SIZE = Batch_Size        # host采样批量
-HOST_RANDOM_WARMUP_STEPS = (Random_warmup_step)     # host前期随机预热启动
-HOST_LEARNING_STARTS = (Learning_Starts)        # host至少积累多少个普通动作后再开始更新网络
-HOST_TRAIN_EVERY = (Train_Every)        # host收集多少经验训一次网络
-HOST_UPDATES_PER_TRAIN = (Updates_Per_Train)        # host每条经验最多执行多少次网络更新
+
+ROUTING_REPLAY_CAPACITY = 200000
+ROUTING_BATCH_SIZE = 512
+ROUTING_RANDOM_WARMUP_STEPS = 5000
+ROUTING_LEARNING_STARTS = 5000
+ROUTING_TRAIN_EVERY = 4
+ROUTING_UPDATES_PER_TRAIN = 2
+
+HOST_REPLAY_CAPACITY = 200000
+HOST_BATCH_SIZE = 512
+HOST_RANDOM_WARMUP_STEPS = 5000
+HOST_LEARNING_STARTS = 5000
+HOST_TRAIN_EVERY = 4
+HOST_UPDATES_PER_TRAIN = 2
+
 Log_interval = 1            # 每多少episode打印一次统计信息
 Checkpoint_Interval = 100        # 每多少个episode保存一次带编号的checkpoint
 Checkpoint_Dir = "model/H-MASAC/checkpoints"

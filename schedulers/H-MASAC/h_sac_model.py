@@ -68,7 +68,7 @@ class RoutingDiscreteActor(nn.Module):
             local_obs_dim: int,
             action_dim: int,
             num_agents: int,
-            hidden_dim: int = conf.ACTOR_HIDDEN_DIM,
+            hidden_dim: int = conf.ROUTING_ACTOR_HIDDEN_DIM,
     ) -> None:
         super().__init__()
 
@@ -91,7 +91,7 @@ class RoutingDiscreteActor(nn.Module):
 
         initialize_linear_layer(self.fc1, gain=nn.init.calculate_gain("relu"))
         initialize_linear_layer(self.fc2, gain=nn.init.calculate_gain("relu"))
-        initialize_linear_layer(self.output_layer, gain=conf.ACTOR_GAIN)
+        initialize_linear_layer(self.output_layer, gain=conf.ROUTING_ACTOR_GAIN,)
 
     # 根据局部观测和智能体编号计算原始 logits
     # 在共享参数的actor中，每次actor收到的应该是局部观察+智能体编号的拼接
@@ -231,7 +231,7 @@ class RoutingDiscreteQNetwork(nn.Module):
             global_state_dim: int,
             action_dim: int,
             num_agents: int,
-            hidden_dim: int = conf.Q_NET_HIDDEN_DIM,
+            hidden_dim: int = conf.ROUTING_CRITIC_HIDDEN_DIM,
     ) -> None:
         super().__init__()
 
@@ -310,7 +310,7 @@ class RoutingDiscreteQNetwork(nn.Module):
 
         initialize_linear_layer(
             self.output_layer,
-            gain=conf.Q_NET_GAIN,
+            gain=conf.ROUTING_CRITIC_GAIN,
         )
 
     def forward(
@@ -386,7 +386,7 @@ class RoutingTwinDiscreteCritic(nn.Module):
             global_state_dim: int,
             action_dim: int,
             num_agents: int,
-            hidden_dim: int = conf.Q_NET_HIDDEN_DIM,
+            hidden_dim: int = conf.ROUTING_CRITIC_HIDDEN_DIM,
     ) -> None:
         super().__init__()
 
@@ -514,7 +514,7 @@ class LocalHostDiscreteActor(nn.Module):
             self,
             obs_dim: int,
             action_dim: int,
-            hidden_dim: int = conf.ACTOR_HIDDEN_DIM,
+            hidden_dim: int = conf.HOST_ACTOR_HIDDEN_DIM,
     ) -> None:
         super().__init__()
 
@@ -549,7 +549,7 @@ class LocalHostDiscreteActor(nn.Module):
 
         initialize_linear_layer(
             self.output_layer,
-            gain=conf.ACTOR_GAIN,
+            gain=conf.HOST_ACTOR_GAIN,
         )
 
     def forward(
@@ -608,7 +608,7 @@ class LocalHostQNetwork(nn.Module):
             self,
             obs_dim: int,
             action_dim: int,
-            hidden_dim: int = conf.Q_NET_HIDDEN_DIM,
+            hidden_dim: int = conf.HOST_CRITIC_HIDDEN_DIM,
     ) -> None:
         super().__init__()
 
@@ -674,7 +674,7 @@ class LocalHostTwinCritic(nn.Module):
             self,
             obs_dim: int,
             action_dim: int,
-            hidden_dim: int = conf.Q_NET_HIDDEN_DIM,
+            hidden_dim: int = conf.HOST_CRITIC_HIDDEN_DIM,
     ) -> None:
         super().__init__()
 

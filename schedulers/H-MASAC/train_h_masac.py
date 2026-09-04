@@ -74,11 +74,11 @@ class TrainConfig:
     # ==========================================================
 
     routing_replay_capacity: int = (
-        conf.ReplyBuffer_Capacity
+        conf.ROUTING_REPLAY_CAPACITY
     )
 
     host_replay_capacity: int = (
-        conf.ReplyBuffer_Capacity
+        conf.HOST_REPLAY_CAPACITY
     )
 
     # ==========================================================
@@ -86,23 +86,23 @@ class TrainConfig:
     # ==========================================================
 
     routing_batch_size: int = (
-        conf.Batch_Size
+        conf.ROUTING_BATCH_SIZE
     )
 
     routing_random_warmup_steps: int = (
-        conf.Random_warmup_step
+        conf.ROUTING_RANDOM_WARMUP_STEPS
     )
 
     routing_learning_starts: int = (
-        conf.Learning_Starts
+        conf.ROUTING_LEARNING_STARTS
     )
 
     routing_train_every: int = (
-        conf.Train_Every
+        conf.ROUTING_TRAIN_EVERY
     )
 
     routing_updates_per_train: int = (
-        conf.Updates_Per_Train
+        conf.ROUTING_UPDATES_PER_TRAIN
     )
 
     # ==========================================================
@@ -2843,41 +2843,69 @@ def train(
         dc_id = str(dc_id)
 
         if host_sac_config is None:
+            # ==========================================================
+            # Local Host SAC fallback configuration
+            #
+            # 即使 train() 被其他入口直接调用，
+            # 没有显式传入 HostSACConfig，
+            # 也必须使用 HOST_* 专属参数。
+            #
+            # 禁止退回 Flat-MASAC / Routing 公共超参数。
+            # ==========================================================
+
             host_sac_config = (
                 HostSACConfig(
+                    gamma=(
+                        conf.HOST_GAMMA
+                    ),
+
+                    tau=(
+                        conf.HOST_TAU
+                    ),
+
                     actor_lr=(
-                        conf.ACTOR_LR
+                        conf.HOST_ACTOR_LR
                     ),
 
                     critic_lr=(
-                        conf.CRITIC_LR
+                        conf.HOST_CRITIC_LR
                     ),
 
                     alpha_lr=(
-                        conf.ALPHA_LR
+                        conf.HOST_ALPHA_LR
                     ),
 
                     actor_hidden_dim=(
-                        conf.ACTOR_HIDDEN_DIM
+                        conf.HOST_ACTOR_HIDDEN_DIM
                     ),
 
                     critic_hidden_dim=(
-                        conf.Q_NET_HIDDEN_DIM
+                        conf.HOST_CRITIC_HIDDEN_DIM
                     ),
 
                     initial_alpha=(
-                        conf.INITIAL_ALPHA
+                        conf.HOST_INITIAL_ALPHA
                     ),
 
                     target_entropy_ratio=(
-                        conf.TARGET_ENTROPY_RATIO
+                        conf.HOST_TARGET_ENTROPY_RATIO
                     ),
 
                     max_grad_norm=(
-                        conf.MAX_GRAD_NORM
+                        conf.HOST_MAX_GRAD_NORM
                     ),
 
-                    device=conf.DEVICE,
+                    policy_update_interval=(
+                        conf.HOST_POLICY_UPDATE_INTERVAL
+                    ),
+
+                    target_update_interval=(
+                        conf.HOST_TARGET_UPDATE_INTERVAL
+                    ),
+
+                    device=(
+                        conf.DEVICE
+                    ),
 
                     seed=int(
                         train_config.seed
@@ -3082,13 +3110,74 @@ def train(
     # ==============================================================
 
     if routing_masac_config is None:
+        # ==========================================================
+        # Routing MASAC fallback configuration
+        #
+        # config.py 是 H-MASAC 实验的统一参数入口。
+        # 即使 train() 被直接调用，
+        # Routing 也必须继续使用 ROUTING_* 配置。
+        # ==========================================================
+
         routing_masac_config = (
             RoutingMASACConfig(
+                gamma=(
+                    conf.ROUTING_GAMMA
+                ),
+
+                tau=(
+                    conf.ROUTING_TAU
+                ),
+
+                actor_lr=(
+                    conf.ROUTING_ACTOR_LR
+                ),
+
+                critic_lr=(
+                    conf.ROUTING_CRITIC_LR
+                ),
+
+                alpha_lr=(
+                    conf.ROUTING_ALPHA_LR
+                ),
+
+                actor_hidden_dim=(
+                    conf.ROUTING_ACTOR_HIDDEN_DIM
+                ),
+
+                critic_hidden_dim=(
+                    conf.ROUTING_CRITIC_HIDDEN_DIM
+                ),
+
+                initial_alpha=(
+                    conf.ROUTING_INITIAL_ALPHA
+                ),
+
+                target_entropy_ratio=(
+                    conf.ROUTING_TARGET_ENTROPY_RATIO
+                ),
+
+                max_grad_norm=(
+                    conf.ROUTING_MAX_GRAD_NORM
+                ),
+
+                policy_update_interval=(
+                    conf.ROUTING_POLICY_UPDATE_INTERVAL
+                ),
+
+                target_update_interval=(
+                    conf.ROUTING_TARGET_UPDATE_INTERVAL
+                ),
+
+                device=(
+                    conf.DEVICE
+                ),
+
                 seed=int(
                     train_config.seed
-                )
+                ),
             )
         )
+
 
     routing_masac = RoutingMASAC(
         # Routing Actor local input
@@ -3631,10 +3720,9 @@ def train(
                                 )
                             )
 
-                            # 后面把该 block 记录到 Host 独立日志统计。global_normal_action_steps                    # Host action 后之前缓存的 Routing snapshot 已失效。
                     decision = None
 
-                    # 当前第十四步不创建 Host Replay Transition。
+
                     continue
 
                 # ==========================================================
@@ -4233,30 +4321,30 @@ def train(
 def main() -> None:
     train_config = TrainConfig(
         num_episodes=conf.Episodes,
-        routing_replay_capacity=(conf.ReplyBuffer_Capacity),
-        host_replay_capacity=(conf.ReplyBuffer_Capacity),
+        routing_replay_capacity=(conf.ROUTING_REPLAY_CAPACITY),
+        host_replay_capacity=(conf.HOST_REPLAY_CAPACITY),
         # ==========================================================
         # Routing MASAC Training Schedule
         # ==========================================================
 
         routing_batch_size=(
-            conf.Batch_Size
+            conf.ROUTING_BATCH_SIZE
         ),
 
         routing_random_warmup_steps=(
-            conf.Random_warmup_step
+            conf.ROUTING_RANDOM_WARMUP_STEPS
         ),
 
         routing_learning_starts=(
-            conf.Learning_Starts
+            conf.ROUTING_LEARNING_STARTS
         ),
 
         routing_train_every=(
-            conf.Train_Every
+            conf.ROUTING_TRAIN_EVERY
         ),
 
         routing_updates_per_train=(
-            conf.Updates_Per_Train
+            conf.ROUTING_UPDATES_PER_TRAIN
         ),
 
         # ==========================================================
@@ -4366,52 +4454,61 @@ def main() -> None:
 
     routing_masac_config = (
         RoutingMASACConfig(
-            gamma=conf.GAMMA,
-            tau=conf.TUA,
+            gamma=(
+                conf.ROUTING_GAMMA
+            ),
+
+            tau=(
+                conf.ROUTING_TAU
+            ),
 
             actor_lr=(
-                conf.ACTOR_LR
+                conf.ROUTING_ACTOR_LR
             ),
 
             critic_lr=(
-                conf.CRITIC_LR
+                conf.ROUTING_CRITIC_LR
             ),
 
             alpha_lr=(
-                conf.ALPHA_LR
+                conf.ROUTING_ALPHA_LR
             ),
 
             actor_hidden_dim=(
-                conf.ACTOR_HIDDEN_DIM
+                conf.ROUTING_ACTOR_HIDDEN_DIM
             ),
 
             critic_hidden_dim=(
-                conf.Q_NET_HIDDEN_DIM
+                conf.ROUTING_CRITIC_HIDDEN_DIM
             ),
 
             initial_alpha=(
-                conf.INITIAL_ALPHA
+                conf.ROUTING_INITIAL_ALPHA
             ),
 
             target_entropy_ratio=(
-                conf.TARGET_ENTROPY_RATIO
+                conf.ROUTING_TARGET_ENTROPY_RATIO
             ),
 
             max_grad_norm=(
-                conf.MAX_GRAD_NORM
+                conf.ROUTING_MAX_GRAD_NORM
             ),
 
             policy_update_interval=(
-                conf.Policy_Updata_Interval
+                conf.ROUTING_POLICY_UPDATE_INTERVAL
             ),
 
             target_update_interval=(
-                conf.Target_Update_Interval
+                conf.ROUTING_TARGET_UPDATE_INTERVAL
             ),
 
-            device=conf.DEVICE,
+            device=(
+                conf.DEVICE
+            ),
 
-            seed=conf.Seed,
+            seed=(
+                conf.Seed
+            ),
         )
     )
 
