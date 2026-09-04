@@ -10,26 +10,40 @@ from torch.nn import functional as F
 from h_sac_model import (RoutingDiscreteActor, RoutingTwinDiscreteCritic,hard_update,soft_update,  LocalHostDiscreteActor,LocalHostTwinCritic,)
 from routing_replay_buffer import (RoutingReplayBatch,RoutingReplayBuffer,)
 
+__all__ = (
+    # Routing MASAC
+    "RoutingMASACConfig",
+    "RoutingMASAC",
+
+    # Independent Local Host SAC
+    "HostSACConfig",
+    "LocalHostSAC",
+)
+
 
 # 超参数配置
 @dataclass(frozen=True)
-class MASACConfig:
-    gamma: float = 0.99     # gamma 通常位于 [0,1]
-    tau: float = 0.005      # tau 必须位于 (0,1]
+@dataclass(frozen=True)
+class RoutingMASACConfig:
+    gamma: float = 0.99
+    tau: float = 0.005
+
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
+
     actor_hidden_dim: int = 256
     critic_hidden_dim: int = 256
-    initial_alpha: float = 0.1      # alpha 初始值必须大于 0
-    # 目标熵比例
-    target_entropy_ratio: float = 0.2      # 目标熵比例建议在 [0,1]
-    # 梯度裁剪上限，None表示不裁剪
-    max_grad_norm: Optional[float] = 10.0       # 梯度裁剪上限如果存在，必须大于 0
-    policy_update_interval: int = 1     # 更新间隔必须是正整数
+
+    initial_alpha: float = 0.1
+    target_entropy_ratio: float = 0.2
+
+    max_grad_norm: Optional[float] = 10.0
+
+    policy_update_interval: int = 1
     target_update_interval: int = 1
+
     device: Optional[str] = None
-    # 宇宙的终极答案是42
     seed: int = 42
 
 @dataclass(frozen=True)
@@ -54,30 +68,40 @@ class HostSACConfig:
 
 # 把 ReplayBatch 中 NumPy 数组转换后的张量
 @dataclass(frozen=True)
-class TensorBatch:
+class RoutingTensorBatch:
     agent_indices: torch.Tensor
+
+    # Routing Actor input
     local_obs: torch.Tensor
+
+    # CTDE Routing Critic input
     global_states: torch.Tensor
-    # action_masks: torch.Tensor
+
     actions: torch.Tensor
     rewards: torch.Tensor
+
     next_agent_indices: torch.Tensor
     next_local_obs: torch.Tensor
     next_global_states: torch.Tensor
-    # next_action_masks: torch.Tensor
+
     terminated: torch.Tensor
     truncated: torch.Tensor
     done: torch.Tensor
+
+    # 当前 RoutingReplayBuffer 已不保存 forced transition，
+    # 暂时保留该字段以兼容现有训练检查接口。
     is_forced_action: torch.Tensor
 
-class DiscreteMASAC:
+class RoutingMASAC:
     def __init__(
-        self,
-        local_obs_dim: int,
-        global_state_dim: int,
-        action_dim: int,
-        num_agents: int,
-        config: Optional[MASACConfig] = None,
+            self,
+            local_obs_dim: int,
+            global_state_dim: int,
+            action_dim: int,
+            num_agents: int,
+            config: Optional[
+                RoutingMASACConfig
+            ] = None,
     ) -> None:
 
         local_obs_dim = int(local_obs_dim)
@@ -87,7 +111,7 @@ class DiscreteMASAC:
 
         # 未传入配置时创建默认配置
         if config is None:
-            config = MASACConfig()
+            config = RoutingMASACConfig()
         self.config = config
 
         self.local_obs_dim = local_obs_dim
@@ -95,7 +119,9 @@ class DiscreteMASAC:
         self.action_dim = action_dim
         self.num_agents = num_agents
 
-        self.device = self._resolve_device(config.device)
+        self.device = resolve_training_device(
+            config.device
+        )
 
         # 若用户提供随机种子，则设置 PyTorch 随机种子
         if config.seed is not None:
@@ -363,19 +389,46 @@ class DiscreteMASAC:
         )
 
         checkpoint = {
+            # ======================================================
+            # Algorithm identity
+            #
+            # 防止以后把 Host SAC checkpoint
+            # 错误加载到 Routing MASAC。
+            # ======================================================
+            "algorithm_role": "routing_masac_ctde",
+
             "local_obs_dim": self.local_obs_dim,
             "global_state_dim": self.global_state_dim,
             "action_dim": self.action_dim,
             "num_agents": self.num_agents,
-            "config": asdict(self.config),
-            "actor_state_dict": self.actor.state_dict(),
-            "critic_state_dict": self.critic.state_dict(),
-            "target_critic_state_dict": self.target_critic.state_dict(),
-            "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
-            "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
-            "alpha_optimizer_state_dict": self.alpha_optimizer.state_dict(),
-            "log_alpha": self.log_alpha.detach().cpu(),
-            "update_step": self.update_step,
+
+            "config": asdict(
+                self.config
+            ),
+
+            "actor_state_dict":
+                self.actor.state_dict(),
+
+            "critic_state_dict":
+                self.critic.state_dict(),
+
+            "target_critic_state_dict":
+                self.target_critic.state_dict(),
+
+            "actor_optimizer_state_dict":
+                self.actor_optimizer.state_dict(),
+
+            "critic_optimizer_state_dict":
+                self.critic_optimizer.state_dict(),
+
+            "alpha_optimizer_state_dict":
+                self.alpha_optimizer.state_dict(),
+
+            "log_alpha":
+                self.log_alpha.detach().cpu(),
+
+            "update_step":
+                self.update_step,
         }
 
         torch.save(checkpoint, file_path,)
@@ -441,68 +494,24 @@ class DiscreteMASAC:
         self.critic.eval()
         self.target_critic.eval()
 
+    # ==============================================================
+    # Common Device Resolver
+    #
+    # RoutingMASAC 和 LocalHostSAC 都需要设备选择，
+    # 但 Host SAC 不应该依赖 RoutingMASAC 类。
+    #
+    # 因此设备解析作为 module-level utility。
+    # ==============================================================
+
+
     ##################### 辅助函数 ######################
-    # 根据配置选择 pytorch 设备
-    @staticmethod
-    def _resolve_device(configured_device: Optional[str],) -> torch.device:
-        # if configured_device is not None:
-        #     return torch.device(
-        #         configured_device
-        #     )
-        # if torch.cuda.is_available():
-        #     return torch.device("cuda")
-        # return torch.device("cpu")
 
-        # 没有显式指定设备时，默认选择第一张GPU。
-        device_name = (
-            "cuda:0"
-            if configured_device is None
-            else str(configured_device)
-        )
-
-        # 禁止设置为cpu，防止意外使用CPU训练。
-        if not device_name.startswith("cuda"):
-            raise ValueError(
-                f"当前项目要求只使用GPU训练，"
-                f"但配置的设备是：{device_name}"
-            )
-
-        # 检查当前PyTorch是否能够访问CUDA。
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "CUDA不可用，程序拒绝退回CPU训练。\n"
-                "请检查：\n"
-                "1. 是否安装了NVIDIA显卡驱动；\n"
-                "2. 当前环境是否安装了CUDA版PyTorch；\n"
-                "3. 运行程序时是否使用了正确的Conda环境。"
-            )
-
-        # 构造PyTorch设备对象。
-        device = torch.device(device_name)
-
-        # cuda没有显式编号时，默认使用第0张GPU。
-        gpu_index = (
-            0
-            if device.index is None
-            else int(device.index)
-        )
-
-        # 检查GPU编号是否存在。
-        gpu_count = torch.cuda.device_count()
-
-        if gpu_index >= gpu_count:
-            raise RuntimeError(
-                f"指定了GPU编号 {gpu_index}，"
-                f"但PyTorch只检测到 {gpu_count} 张GPU。"
-            )
-
-        return device
 
     # 把 ReplayBatch 中的 NumPy 数组转换成张量
     def _batch_to_tensors(
             self,
             batch: RoutingReplayBatch,
-    ) -> TensorBatch:
+    ) -> RoutingTensorBatch:
 
         agent_indices = torch.as_tensor(
             batch.agent_indices,
@@ -575,7 +584,7 @@ class DiscreteMASAC:
             device=self.device,
         )
 
-        return TensorBatch(
+        return RoutingTensorBatch(
             agent_indices=agent_indices,
             local_obs=local_obs,
             global_states=global_states,
@@ -593,7 +602,7 @@ class DiscreteMASAC:
         )
 
     # 更新在线双Q net
-    def _update_critic(self, batch: TensorBatch,) -> Dict[str, float]:
+    def _update_critic(self, batch: RoutingTensorBatch) -> Dict[str, float]:
 
         # 使用目标网络计算TD目标作为监督标签使用
         with torch.no_grad():
@@ -711,7 +720,7 @@ class DiscreteMASAC:
         }
 
     # 更新actor
-    def _update_actor(self, batch: TensorBatch,) -> Dict[str, float]:
+    def _update_actor(self, batch: RoutingTensorBatch,) -> Dict[str, float]:
 
         # 计算当前局部观测下所有普通动作的概率和 log 概率。
         action_probs, action_log_probs, _ = (
@@ -779,7 +788,7 @@ class DiscreteMASAC:
         }
 
     # 更新温度系数alpha
-    def _update_alpha(self, batch: TensorBatch,) -> Dict[str, float]:
+    def _update_alpha(self, batch: RoutingTensorBatch,) -> Dict[str, float]:
 
         # alpha 更新时不需要更新 Actor，因此不记录 Actor 计算图。
         with torch.no_grad():
@@ -893,7 +902,7 @@ class LocalHostSAC:
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
 
-        self.device = DiscreteMASAC._resolve_device(
+        self.device = resolve_training_device(
             config.device
         )
 
@@ -1000,3 +1009,68 @@ class LocalHostSAC:
         return int(
             action_tensor.item()
         )
+
+
+
+# ==============================================================
+# Common Device Resolver
+#
+# RoutingMASAC 和 LocalHostSAC 都需要设备选择，
+# 但 Host SAC 不应该依赖 RoutingMASAC 类。
+#
+# 因此设备解析作为 module-level utility。
+# ==============================================================
+
+def resolve_training_device(
+        configured_device: Optional[str],
+) -> torch.device:
+
+    device_name = (
+        "cuda:0"
+        if configured_device is None
+        else str(
+            configured_device
+        )
+    )
+
+    # 当前项目要求 GPU-only training。
+    if not device_name.startswith(
+        "cuda"
+    ):
+        raise ValueError(
+            "当前项目要求只使用 GPU 训练，"
+            f"但配置的设备是：{device_name}"
+        )
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA 不可用，程序拒绝退回 CPU 训练。\n"
+            "请检查：\n"
+            "1. NVIDIA 驱动；\n"
+            "2. CUDA 版 PyTorch；\n"
+            "3. 当前 Conda / Python 环境。"
+        )
+
+    device = torch.device(
+        device_name
+    )
+
+    gpu_index = (
+        0
+        if device.index is None
+        else int(
+            device.index
+        )
+    )
+
+    gpu_count = (
+        torch.cuda.device_count()
+    )
+
+    if gpu_index >= gpu_count:
+        raise RuntimeError(
+            f"指定了 GPU 编号 {gpu_index}，"
+            f"但 PyTorch 只检测到 {gpu_count} 张 GPU。"
+        )
+
+    return device

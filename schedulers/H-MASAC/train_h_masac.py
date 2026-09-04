@@ -24,7 +24,13 @@ if str(H_MASAC_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from h_masac_agent import (DiscreteMASAC,MASACConfig,LocalHostSAC,HostSACConfig,)
+from h_masac_agent import (
+    RoutingMASAC,
+    RoutingMASACConfig,
+
+    LocalHostSAC,
+    HostSACConfig,
+)
 from routing_replay_buffer import (RoutingReplayBuffer,)
 from host_replay_buffer import (HostReplayBuffer,)
 from pending_job_trace import (PendingJobTraceStore, FinalizedJobTrace,)
@@ -1592,23 +1598,55 @@ def checkpoint_state_path(model_path: Path) -> Path:
     return model_path.with_suffix(".trainer.json")
 
 # 同时保存 MASAC 模型和训练主循环状态
-def save_checkpoint(
-    masac: DiscreteMASAC,
+def save_routing_checkpoint(
+    routing_masac: RoutingMASAC,
     model_path: Path,
     next_episode: int,
     global_decision_steps: int,
     global_normal_action_steps: int,
     best_episode_return: float,
 ) -> None:
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    masac.save(model_path)
+    """
+    保存 Routing MASAC checkpoint 与 Trainer 状态。
+
+    注意：
+    当前函数不保存每个 DC 的 LocalHostSAC。
+    Host checkpoint 将在后续 Host 训练阶段单独处理。
+    """
+
+    model_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    routing_masac.save(
+        model_path
+    )
+
     trainer_state = {
-        "next_episode": int(next_episode),
-        "global_decision_steps": int(global_decision_steps),
-        "global_normal_action_steps": int(global_normal_action_steps),
-        "best_episode_return": float(best_episode_return),
+        "next_episode": int(
+            next_episode
+        ),
+
+        "global_decision_steps": int(
+            global_decision_steps
+        ),
+
+        "global_normal_action_steps": int(
+            global_normal_action_steps
+        ),
+
+        "best_episode_return": float(
+            best_episode_return
+        ),
     }
-    state_path = checkpoint_state_path(model_path)
+
+    state_path = (
+        checkpoint_state_path(
+            model_path
+        )
+    )
+
     state_path.write_text(
         json.dumps(
             trainer_state,
@@ -1619,8 +1657,8 @@ def save_checkpoint(
     )
 
 # 按需恢复模型和训练器状态
-def load_checkpoint_if_needed(
-    masac: DiscreteMASAC,
+def load_routing_checkpoint_if_needed(
+    routing_masac: RoutingMASAC,
     resume_checkpoint: Optional[str],
 ) -> Tuple[int, int, int, float]:
 
@@ -1629,7 +1667,7 @@ def load_checkpoint_if_needed(
         return 1, 0, 0, float("-inf")
 
     model_path = Path(resume_checkpoint)
-    masac.load(
+    routing_masac.load(
         file_path=model_path,
         load_optimizers=True,
     )
@@ -1716,12 +1754,15 @@ def append_csv_log(csv_path: Path, row: Dict[str, Any],) -> None:
 def build_episode_log_row(
     stats: EpisodeStatistics,
     env: Any,
-        routing_replay_buffer:
-        RoutingReplayBuffer,
 
-        host_replay_buffers:
-        Dict[str, HostReplayBuffer],
-    masac: DiscreteMASAC,
+    routing_replay_buffer:
+    RoutingReplayBuffer,
+
+    host_replay_buffers:
+    Dict[str, HostReplayBuffer],
+
+    routing_masac: RoutingMASAC,
+
     global_decision_steps: int,
     global_normal_action_steps: int,
     wall_time_seconds: float,
@@ -1798,13 +1839,15 @@ def build_episode_log_row(
         "routing_replay_trainable_size": int(routing_replay_buffer.num_trainable_actions),
         "host_replay_size_total": int(sum(len(buffer) for buffer in host_replay_buffers.values())),
         "host_replay_size_by_dc": json.dumps({dc_id: int(len(buffer)) for dc_id, buffer in host_replay_buffers.items()},ensure_ascii=False,sort_keys=True,),
-        "masac_update_step": int(masac.update_step),
+        "routing_masac_update_step": int(
+    routing_masac.update_step
+),
         "critic_loss": stats.mean_metric("critic_loss"),
         "q1_loss": stats.mean_metric("q1_loss"),
         "q2_loss": stats.mean_metric("q2_loss"),
         "actor_loss": stats.mean_metric("actor_loss"),
         "alpha_loss": stats.mean_metric("alpha_loss"),
-        "alpha": float(masac.alpha.detach().cpu().item()),
+        "alpha": float( routing_masac.alpha.detach().cpu().item()),
         "policy_entropy": stats.mean_metric("policy_entropy"),
         "target_entropy": stats.mean_metric("target_entropy"),
         "mean_q1": stats.mean_metric("mean_q1"),
@@ -2059,7 +2102,7 @@ def print_episode_summary(row: Dict[str, Any]) -> None:
 
     # MASAC 本身训练状态。
     print(
-        f"  MASAC  | "
+        f"  Routing MASAC | "
         f"routing_buffer="
         f"{int(row['routing_replay_trainable_size']):7d} | "
         f"host_buffer="
@@ -2074,8 +2117,13 @@ def print_episode_summary(row: Dict[str, Any]) -> None:
 
 def train(
     train_config: TrainConfig,
-    masac_config: Optional[MASACConfig] = None,
-) -> DiscreteMASAC:
+
+    routing_masac_config:
+    Optional[
+        RoutingMASACConfig
+    ] = None,
+
+) -> RoutingMASAC:
 
     set_global_random_seeds(train_config.seed)
 
@@ -2269,17 +2317,31 @@ def train(
 
 
     # 没有传入算法配置时，使用 MASACConfig 默认值，但让算法随机种子与训练配置保持一致
-    if masac_config is None:
-        masac_config = MASACConfig(
-            seed=int(train_config.seed)
+    # ==============================================================
+    # Routing MASAC + CTDE
+    #
+    # 这里创建的是整个系统唯一的一套 Routing MASAC。
+    #
+    # Host SAC 不使用本对象。
+    # 每个 Edge DC 的 LocalHostSAC 已在前面独立创建。
+    # ==============================================================
+
+    if routing_masac_config is None:
+        routing_masac_config = (
+            RoutingMASACConfig(
+                seed=int(
+                    train_config.seed
+                )
+            )
         )
 
-    # 创建离散多智能体 SAC 算法
-    masac = DiscreteMASAC(
-        # Routing Actor input
-        local_obs_dim=routing_obs_dim,
+    routing_masac = RoutingMASAC(
+        # Routing Actor local input
+        local_obs_dim=(
+            routing_obs_dim
+        ),
 
-        # Routing Centralized Critic input
+        # Routing CTDE centralized Critic input
         global_state_dim=(
             routing_global_state_dim
         ),
@@ -2289,13 +2351,17 @@ def train(
         ),
 
         num_agents=int(
-            len(env.possible_agents)
+            len(
+                env.possible_agents
+            )
         ),
 
-        config=masac_config,
+        config=(
+            routing_masac_config
+        ),
     )
 
-    masac.train_mode()
+    routing_masac.train_mode()
 
     action_rng = np.random.default_rng(int(train_config.seed))
 
@@ -2305,10 +2371,15 @@ def train(
         global_decision_steps,
         global_normal_action_steps,
         best_episode_return,
-    ) = load_checkpoint_if_needed(
-        masac=masac,
-        resume_checkpoint=train_config.resume_checkpoint,
-    )
+    ) = load_routing_checkpoint_if_needed(
+    routing_masac=(
+        routing_masac
+    ),
+
+    resume_checkpoint=(
+        train_config.resume_checkpoint
+    ),
+)
 
     # 把保存路径转换成 Path
     checkpoint_dir = Path(train_config.checkpoint_dir)
@@ -2628,10 +2699,19 @@ def train(
                     action_source = "random"
 
                 else:
-                    action = masac.select_action(
-                        local_obs=decision.local_obs,
-                        agent_index=decision.agent_index,
-                        deterministic=False,
+                    action = (
+                        routing_masac
+                            .select_action(
+                            local_obs=(
+                                decision.local_obs
+                            ),
+
+                            agent_index=(
+                                decision.agent_index
+                            ),
+
+                            deterministic=False,
+                        )
                     )
                     action_source = "policy"
 
@@ -2784,15 +2864,20 @@ def train(
                     update_info_block = []
                     for _ in range(int(train_config.updates_per_train)):
                         # 从 ReplayBuffer 采样并执行一次完整 SAC 更新
-                        update_info = masac.update(
-                            replay_buffer=(
-                                routing_replay_buffer
-                            ),
+                        update_info = (
+                            routing_masac
+                                .update(
+                                replay_buffer=(
+                                    routing_replay_buffer
+                                ),
 
-                            batch_size=int(
-                                train_config.batch_size
-                            ),
+                                batch_size=int(
+                                    train_config.batch_size
+                                ),
+                            )
                         )
+
+
                         # stats.record_update(update_info)
                         update_info_block.append(update_info)
                     record_update_block(stats=stats,update_infos=update_info_block,)
@@ -2830,20 +2915,6 @@ def train(
 
                 env=env,
 
-                # ==========================================================
-                # 第十九步：
-                # Routing 与 Host 已经拆成两个独立 Replay System。
-                #
-                # 不再向日志函数传递旧：
-                #
-                #     replay_buffer
-                #
-                # 而是分别传递：
-                #
-                #     routing_replay_buffer
-                #     host_replay_buffers
-                # ==========================================================
-
                 routing_replay_buffer=(
                     routing_replay_buffer
                 ),
@@ -2852,7 +2923,9 @@ def train(
                     host_replay_buffers
                 ),
 
-                masac=masac,
+                routing_masac=(
+                    routing_masac
+                ),
 
                 global_decision_steps=(
                     global_decision_steps
@@ -2878,8 +2951,10 @@ def train(
                     stats.episode_return
                 )
 
-                save_checkpoint(
-                    masac=masac,
+                save_routing_checkpoint(
+                    routing_masac=(
+                        routing_masac
+                    ),
                     model_path=checkpoint_dir / "best.pt",
                     next_episode=episode + 1,
                     global_decision_steps=global_decision_steps,
@@ -2888,8 +2963,10 @@ def train(
                 )
 
             # 断点恢复
-            save_checkpoint(
-                masac=masac,
+            save_routing_checkpoint(
+                routing_masac=(
+                    routing_masac
+                ),
                 model_path=checkpoint_dir / "latest.pt",
                 next_episode=episode + 1,
                 global_decision_steps=global_decision_steps,
@@ -2897,8 +2974,10 @@ def train(
                 best_episode_return=best_episode_return,
             )
             if (episode % int(train_config.checkpoint_interval) == 0):
-                save_checkpoint(
-                    masac=masac,
+                save_routing_checkpoint(
+                    routing_masac=(
+                        routing_masac
+                    ),
                     model_path=(checkpoint_dir / f"episode_{episode:06d}.pt"),
                     next_episode=episode + 1,
                     global_decision_steps=global_decision_steps,
@@ -2912,8 +2991,10 @@ def train(
             close_method()
 
     # 全部 episode 完成后保存 final checkpoint
-    save_checkpoint(
-        masac=masac,
+    save_routing_checkpoint(
+        routing_masac=(
+            routing_masac
+        ),
         model_path=checkpoint_dir / "final.pt",
         next_episode=int(train_config.num_episodes) + 1,
         global_decision_steps=global_decision_steps,
@@ -2921,7 +3002,7 @@ def train(
         best_episode_return=best_episode_return,
     )
 
-    return masac
+    return routing_masac
 
 def main() -> None:
     train_config = TrainConfig(
@@ -2944,26 +3025,65 @@ def main() -> None:
         vary_episode_seed=conf.Vary_Episode_Seed
     )
 
-    masac_config = MASACConfig(
-        gamma=conf.GAMMA,
-        tau=conf.TUA,
-        actor_lr=conf.ACTOR_LR,
-        critic_lr=conf.CRITIC_LR,
-        alpha_lr=conf.ALPHA_LR,
-        actor_hidden_dim=conf.ACTOR_HIDDEN_DIM,
-        critic_hidden_dim=conf.Q_NET_HIDDEN_DIM,
-        initial_alpha=conf.INITIAL_ALPHA,
-        target_entropy_ratio=conf.TARGET_ENTROPY_RATIO,
-        max_grad_norm=conf.MAX_GRAD_NORM,
-        policy_update_interval=conf.Policy_Updata_Interval,
-        target_update_interval=conf.Target_Update_Interval,
-        device=conf.DEVICE,
-        seed=conf.Seed
+    routing_masac_config = (
+        RoutingMASACConfig(
+            gamma=conf.GAMMA,
+            tau=conf.TUA,
+
+            actor_lr=(
+                conf.ACTOR_LR
+            ),
+
+            critic_lr=(
+                conf.CRITIC_LR
+            ),
+
+            alpha_lr=(
+                conf.ALPHA_LR
+            ),
+
+            actor_hidden_dim=(
+                conf.ACTOR_HIDDEN_DIM
+            ),
+
+            critic_hidden_dim=(
+                conf.Q_NET_HIDDEN_DIM
+            ),
+
+            initial_alpha=(
+                conf.INITIAL_ALPHA
+            ),
+
+            target_entropy_ratio=(
+                conf.TARGET_ENTROPY_RATIO
+            ),
+
+            max_grad_norm=(
+                conf.MAX_GRAD_NORM
+            ),
+
+            policy_update_interval=(
+                conf.Policy_Updata_Interval
+            ),
+
+            target_update_interval=(
+                conf.Target_Update_Interval
+            ),
+
+            device=conf.DEVICE,
+
+            seed=conf.Seed,
+        )
     )
 
     train(
-        train_config=train_config,
-        masac_config=masac_config,
+        train_config=(
+            train_config
+        ),
+
+        routing_masac_config=(
+            routing_masac_config
+        ),
     )
 
 if __name__ == "__main__":
