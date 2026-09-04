@@ -23,9 +23,9 @@ class CloudEdgeEnvLike(Protocol):
     agent_selection: Optional[str]
     current_agent_id: Optional[str]
 
-    current_job_id: Optional[str]
-    pending_host_job_id: Optional[str]
-    pending_host_dc_id: Optional[str]
+    # current_job_id: Optional[str]
+    # pending_host_job_id: Optional[str]
+    # pending_host_dc_id: Optional[str]
     current_time: float
     # local_obs_dim: int
     # global_state_dim: int
@@ -75,55 +75,75 @@ class DecisionSnapshot:
             "forced_action": self.forced_action,
         }
 
-# 表示 replay buffer 中的一条训练经验
 @dataclass(frozen=True)
-class Transition:
+class RoutingActionResult:
+    """
+    一次 Routing action 执行完成后的即时结果。
+
+    注意：
+        RoutingActionResult 不是 Replay Transition。
+
+    它只服务于 Trainer：
+        - Episode statistics；
+        - 判断当前 Job 是否已经 Finalize；
+        - 识别本次动作类型；
+        - 继续环境控制流。
+
+    正式 RoutingTransition 只能在 Job terminal 后，
+    由 PendingJobTraceStore / FinalizedJobTrace 构造。
+    """
+
     agent_id: str
     agent_index: int
+
     job_id: str
-    env_time: float
-    local_obs: FloatArray
-    global_state: FloatArray
+
+    # 真正做 Routing decision 的时间。
+    decision_time: float
+
+    # env.step() 完成后的环境时间。
+    result_time: float
 
     action: int
     action_type: str
-    reward: float
-    next_agent_id: Optional[str]
+    action_source: str
 
-    # next_agent_index 在终止状态下使用 -1 表示“不存在下一智能体”
-    next_agent_index: int
-    next_job_id: Optional[str]
-    next_env_time: float
-    next_local_obs: FloatArray
-    next_global_state: FloatArray
+    # 当前 Routing action 当时立即产生的 reward。
+    immediate_reward: float
 
-    terminated: bool
-    truncated: bool
-    done: bool
+    # Self:
+    #     当前 DC
+    #
+    # Edge:
+    #     目标 Edge DC
+    #
+    # Cloud:
+    #     cloud
+    #
+    # Drop:
+    #     None
+    target_dc_id: Optional[str]
 
-    # 将 Transition 转成字典，ReplayBuffer 可以按键读取各字段
-    def as_dict(self) -> Dict[str, Any]:
+    # 当前 Job 是否已经在本次调用中完成 Finalize。
+    # 目前主要对应 forced drop。
+    job_finalized: bool
+
+    def as_dict(
+            self,
+    ) -> Dict[str, Any]:
+
         return {
             "agent_id": self.agent_id,
             "agent_index": self.agent_index,
             "job_id": self.job_id,
-            "env_time": self.env_time,
-            "local_obs": self.local_obs.copy(),
-            "global_state": self.global_state.copy(),
-
+            "decision_time": self.decision_time,
+            "result_time": self.result_time,
             "action": self.action,
             "action_type": self.action_type,
-            "reward": self.reward,
-            "next_agent_id": self.next_agent_id,
-            "next_agent_index": self.next_agent_index,
-            "next_job_id": self.next_job_id,
-            "next_env_time": self.next_env_time,
-            "next_local_obs": self.next_local_obs.copy(),
-            "next_global_state": self.next_global_state.copy(),
-
-            "terminated": self.terminated,
-            "truncated": self.truncated,
-            "done": self.done,
+            "action_source": self.action_source,
+            "immediate_reward": self.immediate_reward,
+            "target_dc_id": self.target_dc_id,
+            "job_finalized": self.job_finalized,
         }
 
 # 采集器，从环境中抽取经验
@@ -131,30 +151,44 @@ class TransitionCollector:
     def __init__(
             self,
             env: CloudEdgeEnvLike,
+
             routing_observation_builder:
             RoutingObservationBuilder,
+
             routing_state_builder:
             RoutingCentralizedStateBuilder,
+
             pending_trace_store:
             PendingJobTraceStore,
-            validate_actions: bool = True,
     ) -> None:
+
         self.env = env
-        self.routing_observation_builder = (routing_observation_builder)
-        self.validate_actions = bool(validate_actions)
-        self.routing_state_builder = (routing_state_builder)
-        self.pending_trace_store = (pending_trace_store)
-        self.validate_actions = bool(validate_actions)
-        # 全局计数，不随episode清空
-        self.total_transition_count = 0
-        # 当前episode生成多少条经验
-        self.episode_transition_count = 0
-        # 在采集器实例化时就用环境接口检查
+
+        self.routing_observation_builder = (
+            routing_observation_builder
+        )
+
+        self.routing_state_builder = (
+            routing_state_builder
+        )
+
+        self.pending_trace_store = (
+            pending_trace_store
+        )
+
+        # ==========================================================
+        # Collector 现在统计的是实际执行的 Routing actions，
+        # 不再统计“生成了多少条 Replay Transition”。
+        # ==========================================================
+
+        self.total_routing_action_count = 0
+        self.episode_routing_action_count = 0
+
         self._validate_environment_interface()
 
     # 重置计数器
     def reset_episode(self) -> None:
-        self.episode_transition_count = 0
+        self.episode_routing_action_count = 0
         self.routing_observation_builder.reset_episode()
 
     # 获取决策状态快照
@@ -344,93 +378,74 @@ class TransitionCollector:
         return self._build_current_decision_snapshot()
     # 这里相当于把原来的 capture_decision() 拆成 _build_current_decision_snapshot()->capture_decision(),这样后面 execute_and_collect() 也可以调用同一个函数
 
-    def execute_and_collect(
+    def execute_and_record(
             self,
             decision: DecisionSnapshot,
             action: int,
-            action_type: str,
             action_source: str,
     ) -> Tuple[
-        Transition,
+        RoutingActionResult,
         Optional[DecisionSnapshot],
     ]:
         """
         执行一次 PettingZoo Routing action，
-        同时完成两件事情：
+        并把已经真实发生的 Routing 因果事实写入
+        PendingJobTraceStore。
 
-            1. 继续构造当前 Legacy Routing Transition，
-               供现阶段 ReplayBuffer 兼容使用；
+        第二十一步以后，本函数不再生成任何正式训练 Transition。
 
-            2. 将当前 Routing decision 记录到
-               PendingJobTraceStore，
-               为后续“Job terminal 后完整链一次性回填 Replay”
-               做准备。
+        正式 RoutingTransition 只能在：
 
-        这里必须严格区分：
+            Job terminal
+                ↓
+            FinalizedJobTrace
+                ↓
+            _build_finalized_routing_transitions()
 
-            environment_done:
-                整个环境 Episode 是否结束。
+        阶段生成。
 
-            routing_done:
-                当前 Job 的 Routing trajectory 是否结束。
+        本函数只负责：
 
-        Routing 动作语义：
+            DecisionSnapshot
+                ↓
+            Routing action
+                ↓
+            Environment.step()
+                ↓
+            immediate reward
+                ↓
+            PendingRoutingStep
 
-            edge_dc:
-                当前 Job 的 Routing 尚未结束。
-                它真正的 next_state 必须等同一个 Job
-                到达下一 Edge DC 后才能确定。
+        如果是 forced drop：
 
-            self:
-                当前 Job 的 Routing trajectory 结束，
-                但 Job 生命周期没有结束。
-                后续进入非 PettingZoo Local Host SAC。
+            mark terminal
+                ↓
+            finalize complete Job trace
 
-            cloud:
-                当前 Job 的 Edge Routing trajectory 结束，
-                但 Job 生命周期没有结束。
-                后续由 Cloud execution path 继续。
+        返回的 next_decision 只是 Trainer 环境时间线上的
+        下一条 Routing Decision。
 
-            drop:
-                当前 Routing trajectory 与 Job 生命周期同时结束。
-
-        注意：
-
-            loop_next_decision 只是 Trainer 在环境时间线上
-            接下来可以继续处理的 Routing DecisionSnapshot。
-
-            它不一定属于当前 Job，
-            因此绝不能无条件当作当前 Job 的因果 next_state。
+        它不一定属于当前 Job，
+        因而绝不在本函数中被当作当前 Job 的 Replay next_state。
         """
 
         # ==========================================================
-        # 1. 基础参数标准化与检查
+        # 1. 基础检查
         # ==========================================================
 
         self._require_reset()
+
+        self._validate_decision_is_current(
+            decision
+        )
 
         action = int(
             action
         )
 
-        action_type = str(
-            action_type
-        )
-
         action_source = str(
             action_source
         )
-
-        if action_type not in {
-            "self",
-            "edge_dc",
-            "cloud",
-            "drop",
-        }:
-            raise ValueError(
-                "TransitionCollector 收到未知 Routing action_type："
-                f"{action_type}"
-            )
 
         if action_source not in {
             "forced",
@@ -443,95 +458,64 @@ class TransitionCollector:
             )
 
         # ==========================================================
-        # 2. 在执行动作前先解码 Routing action
+        # 2. Forced action 一致性检查
         #
-        # 这里主要获取：
-        #     source_dc_id
-        #     target_dc_id
+        # 如果 DecisionSnapshot 已经明确告诉 Trainer：
         #
-        # target_dc_id 后面会写入 Pending Routing Step。
+        #     forced_action = DROP_ACTION
         #
-        # 使用 Environment 已有的 _decode_action()，
-        # 不在 Collector 中重新复制一套动作映射逻辑。
+        # Trainer 就不能继续走 random / policy。
         # ==========================================================
 
-        decode_action = getattr(
-            self.env,
-            "_decode_action",
-            None,
-        )
+        if decision.forced_action is not None:
 
-        if not callable(
-                decode_action
-        ):
-            raise AttributeError(
-                "TransitionCollector 需要环境提供 "
-                "_decode_action() 来解析 Routing action。"
+            if action_source != "forced":
+                raise RuntimeError(
+                    "当前 Routing Decision 必须执行 forced action，"
+                    "但 Trainer 给出的 action_source 不是 forced："
+                    f"job={decision.job_id}, "
+                    f"action_source={action_source}"
+                )
+
+            if (
+                    int(decision.forced_action)
+                    != action
+            ):
+                raise RuntimeError(
+                    "Trainer 执行的 forced action "
+                    "与 DecisionSnapshot 不一致："
+                    f"job={decision.job_id}, "
+                    f"expected={decision.forced_action}, "
+                    f"actual={action}"
+                )
+
+        elif action_source == "forced":
+
+            raise RuntimeError(
+                "DecisionSnapshot 没有 forced action，"
+                "但 Trainer 将当前动作标记为 forced："
+                f"job={decision.job_id}, "
+                f"action={action}"
             )
 
-        decoded_action = decode_action(
+        # ==========================================================
+        # 3. 使用 Environment 唯一 action semantics 解码。
+        # ==========================================================
+
+        (
+            action_type,
+            target_dc_id,
+        ) = self._decode_routing_action(
             agent_id=(
                 decision.agent_id
             ),
             action=action,
         )
 
-        decoded_action_type = str(
-            decoded_action.get(
-                "action_type",
-                "",
-            )
-        )
-
-        if (
-                decoded_action_type
-                != action_type
-        ):
-            raise RuntimeError(
-                "Trainer 给出的 action_type "
-                "与 Environment 解码结果不一致："
-                f"job={decision.job_id}, "
-                f"agent={decision.agent_id}, "
-                f"action={action}, "
-                f"trainer_type={action_type}, "
-                f"decoded_type={decoded_action_type}"
-            )
-
-        decoded_target_dc_id = (
-            decoded_action.get(
-                "target_dc_id",
-                None,
-            )
-        )
-
-        target_dc_id: Optional[str]
-
-        if (
-                decoded_target_dc_id
-                is None
-        ):
-            target_dc_id = None
-        else:
-            target_dc_id = str(
-                decoded_target_dc_id
-            )
-
         # ==========================================================
-        # 3. 执行 PettingZoo Routing action
+        # 4. 执行真正的 PettingZoo Routing action。
         #
-        # Host action 绝对不会经过本函数。
-        #
-        # Self:
-        #     env.step() 只产生 pending Host decision。
-        #
-        # Edge:
-        #     env.step() 创建传输并继续推进环境。
-        #
-        # Cloud:
-        #     env.step() 进入 Cloud path。
-        #
-        # Drop:
-        #     env.step() 直接终止当前 Job。
+        # Host action 永远不会进入本函数。
         # ==========================================================
 
         self.env.step(
@@ -539,10 +523,8 @@ class TransitionCollector:
         )
 
         # ==========================================================
-        # 4. 更新 Routing Observation History
-        #
-        # 当前动作已经实际发生，
-        # 因此现在才可以写 Routing history。
+        # 5. 动作已经真实发生，
+        #    现在才更新 Routing history。
         # ==========================================================
 
         self.routing_observation_builder.record_routing_action(
@@ -562,46 +544,32 @@ class TransitionCollector:
         )
 
         # ==========================================================
-        # 5. 保存当前 Routing action 的即时 reward
+        # 6. 保存本次 Routing action 的即时 reward。
         #
-        # 必须使用动作执行前 decision.agent_id。
-        #
-        # 因为 env.step() 后：
-        #
-        #     agent_selection
-        #     current_agent_id
-        #     current_job_id
-        #
-        # 都可能已经发生变化。
+        # 必须按动作执行前的 decision.agent_id 获取，
+        # 因为 env.step() 后当前 Agent / Job 都可能变化。
         # ==========================================================
 
-        reward = float(
+        immediate_reward = float(
             self.env.rewards[
                 decision.agent_id
             ]
         )
 
         # ==========================================================
-        # 6. 将当前 Routing decision 写入 Pending Job Causal Trace
+        # 7. 写入 Pending Job Causal Trace。
         #
-        # 重要：
-        #
-        # 这里只记录已经发生的“因果事实”：
+        # 这里只记录事实：
         #
         #     state
         #     action
-        #     action_type
-        #     action_source
+        #     source / target
         #     immediate_reward
-        #     source / target DC
         #
-        # 如果当前是 Edge -> Edge：
-        #
-        #     next_state 现在仍然未知。
-        #
-        # 必须等同一个 Job 真正到达目标 Edge，
-        # 再由 _build_current_decision_snapshot()
-        # 调用 resolve_routing_successor() 回填。
+        # Edge action 的 same-job next_state 仍然未知。
+        # 后续真正到达目标 DC 时，
+        # _build_current_decision_snapshot()
+        # 会负责 resolve。
         # ==========================================================
 
         self.pending_trace_store.record_routing_step(
@@ -640,7 +608,7 @@ class TransitionCollector:
             ),
 
             immediate_reward=(
-                reward
+                immediate_reward
             ),
 
             target_dc_id=(
@@ -649,36 +617,18 @@ class TransitionCollector:
         )
 
         # ==========================================================
-        # 7. Forced Drop 是 Job 本身立即 terminal
+        # 8. Forced Drop：
         #
-        # Drop reward 已经作为 immediate_reward
-        # 写入 PendingRoutingStep。
+        # Drop penalty 已经保存在当前 Routing Step 的
+        # immediate_reward 中。
         #
-        # 因此这里不能再：
-        #
-        #     record_reward_event(
-        #         reward_delta=reward
-        #     )
-        #
-        # 否则后续 Finalize 时会把 Drop penalty 计算两遍。
-        #
-        # 这里只标记 Job terminal。
+        # 因此：
+        #   - 不额外创建 RewardEvent；
+        #   - 只 mark terminal；
+        #   - 然后立即 Finalize。
         # ==========================================================
 
         if action_type == "drop":
-            # ==========================================================
-            # Forced Drop
-            #
-            # Drop penalty 已经保存在当前 Routing Step 的
-            # immediate_reward 中。
-            #
-            # 所以：
-            #   1. mark terminal
-            #   2. 立即 Finalize 整条 Job Trace
-            #
-            # 不再额外创建 RewardEvent。
-            # ==========================================================
-
             self.pending_trace_store.mark_terminal(
                 job_id=(
                     decision.job_id
@@ -691,13 +641,6 @@ class TransitionCollector:
                 reason="forced_drop",
             )
 
-            # ==========================================================
-            # Forced Drop 本身就是最终 Job outcome。
-            #
-            # 此时完整 Routing Chain 已经结束，
-            # 不需要等待 Environment reward correction。
-            # ==========================================================
-
             self.pending_trace_store.finalize_terminal_trace(
                 job_id=(
                     decision.job_id
@@ -705,89 +648,24 @@ class TransitionCollector:
             )
 
         # ==========================================================
-        # 8. PettingZoo Agent termination / truncation
+        # 9. 创建 Trainer 环境时间线上的下一 Routing Decision。
         #
-        # 这两个字段继续保留当前 Legacy Transition 的原语义。
-        # ==========================================================
-
-        terminated = bool(
-            self.env.terminations.get(
-                decision.agent_id,
-                False,
-            )
-        )
-
-        truncated = bool(
-            self.env.truncations.get(
-                decision.agent_id,
-                False,
-            )
-        )
-
-        # ==========================================================
-        # 9. 判断整个 Environment Episode 是否结束
+        # 重要：
+        #
+        #     next_decision
+        #
+        # 不是当前 Job 的 Replay next_state。
+        #
+        # 如果它恰好是当前 Job 的真实 Edge successor，
+        # _build_current_decision_snapshot() 会通过 job_id
+        # 正确 resolve 前一跳。
         # ==========================================================
 
         environment_done = (
             self._is_episode_done()
         )
 
-        # ==========================================================
-        # 10. 判断当前 Job 的 Routing trajectory 是否结束
-        #
-        # Self:
-        #     后面转 Host SAC，所以 Routing terminal。
-        #
-        # Cloud:
-        #     后面不会再产生 Edge Routing decision，
-        #     所以 Routing terminal。
-        #
-        # Drop:
-        #     Routing 和 Job 都 terminal。
-        #
-        # Edge -> Edge:
-        #     当前 Job 后续仍会再次产生 Routing decision。
-        # ==========================================================
-
-        routing_terminal_action = (
-                action_type
-                in {
-                    "self",
-                    "cloud",
-                    "drop",
-                }
-        )
-
-        routing_done = bool(
-            environment_done
-            or routing_terminal_action
-        )
-
-        # ==========================================================
-        # 11. 构造 Trainer 环境时间线上的下一 Routing Decision
-        #
-        # 注意：
-        #
-        # loop_next_decision
-        #
-        # 仅用于 Trainer 继续运行。
-        #
-        # 它可能属于完全不同的 Job。
-        #
-        # _build_current_decision_snapshot() 内部现在还会调用：
-        #
-        #     pending_trace_store.resolve_routing_successor(...)
-        #
-        # 因此：
-        #
-        # 如果这个 Decision 恰好是同一个 Job
-        # Edge -> Edge 后真正到达目标 DC 的状态，
-        # 上一 Routing Step 会在这里被正确闭合。
-        #
-        # 如果是其他 Job，则不会错误连接。
-        # ==========================================================
-
-        loop_next_decision: Optional[
+        next_decision: Optional[
             DecisionSnapshot
         ] = None
 
@@ -796,259 +674,124 @@ class TransitionCollector:
                 and self.env.agent_selection
                 is not None
         ):
-            loop_next_decision = (
+            next_decision = (
                 self._build_current_decision_snapshot()
             )
 
         # ==========================================================
-        # 12. 构造当前 Legacy Routing Transition 的 next_state
+        # 10. 只返回即时执行结果。
         #
-        # 这里暂时保留旧 ReplayBuffer 训练兼容逻辑。
+        # 不返回：
+        #     next_state
+        #     done
+        #     terminated
+        #     truncated
         #
-        # 第十四步真正可信的 Job 因果关系，
-        # 已经由 PendingJobTraceStore 单独维护。
-        #
-        # 后续完成：
-        #
-        #     Terminal
-        #       ↓
-        #     Finalize Trace
-        #       ↓
-        #     RoutingReplayBuffer
-        #
-        # 后，这一整段 Legacy next_state 逻辑会被删除。
+        # 这些属于 Job Finalize 后的 RoutingTransition。
         # ==========================================================
 
-        if routing_done:
-
-            # ------------------------------------------------------
-            # Self / Cloud / Drop
-            #
-            # 对 Routing SAC 来说已经是 terminal，
-            # 因此不允许 bootstrap 到其他 Job。
-            # ------------------------------------------------------
-
-            next_agent_id = None
-
-            next_agent_index = -1
-
-            next_job_id = None
-
-            next_local_obs = np.zeros(
-                int(
-                    self.routing_observation_builder
-                        .obs_dim
+        routing_result = (
+            RoutingActionResult(
+                agent_id=str(
+                    decision.agent_id
                 ),
-                dtype=np.float32,
-            )
 
-            next_global_state = np.zeros(
-                int(
-                    self.routing_state_builder
-                        .state_dim
+                agent_index=int(
+                    decision.agent_index
                 ),
-                dtype=np.float32,
+
+                job_id=str(
+                    decision.job_id
+                ),
+
+                decision_time=float(
+                    decision.env_time
+                ),
+
+                result_time=float(
+                    self.env.current_time
+                ),
+
+                action=action,
+
+                action_type=(
+                    action_type
+                ),
+
+                action_source=(
+                    action_source
+                ),
+
+                immediate_reward=(
+                    immediate_reward
+                ),
+
+                target_dc_id=(
+                    target_dc_id
+                ),
+
+                job_finalized=(
+                    self.pending_trace_store
+                        .has_finalized_trace(
+                        decision.job_id
+                    )
+                ),
             )
-
-        else:
-
-            # ------------------------------------------------------
-            # 正常情况下只有 Edge -> Edge 会进入这里。
-            #
-            # 当前仍然处于 Legacy ReplayBuffer 兼容阶段，
-            # 所以先沿用旧的 loop_next_decision。
-            #
-            # 注意：
-            # 这个 next state 不一定属于当前 Job。
-            #
-            # 当前 Legacy ReplayBuffer 后面仍会通过
-            # same-job successor 机制进行修正。
-            #
-            # 真正新的因果链则已经由：
-            #
-            #     PendingJobTraceStore
-            #
-            # 单独维护。
-            # ------------------------------------------------------
-
-            if (
-                    loop_next_decision
-                    is None
-            ):
-                raise RuntimeError(
-                    "非 terminal Routing action 后"
-                    "没有得到下一 Routing decision："
-                    f"job={decision.job_id}, "
-                    f"action_type={action_type}"
-                )
-
-            next_agent_id = (
-                loop_next_decision.agent_id
-            )
-
-            next_agent_index = (
-                loop_next_decision.agent_index
-            )
-
-            next_job_id = (
-                loop_next_decision.job_id
-            )
-
-            next_local_obs = (
-                loop_next_decision
-                    .local_obs
-                    .copy()
-            )
-
-            next_global_state = (
-                loop_next_decision
-                    .global_state
-                    .copy()
-            )
-
-        # ==========================================================
-        # 13. 构造 Legacy Routing Transition
-        #
-        # 注意：
-        #
-        # 当前第十四步仍然返回 Transition，
-        # 因为 train_h_masac.py 目前还需要：
-        #
-        #     replay_buffer.add(transition)
-        #
-        # 来维持现阶段 Routing MASAC 可训练。
-        #
-        # 后续“双 Replay + Terminal Finalize”完成后，
-        # execute_and_collect() 将不再负责直接生成
-        # 最终训练 Transition。
-        # ==========================================================
-
-        transition = Transition(
-
-            agent_id=(
-                decision.agent_id
-            ),
-
-            agent_index=(
-                decision.agent_index
-            ),
-
-            job_id=(
-                decision.job_id
-            ),
-
-            env_time=(
-                decision.env_time
-            ),
-
-            local_obs=(
-                decision.local_obs
-                    .copy()
-            ),
-
-            global_state=(
-                decision.global_state
-                    .copy()
-            ),
-
-            action=action,
-
-            action_type=(
-                action_type
-            ),
-
-            reward=(
-                reward
-            ),
-
-            next_agent_id=(
-                next_agent_id
-            ),
-
-            next_agent_index=(
-                next_agent_index
-            ),
-
-            next_job_id=(
-                next_job_id
-            ),
-
-            next_env_time=float(
-                self.env.current_time
-            ),
-
-            next_local_obs=(
-                next_local_obs
-            ),
-
-            next_global_state=(
-                next_global_state
-            ),
-
-            terminated=(
-                terminated
-            ),
-
-            truncated=(
-                truncated
-            ),
-
-            # ======================================================
-            # done 表示 Routing-layer terminal，
-            # 而不是只表示 Environment Episode terminal。
-            # ======================================================
-            done=(
-                routing_done
-            ),
         )
 
         # ==========================================================
-        # 14. Collector 计数
+        # 11. Collector 计数。
         # ==========================================================
 
-        self.total_transition_count += 1
-
-        self.episode_transition_count += 1
-
-        # ==========================================================
-        # 15. 返回
-        #
-        # transition:
-        #     当前阶段继续交给 Legacy Routing ReplayBuffer。
-        #
-        # loop_next_decision:
-        #     Trainer 时间线上的下一 Routing decision。
-        #
-        # 对 Self：
-        #
-        #     env.agent_selection == None
-        #
-        # 因此：
-        #
-        #     loop_next_decision == None
-        #
-        # Trainer 下一轮应该转入 Host branch。
-        # ==========================================================
+        self.total_routing_action_count += 1
+        self.episode_routing_action_count += 1
 
         return (
-            transition,
-            loop_next_decision,
+            routing_result,
+            next_decision,
         )
 
     # 按 PettingZoo AEC 约定清理一个已经终止的智能体
-    def drain_one_dead_agent(self) -> bool:
+    def drain_one_dead_agent(
+            self,
+    ) -> bool:
+        """
+        按 PettingZoo AEC 约定，
+        对当前已经 terminal / truncated 的 Routing Agent
+        执行一次 step(None)。
+
+        Host Phase 下 agent_selection=None，
+        此时本函数什么都不做。
+        """
+
         if not self.env.agents:
             return False
-        agent_id = str(self.env.agent_selection)
-        is_dead = bool(
-            self.env.terminations.get(agent_id, False)
-            or self.env.truncations.get(agent_id, False)
+
+        if self.env.agent_selection is None:
+            return False
+
+        agent_id = str(
+            self.env.agent_selection
         )
+
+        is_dead = bool(
+            self.env.terminations.get(
+                agent_id,
+                False,
+            )
+            or self.env.truncations.get(
+                agent_id,
+                False,
+            )
+        )
+
         if not is_dead:
             return False
 
-        # 按 PettingZoo AEC 约定，对已经结束的智能体执行一次 None 动作。
-        self.env.step(None)
+        self.env.step(
+            None
+        )
+
         return True
 
     # 清理 episode 结束后的全部 dead agent，返回清理次数
@@ -1068,7 +811,7 @@ class TransitionCollector:
             "possible_agents",
             "agents",
             "agent_selection",
-            "current_agent_id",
+            # "current_agent_id",
             "current_job_id",
             "current_time",
             # "local_obs_dim",
@@ -1090,20 +833,23 @@ class TransitionCollector:
 
         # observe、state 和 step 不仅要存在，还必须可以调用。
         for method_name in (
-                # "observe",
                 "step",
+                "_decode_action",
+                "_should_drop_arrival_job",
         ):
-
             method = getattr(
                 self.env,
                 method_name,
                 None,
             )
 
-            if not callable(method):
+            if not callable(
+                    method
+            ):
                 raise AttributeError(
-                    "环境缺少可调用方法："
-                    f"{method_name}()。"
+                    "Environment 缺少 TransitionCollector "
+                    "所需可调用方法："
+                    f"{method_name}()"
                 )
 
 
@@ -1200,6 +946,89 @@ class TransitionCollector:
         if bool(should_drop_fn(job_id)):
             return int(self.env.drop_action)
         return None
+
+    def _decode_routing_action(
+            self,
+            *,
+            agent_id: str,
+            action: int,
+    ) -> Tuple[
+        str,
+        Optional[str],
+    ]:
+        """
+        使用 Environment 的唯一动作语义定义解析 Routing action。
+
+        Collector 不复制：
+            Self index
+            Edge index
+            Cloud index
+
+        DROP_ACTION=-1 同样由 Environment 解码。
+        """
+
+        decode_action = getattr(
+            self.env,
+            "_decode_action",
+            None,
+        )
+
+        if not callable(
+                decode_action
+        ):
+            raise AttributeError(
+                "TransitionCollector 需要 Environment 提供 "
+                "_decode_action()。"
+            )
+
+        decoded_action = decode_action(
+            agent_id=str(
+                agent_id
+            ),
+            action=int(
+                action
+            ),
+        )
+
+        action_type = str(
+            decoded_action.get(
+                "action_type",
+                "",
+            )
+        )
+
+        if action_type not in {
+            "self",
+            "edge_dc",
+            "cloud",
+            "drop",
+        }:
+            raise RuntimeError(
+                "Environment 返回未知 Routing action_type："
+                f"agent={agent_id}, "
+                f"action={action}, "
+                f"action_type={action_type}"
+            )
+
+        raw_target_dc_id = (
+            decoded_action.get(
+                "target_dc_id",
+                None,
+            )
+        )
+
+        target_dc_id = (
+            None
+            if raw_target_dc_id is None
+            else str(
+                raw_target_dc_id
+            )
+        )
+
+        return (
+            action_type,
+            target_dc_id,
+        )
 
 
 

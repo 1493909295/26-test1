@@ -527,18 +527,7 @@ def choose_random_routing_action(
         )
     )
 
-# 根据动作解码函数获取动作类型
-def infer_action_type(env: Any, agent_id: str, action: int,) -> str:
-    if int(action) == int(env.drop_action):
-        return "drop"
-    decode_action = getattr(env, "_decode_action", None)
-    if callable(decode_action):
-        decoded_action = decode_action(
-            agent_id=str(agent_id),
-            action=int(action),
-        )
-        return str(decoded_action.get("action_type", "unknown"))
-    return "unknown"
+
 
 # 遍历所有数据中心和 host，统计完成队列中的任务数量
 def count_completed_jobs(env: Any) -> int:
@@ -2646,17 +2635,19 @@ def train(
                     )
                     action_source = "policy"
 
-                action_type = infer_action_type(
-                    env=env,
-                    agent_id=decision.agent_id,
-                    action=action,
-                )
+                # ==========================================================
+                # Routing action 的真实语义统一由 Collector
+                # 调用 Environment._decode_action() 决定。
+                #
+                # Trainer 不再复制 action_type 推断逻辑。
+                # ==========================================================
 
-                transition, next_decision = (
-                    collector.execute_and_collect(
+                routing_result, next_decision = (
+                    collector.execute_and_record(
                         decision=decision,
+
                         action=action,
-                        action_type=action_type,
+
                         action_source=(
                             action_source
                         ),
@@ -2667,10 +2658,24 @@ def train(
 
                 # 记录这条经验的奖励和动作类型
                 stats.record_transition(
-                    agent_id=transition.agent_id,
-                    reward=transition.reward,
-                    action_type=action_type,
-                    action_source=action_source,
+                    agent_id=(
+                        routing_result.agent_id
+                    ),
+
+                    reward=(
+                        routing_result
+                            .immediate_reward
+                    ),
+
+                    action_type=(
+                        routing_result
+                            .action_type
+                    ),
+
+                    action_source=(
+                        routing_result
+                            .action_source
+                    ),
                 )
 
                 # ==========================================================
@@ -2681,13 +2686,19 @@ def train(
                 # 所以这里必须检查并立即 Flush。
                 # ==========================================================
 
-                if pending_trace_store.has_finalized_trace(
-                        transition.job_id
-                ):
+                # ==========================================================
+                # 当前 action 如果让 Job 在 Collector 中直接 Finalize，
+                # 典型情况就是 forced drop。
+                #
+                # 此类 Job 不会再产生 Environment terminal correction，
+                # 因此这里立即 Flush。
+                # ==========================================================
+
+                if routing_result.job_finalized:
                     finalized_trace = (
                         pending_trace_store
                             .get_finalized_trace(
-                            transition.job_id
+                            routing_result.job_id
                         )
                     )
 
@@ -2706,7 +2717,7 @@ def train(
                     )
 
                     pending_trace_store.pop_finalized_trace(
-                        transition.job_id
+                        routing_result.job_id
                     )
 
 
