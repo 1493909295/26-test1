@@ -59,7 +59,7 @@ DEVICE = "cuda:0"
 
 
 # 训练基本参数
-Episodes = 500         # 训练轮次
+Episodes = 1000        # 训练轮次
 ReplyBuffer_Capacity = 200000           # 经验池容量
 Batch_Size = 512            # 采样批量
 Seed = 42           # 宇宙的终极答案
@@ -67,6 +67,11 @@ Random_warmup_step = 5000           # 前期随机预热启动
 Learning_Starts = 5000          # 至少积累多少个普通动作后再开始更新网络
 Train_Every = 4                 # 收集多少经验训一次网络
 Updates_Per_Train = 2            # 每条经验最多执行多少次网络更新
+HOST_BATCH_SIZE = Batch_Size        # host采样批量
+HOST_RANDOM_WARMUP_STEPS = (Random_warmup_step)     # host前期随机预热启动
+HOST_LEARNING_STARTS = (Learning_Starts)        # host至少积累多少个普通动作后再开始更新网络
+HOST_TRAIN_EVERY = (Train_Every)        # host收集多少经验训一次网络
+HOST_UPDATES_PER_TRAIN = (Updates_Per_Train)        # host每条经验最多执行多少次网络更新
 Log_interval = 1            # 每多少episode打印一次统计信息
 Checkpoint_Interval = 100        # 每多少个episode保存一次带编号的checkpoint
 Checkpoint_Dir = "model/H-MASAC/checkpoints"
@@ -74,6 +79,10 @@ Log_csv_Path = "result/H-MASAC/train_log.csv"
 Old_Env_Path = None         #可选的旧环境文件路径,为 None 时，CloudEdgeEnv 会按自己的默认逻辑生成新环境
 Resume_Checkpoint = None         #可选的断点模型路径,为 None 表示从头训练。
 Vary_Episode_Seed: bool = True          # 是否在每个 episode 使用不同但可复现的 seed
+
+HOST_PRETRAIN_EPISODES = 200    # host训练轮数
+ROUTING_TRAIN_EPISODES = 500    # routing训练轮数
+JOINT_FINETUNE_EPISODES = (Episodes - HOST_PRETRAIN_EPISODES - ROUTING_TRAIN_EPISODES)      #合并训练
 
 
 

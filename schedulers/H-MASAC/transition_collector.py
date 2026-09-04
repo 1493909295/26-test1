@@ -26,6 +26,7 @@ class CloudEdgeEnvLike(Protocol):
     # current_job_id: Optional[str]
     # pending_host_job_id: Optional[str]
     # pending_host_dc_id: Optional[str]
+    current_job_id: Optional[str]
     current_time: float
     # local_obs_dim: int
     # global_state_dim: int
@@ -378,6 +379,92 @@ class TransitionCollector:
         return self._build_current_decision_snapshot()
     # 这里相当于把原来的 capture_decision() 拆成 _build_current_decision_snapshot()->capture_decision(),这样后面 execute_and_collect() 也可以调用同一个函数
 
+    def _validate_decision_is_current(
+            self,
+            decision: DecisionSnapshot,
+    ) -> None:
+        """
+        检查 Trainer 保存的 Routing DecisionSnapshot
+        是否仍然对应 Environment 当前真正等待执行的
+        Routing decision。
+
+        主要防止：
+
+            1. Host Phase 后错误复用旧 Routing snapshot；
+            2. 当前 Routing Agent 已经改变；
+            3. 当前 Job 已经改变；
+            4. 对过期状态执行 Actor action。
+
+        注意：
+            本函数只验证 Routing decision 的 identity，
+            不负责构造 Observation 或执行 action。
+        """
+
+        # ==========================================================
+        # 1. 当前必须仍然存在真正活跃的 Routing Agent。
+        #
+        # Host phase 下 agent_selection=None，
+        # _get_live_selected_agent() 会直接拒绝。
+        # ==========================================================
+
+        current_agent_id = (
+            self._get_live_selected_agent()
+        )
+
+        # ==========================================================
+        # 2. Agent 必须与 Snapshot 一致。
+        # ==========================================================
+
+        if (
+                current_agent_id
+                != str(
+            decision.agent_id
+        )
+        ):
+            raise RuntimeError(
+                "Routing DecisionSnapshot 已过期："
+                f"snapshot_agent={decision.agent_id}, "
+                f"current_agent={current_agent_id}, "
+                f"job={decision.job_id}"
+            )
+
+        # ==========================================================
+        # 3. 当前必须仍然存在 Routing Job。
+        # ==========================================================
+
+        if self.env.current_job_id is None:
+            raise RuntimeError(
+                "执行 Routing action 时 "
+                "Environment current_job_id 为 None："
+                f"snapshot_agent={decision.agent_id}, "
+                f"snapshot_job={decision.job_id}"
+            )
+
+        current_job_id = str(
+            self.env.current_job_id
+        )
+
+        # ==========================================================
+        # 4. Job 必须与 Snapshot 一致。
+        #
+        # 如果不同，说明 Environment 已经推进到另一个 Job，
+        # 不能再用旧 Observation 执行动作。
+        # ==========================================================
+
+        if (
+                current_job_id
+                != str(
+            decision.job_id
+        )
+        ):
+            raise RuntimeError(
+                "Routing DecisionSnapshot Job 已过期："
+                f"snapshot_job={decision.job_id}, "
+                f"current_job={current_job_id}, "
+                f"agent={current_agent_id}"
+            )
+
+
     def execute_and_record(
             self,
             decision: DecisionSnapshot,
@@ -451,6 +538,7 @@ class TransitionCollector:
             "forced",
             "random",
             "policy",
+            "orchestrator",
         }:
             raise ValueError(
                 "TransitionCollector 收到未知 action_source："

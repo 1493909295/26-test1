@@ -1,5 +1,5 @@
 from __future__ import annotations
-import argparse
+
 import csv
 import json
 import random
@@ -8,6 +8,7 @@ import os
 import time
 
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
@@ -40,7 +41,7 @@ import config as conf
 from routing_observation import (RoutingObservationBuilder,)
 from routing_centralized_state import (RoutingCentralizedStateBuilder,)
 from host_observation import (HostObservationBuilder,)
-from pending_job_trace import (PendingJobTraceStore,)
+
 
 TERMINAL_FAILURE_REASONS = frozenset({
     "waiting_timeout",
@@ -64,33 +65,143 @@ UPDATE_TENSOR_METRIC_NAMES = ("critic_loss",
 
 @dataclass(frozen=True)
 class TrainConfig:
-    num_episodes: int = conf.Episodes
-    routing_replay_capacity: int = (conf.ReplyBuffer_Capacity)
-    host_replay_capacity: int = (conf.ReplyBuffer_Capacity)
-    batch_size: int = conf.Batch_Size
-    random_warmup_steps: int = conf.Random_warmup_step
-    learning_starts: int = conf.Learning_Starts
-    # updates_per_step: int = conf.Updates_Per_Step
-    # max_decisions_per_episode: int = 100_000
-    train_every: int = conf.Train_Every
-    updates_per_train: int = conf.Updates_Per_Train
-    log_interval: int = conf.Log_interval
-    checkpoint_interval: int = conf.Checkpoint_Interval
+    num_episodes: int = (
+        conf.Episodes
+    )
+
+    # ==========================================================
+    # Replay
+    # ==========================================================
+
+    routing_replay_capacity: int = (
+        conf.ReplyBuffer_Capacity
+    )
+
+    host_replay_capacity: int = (
+        conf.ReplyBuffer_Capacity
+    )
+
+    # ==========================================================
+    # Routing MASAC training schedule
+    # ==========================================================
+
+    routing_batch_size: int = (
+        conf.Batch_Size
+    )
+
+    routing_random_warmup_steps: int = (
+        conf.Random_warmup_step
+    )
+
+    routing_learning_starts: int = (
+        conf.Learning_Starts
+    )
+
+    routing_train_every: int = (
+        conf.Train_Every
+    )
+
+    routing_updates_per_train: int = (
+        conf.Updates_Per_Train
+    )
+
+    # ==========================================================
+    # Local Host SAC training schedule
+    # ==========================================================
+
+    host_batch_size: int = (
+        conf.HOST_BATCH_SIZE
+    )
+
+    host_random_warmup_steps: int = (
+        conf.HOST_RANDOM_WARMUP_STEPS
+    )
+
+    host_learning_starts: int = (
+        conf.HOST_LEARNING_STARTS
+    )
+
+    host_train_every: int = (
+        conf.HOST_TRAIN_EVERY
+    )
+
+    host_updates_per_train: int = (
+        conf.HOST_UPDATES_PER_TRAIN
+    )
+
+    # ==========================================================
+    # Three-stage training
+    # ==========================================================
+
+    host_pretrain_episodes: int = (
+        conf.HOST_PRETRAIN_EPISODES
+    )
+
+    routing_train_episodes: int = (
+        conf.ROUTING_TRAIN_EPISODES
+    )
+
+    joint_finetune_episodes: int = (
+        conf.JOINT_FINETUNE_EPISODES
+    )
+
+    log_interval: int = (
+        conf.Log_interval
+    )
+
+    checkpoint_interval: int = (
+        conf.Checkpoint_Interval
+    )
+
     seed: int = conf.Seed
-    checkpoint_dir: str = conf.Checkpoint_Dir
-    log_csv_path: str = conf.Log_csv_Path
-    old_env_path: Optional[str] = conf.Old_Env_Path
-    resume_checkpoint: Optional[str] = conf.Resume_Checkpoint
-    vary_episode_seed: bool = conf.Vary_Episode_Seed
-    # completion_credit_decay: float = conf.COMPLETION_CREDIT_DECAY
-    # failure_credit_decay: float = (conf.FAILURE_CREDIT_DECAY)
-    use_neighbor_historical_feedback: bool = (conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK)
+
+    checkpoint_dir: str = (
+        conf.Checkpoint_Dir
+    )
+
+    log_csv_path: str = (
+        conf.Log_csv_Path
+    )
+
+    old_env_path: Optional[str] = (
+        conf.Old_Env_Path
+    )
+
+    resume_checkpoint: Optional[str] = (
+        conf.Resume_Checkpoint
+    )
+
+    vary_episode_seed: bool = (
+        conf.Vary_Episode_Seed
+    )
+
+    use_neighbor_historical_feedback: bool = (
+        conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK
+    )
+
+class TrainingStage( str,Enum,):
+    """
+    Two-Level Scheduler 三阶段训练状态。
+    """
+
+    HOST_PRETRAIN = (
+        "host_pretrain"
+    )
+
+    ROUTING_TRAIN = (
+        "routing_train"
+    )
+
+    JOINT_FINETUNE = (
+        "joint_finetune"
+    )
 
 # 统计一个 episode 运行期间的统计信息
 @dataclass
 class EpisodeStatistics:
     episode: int
     episode_seed: int
+    training_stage: str
     per_agent_returns: Dict[str, float]
     episode_return: float = 0.0
     decision_count: int = 0
@@ -102,7 +213,12 @@ class EpisodeStatistics:
     edge_action_count: int = 0
     cloud_action_count: int = 0
     drop_action_count: int = 0
-    update_count: int = 0
+    # Routing MASAC 当前 Episode 的梯度更新次数。
+    routing_update_count: int = 0
+
+    # 所有 Local Host SAC 在当前 Episode
+    # 合计完成的梯度更新次数。
+    host_update_count: int = 0
     update_metric_sums: Dict[str, float] = field(default_factory=dict)
     update_metric_counts: Dict[str, int] = field(default_factory=dict)
 
@@ -147,15 +263,48 @@ class EpisodeStatistics:
 
 
     # 记录一次 MASAC.update() 返回的训练指标
-    def record_update(self, update_info: Dict[str, float]) -> None:
-        self.update_count += 1
+    def record_routing_update(
+            self,
+            update_info: Dict[
+                str,
+                float,
+            ],
+    ) -> None:
 
-        for metric_name, metric_value in update_info.items():
-            metric_value = float(metric_value)
-            if not np.isfinite(metric_value):
+        self.routing_update_count += 1
+
+        for metric_name, metric_value in (
+                update_info.items()
+        ):
+
+            metric_value = float(
+                metric_value
+            )
+
+            if not np.isfinite(
+                    metric_value
+            ):
                 continue
-            self.update_metric_sums[metric_name] = (self.update_metric_sums.get(metric_name, 0.0)+ metric_value)
-            self.update_metric_counts[metric_name] = (self.update_metric_counts.get(metric_name, 0)+ 1)
+
+            self.update_metric_sums[
+                metric_name
+            ] = (
+                    self.update_metric_sums.get(
+                        metric_name,
+                        0.0,
+                    )
+                    + metric_value
+            )
+
+            self.update_metric_counts[
+                metric_name
+            ] = (
+                    self.update_metric_counts.get(
+                        metric_name,
+                        0,
+                    )
+                    + 1
+            )
 
     # 返回某个训练指标在当前episode中的平均值
     def mean_metric(self, metric_name: str) -> float:
@@ -165,6 +314,235 @@ class EpisodeStatistics:
         return float(
             self.update_metric_sums[metric_name] / count
         )
+
+def validate_training_stage_config(
+        train_config: TrainConfig,
+) -> None:
+
+    host_pretrain = int(
+        train_config
+        .host_pretrain_episodes
+    )
+
+    routing_train = int(
+        train_config
+        .routing_train_episodes
+    )
+
+    joint_finetune = int(
+        train_config
+        .joint_finetune_episodes
+    )
+
+    if min(
+        host_pretrain,
+        routing_train,
+        joint_finetune,
+    ) < 0:
+        raise ValueError(
+            "三阶段 Episode 数不能为负数。"
+        )
+
+    configured_total = (
+        host_pretrain
+        + routing_train
+        + joint_finetune
+    )
+
+    if (
+        configured_total
+        != int(
+            train_config.num_episodes
+        )
+    ):
+        raise ValueError(
+            "三阶段 Episode 总数与 "
+            "num_episodes 不一致："
+            f"stages={configured_total}, "
+            f"num_episodes="
+            f"{train_config.num_episodes}"
+        )
+
+def resolve_training_stage(
+        episode: int,
+        train_config: TrainConfig,
+) -> TrainingStage:
+
+    episode = int(
+        episode
+    )
+
+    host_end = int(
+        train_config
+        .host_pretrain_episodes
+    )
+
+    routing_end = (
+        host_end
+        + int(
+            train_config
+            .routing_train_episodes
+        )
+    )
+
+    if episode <= host_end:
+        return (
+            TrainingStage
+            .HOST_PRETRAIN
+        )
+
+    if episode <= routing_end:
+        return (
+            TrainingStage
+            .ROUTING_TRAIN
+        )
+
+    return (
+        TrainingStage
+        .JOINT_FINETUNE
+    )
+
+def stage_trains_routing(
+        stage: TrainingStage,
+) -> bool:
+
+    return stage in {
+        TrainingStage.ROUTING_TRAIN,
+        TrainingStage.JOINT_FINETUNE,
+    }
+
+
+def stage_trains_host(
+        stage: TrainingStage,
+) -> bool:
+
+    return stage in {
+        TrainingStage.HOST_PRETRAIN,
+        TrainingStage.JOINT_FINETUNE,
+    }
+
+def apply_training_stage_modes(
+        stage: TrainingStage,
+        routing_masac: RoutingMASAC,
+        host_sac_agents:
+        Dict[str, LocalHostSAC],
+) -> None:
+    """
+    根据 Training Stage 明确设置两层网络模式。
+
+    真正是否更新参数仍由 Orchestrator
+    是否调用 update() 决定。
+    """
+
+    if (
+        stage
+        == TrainingStage.HOST_PRETRAIN
+    ):
+
+        routing_masac.eval_mode()
+
+        for host_agent in (
+            host_sac_agents.values()
+        ):
+            host_agent.train_mode()
+
+        return
+
+    if (
+        stage
+        == TrainingStage.ROUTING_TRAIN
+    ):
+
+        routing_masac.train_mode()
+
+        for host_agent in (
+            host_sac_agents.values()
+        ):
+            host_agent.eval_mode()
+
+        return
+
+    # Joint fine-tune
+    routing_masac.train_mode()
+
+    for host_agent in (
+        host_sac_agents.values()
+    ):
+        host_agent.train_mode()
+
+def get_self_routing_action(
+        env: CloudEdgeEnv,
+        agent_id: str,
+) -> int:
+    """
+    Stage 1 Host Pretrain 时，
+    Orchestrator 直接让当前 Job 进入当前 DC Host 层。
+
+    不是 action mask，
+    也不是 Environment forced action。
+    """
+
+    agent_id = str(
+        agent_id
+    )
+
+    action = (
+        env.routing_dc_id_to_action
+        .get(
+            agent_id
+        )
+    )
+
+    if action is None:
+        raise RuntimeError(
+            "找不到当前 DC 对应的 Self "
+            "Routing action："
+            f"dc={agent_id}"
+        )
+
+    decoded = env._decode_action(
+        agent_id=agent_id,
+        action=int(action),
+    )
+
+    if (
+        str(
+            decoded["action_type"]
+        )
+        != "self"
+    ):
+        raise RuntimeError(
+            "Stage 1 Self bypass "
+            "动作编码错误："
+            f"dc={agent_id}, "
+            f"action={action}"
+        )
+
+    return int(
+        action
+    )
+
+def choose_random_host_action(
+        action_dim: int,
+        rng: np.random.Generator,
+) -> int:
+
+    action_dim = int(
+        action_dim
+    )
+
+    if action_dim <= 0:
+        raise ValueError(
+            "Host action_dim 必须 > 0"
+        )
+
+    return int(
+        rng.integers(
+            low=0,
+            high=action_dim,
+        )
+    )
+
 
 
 # 批量记录连续若干次 MASAC.update() 的训练指标，避免每次 update 内部执行大量 cuda_tensor.item()
@@ -198,7 +576,9 @@ def record_update_block(stats: EpisodeStatistics, update_infos: list[ Dict[str, 
                 UPDATE_TENSOR_METRIC_NAMES
             )
          }
-        stats.record_update(cpu_update_info)
+        stats.record_routing_update(
+            cpu_update_info
+        )
 
 def flush_finalized_trace_to_replay(
         finalized_trace: FinalizedJobTrace,
@@ -1597,13 +1977,33 @@ def calculate_episode_energy_metrics(env: Any,) -> Dict[str, float]:
 def checkpoint_state_path(model_path: Path) -> Path:
     return model_path.with_suffix(".trainer.json")
 
+def host_checkpoint_dir(
+        routing_model_path: Path,
+) -> Path:
+
+    return routing_model_path.with_name(
+        f"{routing_model_path.stem}"
+        "_hosts"
+    )
+
 # 同时保存 MASAC 模型和训练主循环状态
-def save_routing_checkpoint(
+def save_two_layer_checkpoint(
     routing_masac: RoutingMASAC,
+
+    host_sac_agents:
+    Dict[str, LocalHostSAC],
+
     model_path: Path,
+
     next_episode: int,
+
     global_decision_steps: int,
-    global_normal_action_steps: int,
+
+    routing_normal_action_steps: int,
+
+    host_training_action_steps:
+    Dict[str, int],
+
     best_episode_return: float,
 ) -> None:
     """
@@ -1632,9 +2032,28 @@ def save_routing_checkpoint(
             global_decision_steps
         ),
 
-        "global_normal_action_steps": int(
-            global_normal_action_steps
+        # ==========================================================
+        # Routing 层真正参与 random / policy 的动作总数。
+        #
+        # Stage 1 的 orchestrator Self 不计入这里。
+        # ==========================================================
+        "routing_normal_action_steps": int(
+            routing_normal_action_steps
         ),
+
+        # ==========================================================
+        # 每个 DC 自己的 Host training step。
+        #
+        # Resume 后必须恢复，否则 Host SAC 会重新进入
+        # random warmup。
+        # ==========================================================
+        "host_training_action_steps": {
+            str(dc_id): int(
+                step_count
+            )
+            for dc_id, step_count
+            in host_training_action_steps.items()
+        },
 
         "best_episode_return": float(
             best_episode_return
@@ -1656,50 +2075,201 @@ def save_routing_checkpoint(
         encoding="utf-8",
     )
 
-# 按需恢复模型和训练器状态
-def load_routing_checkpoint_if_needed(
-    routing_masac: RoutingMASAC,
-    resume_checkpoint: Optional[str],
-) -> Tuple[int, int, int, float]:
+def load_two_layer_checkpoint_if_needed(
+        routing_masac: RoutingMASAC,
 
-    # 没有指定 checkpoint 时，从第 1 个 episode 开始
+        host_sac_agents: Dict[
+            str,
+            LocalHostSAC,
+        ],
+
+        resume_checkpoint: Optional[str],
+) -> Tuple[
+    int,
+    int,
+    int,
+    Dict[str, int],
+    float,
+]:
+    """
+    恢复完整 Two-Level Scheduler checkpoint。
+
+    返回：
+
+        start_episode
+        global_decision_steps
+        routing_normal_action_steps
+        host_training_action_steps
+        best_episode_return
+    """
+
+    default_host_steps = {
+        str(dc_id): 0
+        for dc_id
+        in host_sac_agents.keys()
+    }
+
+    # ==========================================================
+    # 没有指定 checkpoint：
+    # 从全新训练状态开始。
+    # ==========================================================
+
     if resume_checkpoint is None:
-        return 1, 0, 0, float("-inf")
+        return (
+            1,
+            0,
+            0,
+            default_host_steps,
+            float("-inf"),
+        )
 
-    model_path = Path(resume_checkpoint)
+    model_path = Path(
+        resume_checkpoint
+    )
+
+    # ==========================================================
+    # 1. Routing MASAC
+    # ==========================================================
+
     routing_masac.load(
-        file_path=model_path,
+        file_path=(
+            model_path
+        ),
+
         load_optimizers=True,
     )
-    state_path = checkpoint_state_path(model_path)
+
+    # ==========================================================
+    # 2. Local Host SAC × DC
+    # ==========================================================
+
+    host_dir = host_checkpoint_dir(
+        model_path
+    )
+
+    if not host_dir.exists():
+        raise FileNotFoundError(
+            "恢复双层 checkpoint 时找不到 "
+            "Host checkpoint 目录："
+            f"{host_dir}"
+        )
+
+    for dc_id, host_agent in (
+        host_sac_agents.items()
+    ):
+
+        host_path = (
+            host_dir
+            / f"{dc_id}.pt"
+        )
+
+        if not host_path.exists():
+            raise FileNotFoundError(
+                "缺少 Local Host SAC checkpoint："
+                f"dc={dc_id}, "
+                f"path={host_path}"
+            )
+
+        host_agent.load(
+            host_path,
+            load_optimizers=True,
+        )
+
+    # ==========================================================
+    # 3. Trainer State
+    # ==========================================================
+
+    state_path = (
+        checkpoint_state_path(
+            model_path
+        )
+    )
 
     if not state_path.exists():
-        print(
-            "已恢复模型，但没有找到训练器状态文件："
-            f"{state_path}。训练 episode 计数将从 1 开始。"
-        )
-        return 1, 0, 0, float("-inf")
 
-    trainer_state = json.loads(state_path.read_text(encoding="utf-8"))
+        print(
+            "已恢复 Routing / Host 模型，"
+            "但没有找到 Trainer 状态文件："
+            f"{state_path}。"
+            "训练计数将从默认值重新开始。"
+        )
+
+        return (
+            1,
+            0,
+            0,
+            default_host_steps,
+            float("-inf"),
+        )
+
+    trainer_state = json.loads(
+        state_path.read_text(
+            encoding="utf-8"
+        )
+    )
 
     start_episode = int(
-        trainer_state.get("next_episode", 1)
-    )
-    global_decision_steps = int(
-        trainer_state.get("global_decision_steps", 0)
-    )
-    global_normal_action_steps = int(
-        trainer_state.get("global_normal_action_steps", 0)
-    )
-    best_episode_return = float(
-        trainer_state.get("best_episode_return", float("-inf"))
+        trainer_state.get(
+            "next_episode",
+            1,
+        )
     )
 
-    # 返回恢复后的训练进度。
+    global_decision_steps = int(
+        trainer_state.get(
+            "global_decision_steps",
+            0,
+        )
+    )
+
+    # ==========================================================
+    # 新 checkpoint 使用 routing_normal_action_steps。
+    #
+    # 为兼容旧 Routing-only Trainer State，
+    # 同时读取旧 global_normal_action_steps。
+    # ==========================================================
+
+    routing_normal_action_steps = int(
+        trainer_state.get(
+            "routing_normal_action_steps",
+
+            trainer_state.get(
+                "global_normal_action_steps",
+                0,
+            ),
+        )
+    )
+
+    saved_host_steps = (
+        trainer_state.get(
+            "host_training_action_steps",
+            {},
+        )
+    )
+
+    host_training_action_steps = {
+        str(dc_id): int(
+            saved_host_steps.get(
+                str(dc_id),
+                0,
+            )
+        )
+        for dc_id
+        in host_sac_agents.keys()
+    }
+
+    best_episode_return = float(
+        trainer_state.get(
+            "best_episode_return",
+            float("-inf"),
+        )
+    )
+
     return (
         start_episode,
         global_decision_steps,
-        global_normal_action_steps,
+        routing_normal_action_steps,
+        host_training_action_steps,
         best_episode_return,
     )
 
@@ -1764,7 +2334,7 @@ def build_episode_log_row(
     routing_masac: RoutingMASAC,
 
     global_decision_steps: int,
-    global_normal_action_steps: int,
+    routing_normal_action_steps: int,
     wall_time_seconds: float,
 ) -> Dict[str, Any]:
     # 当前 episode 总任务数。
@@ -1793,6 +2363,9 @@ def build_episode_log_row(
     return {
         "episode": int(stats.episode),
         "episode_seed": int(stats.episode_seed),
+        "training_stage": str(
+            stats.training_stage
+        ),
         "episode_return": float(stats.episode_return),
         "energy_normalization_j": float(conf.ENERGY_NORMALIZATION_J),
         "energy_cost_weight": float(conf.ENERGY_COST_WEIGHT),
@@ -1832,9 +2405,17 @@ def build_episode_log_row(
         "max_waiting_queue_length": max_waiting_queue_length,
         "remaining_waiting_jobs": remaining_waiting_jobs,
         "simulation_end_time": float(getattr(env, "current_time", 0.0)),
-        "episode_updates": int(stats.update_count),
+        "routing_episode_updates": int(
+    stats.routing_update_count
+),
+
+"host_episode_updates": int(
+    stats.host_update_count
+),
         "global_decision_steps": int(global_decision_steps),
-        "global_normal_action_steps": int(global_normal_action_steps),
+        "routing_normal_action_steps": int(
+            routing_normal_action_steps
+        ),
         "routing_replay_size": int(len(routing_replay_buffer)),
         "routing_replay_trainable_size": int(routing_replay_buffer.num_trainable_actions),
         "host_replay_size_total": int(sum(len(buffer) for buffer in host_replay_buffers.values())),
@@ -2107,8 +2688,10 @@ def print_episode_summary(row: Dict[str, Any]) -> None:
         f"{int(row['routing_replay_trainable_size']):7d} | "
         f"host_buffer="
         f"{int(row['host_replay_size_total']):7d} | "
-        f"updates="
-        f"{int(row['episode_updates']):5d} | "
+        f"routing_updates="
+f"{int(row['routing_episode_updates']):5d} | "
+f"host_updates="
+f"{int(row['host_episode_updates']):5d} | "
         f"critic_loss={critic_loss_text} | "
         f"alpha={float(row['alpha']):.5f}"
     )
@@ -2123,7 +2706,18 @@ def train(
         RoutingMASACConfig
     ] = None,
 
-) -> RoutingMASAC:
+    host_sac_config:
+    Optional[
+        HostSACConfig
+    ] = None,
+
+) -> Tuple[
+    RoutingMASAC,
+    Dict[str, LocalHostSAC],
+]:
+    validate_training_stage_config(
+        train_config
+    )
 
     set_global_random_seeds(train_config.seed)
 
@@ -2160,13 +2754,48 @@ def train(
     ):
         dc_id = str(dc_id)
 
-        host_config = HostSACConfig(
-            seed=(
-                    int(train_config.seed)
-                    + 10_000
-                    + host_dc_index
-            ),
-        )
+        if host_sac_config is None:
+            host_sac_config = (
+                HostSACConfig(
+                    actor_lr=(
+                        conf.ACTOR_LR
+                    ),
+
+                    critic_lr=(
+                        conf.CRITIC_LR
+                    ),
+
+                    alpha_lr=(
+                        conf.ALPHA_LR
+                    ),
+
+                    actor_hidden_dim=(
+                        conf.ACTOR_HIDDEN_DIM
+                    ),
+
+                    critic_hidden_dim=(
+                        conf.Q_NET_HIDDEN_DIM
+                    ),
+
+                    initial_alpha=(
+                        conf.INITIAL_ALPHA
+                    ),
+
+                    target_entropy_ratio=(
+                        conf.TARGET_ENTROPY_RATIO
+                    ),
+
+                    max_grad_norm=(
+                        conf.MAX_GRAD_NORM
+                    ),
+
+                    device=conf.DEVICE,
+
+                    seed=int(
+                        train_config.seed
+                    ),
+                )
+            )
 
         host_obs_dim = int(
             host_observation_builder
@@ -2198,7 +2827,7 @@ def train(
             ),
 
             config=(
-                host_config
+                host_sac_config
             ),
         )
 
@@ -2236,6 +2865,44 @@ def train(
                     + host_dc_index
             ),
         )
+    host_training_action_steps: Dict[
+        str,
+        int,
+    ] = {
+        str(dc_id): 0
+        for dc_id
+        in env.edge_dc_ids
+    }
+
+    # ==============================================================
+    # Local Host SAC Independent Action RNG
+    #
+    # 每个 DC 使用自己独立的 NumPy RNG，
+    # 用于 Host random warmup 阶段随机选择 Host。
+    #
+    # 这样不同 DC 的随机 Host action stream 不会共用
+    # 同一个随机生成器。
+    # ==============================================================
+
+    host_action_rngs: Dict[
+        str,
+        np.random.Generator,
+    ] = {
+        str(dc_id):
+            np.random.default_rng(
+                int(
+                    train_config.seed
+                )
+                + 30_000
+                + dc_index
+            )
+
+        for dc_index, dc_id
+        in enumerate(
+            env.edge_dc_ids
+        )
+    }
+
 
     routing_observation_builder = (
         RoutingObservationBuilder(
@@ -2365,21 +3032,25 @@ def train(
 
     action_rng = np.random.default_rng(int(train_config.seed))
 
-    # 按需恢复 checkpoint 和训练进度
     (
         start_episode,
         global_decision_steps,
-        global_normal_action_steps,
+        routing_normal_action_steps,
+        host_training_action_steps,
         best_episode_return,
-    ) = load_routing_checkpoint_if_needed(
-    routing_masac=(
-        routing_masac
-    ),
+    ) = load_two_layer_checkpoint_if_needed(
+        routing_masac=(
+            routing_masac
+        ),
 
-    resume_checkpoint=(
-        train_config.resume_checkpoint
-    ),
-)
+        host_sac_agents=(
+            host_sac_agents
+        ),
+
+        resume_checkpoint=(
+            train_config.resume_checkpoint
+        ),
+    )
 
     # 把保存路径转换成 Path
     checkpoint_dir = Path(train_config.checkpoint_dir)
@@ -2422,6 +3093,29 @@ def train(
 
             collector.reset_episode()
 
+            training_stage = (
+                resolve_training_stage(
+                    episode=episode,
+                    train_config=(
+                        train_config
+                    ),
+                )
+            )
+
+            apply_training_stage_modes(
+                stage=(
+                    training_stage
+                ),
+
+                routing_masac=(
+                    routing_masac
+                ),
+
+                host_sac_agents=(
+                    host_sac_agents
+                ),
+            )
+
             # 为每个智能体创建奖励累计字典
             per_agent_returns = {}
             for agent_id in env.possible_agents:
@@ -2429,9 +3123,21 @@ def train(
 
             # 创建当前 episode 的统计对象
             stats = EpisodeStatistics(
-                episode=int(episode),
-                episode_seed=episode_seed,
-                per_agent_returns=per_agent_returns,
+                episode=int(
+                    episode
+                ),
+
+                episode_seed=(
+                    episode_seed
+                ),
+
+                per_agent_returns=(
+                    per_agent_returns
+                ),
+
+                training_stage=(
+                    training_stage.value
+                ),
             )
 
             # 记录episode开始的时间
@@ -2496,14 +3202,103 @@ def train(
                     )
 
                     # 当前 DC 自己的 Local Host SAC 决策。
-                    host_action = (
+                    host_agent = (
                         host_sac_agents[
                             host_dc_id
-                        ].select_action(
-                            host_obs=host_obs,
-                            deterministic=False,
-                        )
+                        ]
                     )
+
+                    host_replay = (
+                        host_replay_buffers[
+                            host_dc_id
+                        ]
+                    )
+
+                    # ==========================================================
+                    # Training Stage 决定 Host action 行为。
+                    # ==========================================================
+
+                    if (
+                            training_stage
+                            == TrainingStage.ROUTING_TRAIN
+                    ):
+                        # ======================================================
+                        # Stage 2：
+                        #
+                        # Host 网络完全冻结。
+                        #
+                        # 使用 deterministic policy，
+                        # 降低 Routing MASAC 所面对环境的非平稳性。
+                        # ======================================================
+
+                        host_action = (
+                            host_agent.select_action(
+                                host_obs=host_obs,
+                                deterministic=True,
+                            )
+                        )
+
+                        host_action_source = (
+                            "policy"
+                        )
+
+                    else:
+
+                        # ======================================================
+                        # Stage 1 / Stage 3：
+                        #
+                        # Host SAC 参与训练。
+                        # 每个 DC 独立进行 random warmup。
+                        # ======================================================
+
+                        host_training_steps = int(
+                            host_training_action_steps[
+                                host_dc_id
+                            ]
+                        )
+
+                        if (
+                                host_training_steps
+                                < int(
+                            train_config
+                                    .host_random_warmup_steps
+                        )
+                        ):
+
+                            host_action = (
+                                choose_random_host_action(
+                                    action_dim=(
+                                        host_agent.action_dim
+                                    ),
+
+                                    rng=(
+                                        host_action_rngs[
+                                            host_dc_id
+                                        ]
+                                    ),
+                                )
+                            )
+
+                            host_action_source = (
+                                "random"
+                            )
+
+                        else:
+
+                            host_action = (
+                                host_agent.select_action(
+                                    host_obs=host_obs,
+                                    deterministic=False,
+                                )
+                            )
+
+                            host_action_source = (
+                                "policy"
+                            )
+
+                        host_training_action_steps[
+                            host_dc_id
+                        ] += 1
 
                     # ==========================================================
                     # 非 PettingZoo Host execution。
@@ -2582,19 +3377,18 @@ def train(
                     pending_trace_store.record_host_step(
                         job_id=host_job_id,
                         dc_id=host_dc_id,
-
-                        # 使用真正的决策时间。
                         env_time=host_decision_time,
-
                         host_obs=host_obs,
-
                         action=int(
                             host_action
                         ),
-
                         host_id=actual_host_id,
 
-                        action_source="policy",
+                        # Stage 1 warmup 可以是 random；
+                        # Stage 1/3 后期以及 Stage 2 为 policy。
+                        action_source=(
+                            host_action_source
+                        ),
                     )
 
                     # ==========================================================
@@ -2654,8 +3448,81 @@ def train(
 
 
                     )
+                    # ==========================================================
+                    # Local Host SAC Update
+                    #
+                    # 只在：
+                    #
+                    #   Stage 1 Host Pretrain
+                    #   Stage 3 Joint Fine-tune
+                    #
+                    # 更新。
+                    #
+                    # Stage 2 Host 完全冻结。
+                    # ==========================================================
 
-                    # Host action 后之前缓存的 Routing snapshot 已失效。
+                    if stage_trains_host(
+                            training_stage
+                    ):
+
+                        host_steps = int(
+                            host_training_action_steps[
+                                host_dc_id
+                            ]
+                        )
+
+                        ready_to_update_host = (
+                                host_steps
+                                >= int(
+                            train_config
+                                .host_learning_starts
+                        )
+
+                                and host_steps
+                                % int(
+                            train_config
+                                .host_train_every
+                        )
+                                == 0
+
+                                and host_replay.can_sample(
+                            batch_size=int(
+                                train_config
+                                    .host_batch_size
+                            )
+                        )
+                        )
+
+                        if ready_to_update_host:
+
+                            host_update_infos = []
+
+                            for _ in range(
+                                    int(
+                                        train_config
+                                                .host_updates_per_train
+                                    )
+                            ):
+                                host_update_infos.append(
+                                    host_agent.update(
+                                        replay_buffer=(
+                                            host_replay
+                                        ),
+
+                                        batch_size=int(
+                                            train_config
+                                                .host_batch_size
+                                        ),
+                                    )
+                                )
+
+                            stats.host_update_count += int(
+                                len(
+                                    host_update_infos
+                                )
+                            )
+
+                            # 后面把该 block 记录到 Host 独立日志统计。global_normal_action_steps                    # Host action 后之前缓存的 Routing snapshot 已失效。
                     decision = None
 
                     # 当前第十四步不创建 Host Replay Transition。
@@ -2681,24 +3548,75 @@ def train(
                 # ----------------------------------------------------------
 
                 if decision.forced_action is not None:
+
+                    # Environment lifecycle forced drop
                     action = int(
                         decision.forced_action
                     )
-                    action_source = "forced"
+
+                    action_source = (
+                        "forced"
+                    )
+
 
                 elif (
-                        global_normal_action_steps
+                        training_stage
+                        == TrainingStage.HOST_PRETRAIN
+                ):
+
+                    # ======================================================
+                    # Stage 1:
+                    #
+                    # Routing 不参与学习。
+                    # 所有正常 Job 都进入当前 DC 的 Host 层。
+                    #
+                    # 该 Self action：
+                    #   - 写入 Causal Trace；
+                    #   - 不进入 Routing Replay；
+                    #   - 不增加 Routing warmup step。
+                    # ======================================================
+
+                    action = (
+                        get_self_routing_action(
+                            env=env,
+                            agent_id=(
+                                decision.agent_id
+                            ),
+                        )
+                    )
+
+                    action_source = (
+                        "orchestrator"
+                    )
+
+
+                elif (
+                        routing_normal_action_steps
                         < int(
-                    train_config.random_warmup_steps
+                    train_config
+                            .routing_random_warmup_steps
                 )
                 ):
-                    action = choose_random_routing_action(
-                        action_dim=env.action_dim,
-                        rng=action_rng,
+
+                    action = (
+                        choose_random_routing_action(
+                            action_dim=(
+                                env.action_dim
+                            ),
+
+                            rng=(
+                                action_rng
+                            ),
+                        )
                     )
-                    action_source = "random"
+
+                    action_source = (
+                        "random"
+                    )
+
 
                 else:
+
                     action = (
                         routing_masac
                             .select_action(
@@ -2713,7 +3631,10 @@ def train(
                             deterministic=False,
                         )
                     )
-                    action_source = "policy"
+
+                    action_source = (
+                        "policy"
+                    )
 
                 # ==========================================================
                 # Routing action 的真实语义统一由 Collector
@@ -2824,63 +3745,98 @@ def train(
 
                 # 增加计数
                 global_decision_steps += 1
-                if action_source != "forced":
-                    global_normal_action_steps += 1
+                if action_source in {
+                    "random",
+                    "policy",
+                }:
+
+                    routing_normal_action_steps += 1
                     if (
-                            global_normal_action_steps
-                            == int(train_config.random_warmup_steps)
+                            routing_normal_action_steps
+                            == int(
+                        train_config
+                                .routing_random_warmup_steps
+                    )
                     ):
                         print(
                             "\n"
                             "============================================================\n"
-                            "✅ 随机动作预热结束\n"
+                            "✅ Routing 随机动作预热结束\n"
                             "============================================================\n"
                         )
 
                 # 同时满足以下条件才允许更新网络：
                 # 1. 普通动作总数已经达到 learning_starts；
                 # 2. ReplayBuffer 中普通经验足够采样一个 batch。
-                ready_to_update = (
-                        action_source != "forced"
-                        and global_normal_action_steps
+                ready_to_update_routing = (
+                        stage_trains_routing(
+                            training_stage
+                        )
+
+                        and action_source
+                        in {
+                            "random",
+                            "policy",
+                        }
+
+                        and routing_normal_action_steps
                         >= int(
-                    train_config.learning_starts
+                    train_config
+                        .routing_learning_starts
                 )
-                        and global_normal_action_steps
+
+                        and routing_normal_action_steps
                         % int(
-                    train_config.train_every
+                    train_config
+                        .routing_train_every
                 )
                         == 0
-                        and routing_replay_buffer.can_sample(
+
+                        and routing_replay_buffer
+                        .can_sample(
                     batch_size=int(
-                        train_config.batch_size
+                        train_config
+                            .routing_batch_size
                     ),
+
                     include_forced_actions=False,
                 )
                 )
 
                 # 网络更新
-                if ready_to_update:
+                if ready_to_update_routing:
+
                     update_info_block = []
-                    for _ in range(int(train_config.updates_per_train)):
-                        # 从 ReplayBuffer 采样并执行一次完整 SAC 更新
+
+                    for _ in range(
+                            int(
+                                train_config
+                                        .routing_updates_per_train
+                            )
+                    ):
                         update_info = (
-                            routing_masac
-                                .update(
+                            routing_masac.update(
                                 replay_buffer=(
                                     routing_replay_buffer
                                 ),
 
                                 batch_size=int(
-                                    train_config.batch_size
+                                    train_config
+                                        .routing_batch_size
                                 ),
                             )
                         )
 
+                        update_info_block.append(
+                            update_info
+                        )
 
-                        # stats.record_update(update_info)
-                        update_info_block.append(update_info)
-                    record_update_block(stats=stats,update_infos=update_info_block,)
+                    record_update_block(
+                        stats=stats,
+                        update_infos=(
+                            update_info_block
+                        ),
+                    )
 
             # ==============================================================
             # Episode 结束后的最后一次 delayed outcome flush。
@@ -2931,8 +3887,8 @@ def train(
                     global_decision_steps
                 ),
 
-                global_normal_action_steps=(
-                    global_normal_action_steps
+                routing_normal_action_steps=(
+                    routing_normal_action_steps
                 ),
 
                 wall_time_seconds=(
@@ -2951,38 +3907,115 @@ def train(
                     stats.episode_return
                 )
 
-                save_routing_checkpoint(
+                save_two_layer_checkpoint(
                     routing_masac=(
                         routing_masac
                     ),
-                    model_path=checkpoint_dir / "best.pt",
-                    next_episode=episode + 1,
-                    global_decision_steps=global_decision_steps,
-                    global_normal_action_steps=global_normal_action_steps,
-                    best_episode_return=best_episode_return,
-                )
 
+                    host_sac_agents=(
+                        host_sac_agents
+                    ),
+
+                    model_path=(
+                            checkpoint_dir
+                            / "best.pt"
+                    ),
+
+                    next_episode=(
+                            episode + 1
+                    ),
+
+                    global_decision_steps=(
+                        global_decision_steps
+                    ),
+
+                    routing_normal_action_steps=(
+                        routing_normal_action_steps
+                    ),
+
+                    host_training_action_steps=(
+                        host_training_action_steps
+                    ),
+
+                    best_episode_return=(
+                        best_episode_return
+                    ),
+                )
             # 断点恢复
-            save_routing_checkpoint(
+            save_two_layer_checkpoint(
                 routing_masac=(
                     routing_masac
                 ),
-                model_path=checkpoint_dir / "latest.pt",
-                next_episode=episode + 1,
-                global_decision_steps=global_decision_steps,
-                global_normal_action_steps=global_normal_action_steps,
-                best_episode_return=best_episode_return,
+
+                host_sac_agents=(
+                    host_sac_agents
+                ),
+
+                model_path=(
+                        checkpoint_dir
+                        / "latest.pt"
+                ),
+
+                next_episode=(
+                        episode + 1
+                ),
+
+                global_decision_steps=(
+                    global_decision_steps
+                ),
+
+                routing_normal_action_steps=(
+                    routing_normal_action_steps
+                ),
+
+                host_training_action_steps=(
+                    host_training_action_steps
+                ),
+
+                best_episode_return=(
+                    best_episode_return
+                ),
             )
-            if (episode % int(train_config.checkpoint_interval) == 0):
-                save_routing_checkpoint(
+            if (
+                    episode
+                    % int(
+                train_config.checkpoint_interval
+            )
+                    == 0
+            ):
+                save_two_layer_checkpoint(
                     routing_masac=(
                         routing_masac
                     ),
-                    model_path=(checkpoint_dir / f"episode_{episode:06d}.pt"),
-                    next_episode=episode + 1,
-                    global_decision_steps=global_decision_steps,
-                    global_normal_action_steps=global_normal_action_steps,
-                    best_episode_return=best_episode_return,
+
+                    host_sac_agents=(
+                        host_sac_agents
+                    ),
+
+                    model_path=(
+                            checkpoint_dir
+                            / f"episode_{episode:06d}.pt"
+                    ),
+
+                    next_episode=(
+                            episode + 1
+                    ),
+
+                    global_decision_steps=(
+                        global_decision_steps
+                    ),
+
+                    routing_normal_action_steps=(
+                        routing_normal_action_steps
+                    ),
+
+                    host_training_action_steps=(
+                        host_training_action_steps
+                    ),
+
+                    best_episode_return=(
+                        best_episode_return
+                    ),
                 )
 
     finally:
@@ -2991,30 +4024,117 @@ def train(
             close_method()
 
     # 全部 episode 完成后保存 final checkpoint
-    save_routing_checkpoint(
+    save_two_layer_checkpoint(
         routing_masac=(
             routing_masac
         ),
-        model_path=checkpoint_dir / "final.pt",
-        next_episode=int(train_config.num_episodes) + 1,
-        global_decision_steps=global_decision_steps,
-        global_normal_action_steps=global_normal_action_steps,
-        best_episode_return=best_episode_return,
+
+        host_sac_agents=(
+            host_sac_agents
+        ),
+
+        model_path=(
+                checkpoint_dir
+                / "final.pt"
+        ),
+
+        next_episode=(
+                int(
+                    train_config.num_episodes
+                )
+                + 1
+        ),
+
+        global_decision_steps=(
+            global_decision_steps
+        ),
+
+        routing_normal_action_steps=(
+            routing_normal_action_steps
+        ),
+
+        host_training_action_steps=(
+            host_training_action_steps
+        ),
+
+        best_episode_return=(
+            best_episode_return
+        ),
     )
 
-    return routing_masac
+    return (
+        routing_masac,
+        host_sac_agents,
+    )
 
 def main() -> None:
     train_config = TrainConfig(
         num_episodes=conf.Episodes,
         routing_replay_capacity=(conf.ReplyBuffer_Capacity),
         host_replay_capacity=(conf.ReplyBuffer_Capacity),
-        batch_size=conf.Batch_Size,
-        random_warmup_steps=conf.Random_warmup_step,
-        learning_starts=conf.Learning_Starts,
-        # updates_per_step=conf.Updates_Per_Step,
-        train_every=conf.Train_Every,
-        updates_per_train=conf.Updates_Per_Train,
+        # ==========================================================
+        # Routing MASAC Training Schedule
+        # ==========================================================
+
+        routing_batch_size=(
+            conf.Batch_Size
+        ),
+
+        routing_random_warmup_steps=(
+            conf.Random_warmup_step
+        ),
+
+        routing_learning_starts=(
+            conf.Learning_Starts
+        ),
+
+        routing_train_every=(
+            conf.Train_Every
+        ),
+
+        routing_updates_per_train=(
+            conf.Updates_Per_Train
+        ),
+
+        # ==========================================================
+        # Local Host SAC Training Schedule
+        # ==========================================================
+
+        host_batch_size=(
+            conf.HOST_BATCH_SIZE
+        ),
+
+        host_random_warmup_steps=(
+            conf.HOST_RANDOM_WARMUP_STEPS
+        ),
+
+        host_learning_starts=(
+            conf.HOST_LEARNING_STARTS
+        ),
+
+        host_train_every=(
+            conf.HOST_TRAIN_EVERY
+        ),
+
+        host_updates_per_train=(
+            conf.HOST_UPDATES_PER_TRAIN
+        ),
+
+        # ==========================================================
+        # Three-Stage Training
+        # ==========================================================
+
+        host_pretrain_episodes=(
+            conf.HOST_PRETRAIN_EPISODES
+        ),
+
+        routing_train_episodes=(
+            conf.ROUTING_TRAIN_EPISODES
+        ),
+
+        joint_finetune_episodes=(
+            conf.JOINT_FINETUNE_EPISODES
+        ),
         log_interval=conf.Log_interval,
         checkpoint_interval=conf.Checkpoint_Interval,
         seed=conf.Seed,
@@ -3023,6 +4143,62 @@ def main() -> None:
         old_env_path=conf.Old_Env_Path,
         resume_checkpoint=conf.Resume_Checkpoint,
         vary_episode_seed=conf.Vary_Episode_Seed
+    )
+
+    host_sac_config = (
+        HostSACConfig(
+            gamma=conf.GAMMA,
+
+            tau=conf.TUA,
+
+            actor_lr=(
+                conf.ACTOR_LR
+            ),
+
+            critic_lr=(
+                conf.CRITIC_LR
+            ),
+
+            alpha_lr=(
+                conf.ALPHA_LR
+            ),
+
+            actor_hidden_dim=(
+                conf.ACTOR_HIDDEN_DIM
+            ),
+
+            critic_hidden_dim=(
+                conf.Q_NET_HIDDEN_DIM
+            ),
+
+            initial_alpha=(
+                conf.INITIAL_ALPHA
+            ),
+
+            target_entropy_ratio=(
+                conf.TARGET_ENTROPY_RATIO
+            ),
+
+            max_grad_norm=(
+                conf.MAX_GRAD_NORM
+            ),
+
+            policy_update_interval=(
+                conf.Policy_Updata_Interval
+            ),
+
+            target_update_interval=(
+                conf.Target_Update_Interval
+            ),
+
+            device=(
+                conf.DEVICE
+            ),
+
+            seed=(
+                conf.Seed
+            ),
+        )
     )
 
     routing_masac_config = (
@@ -3083,6 +4259,10 @@ def main() -> None:
 
         routing_masac_config=(
             routing_masac_config
+        ),
+
+        host_sac_config=(
+            host_sac_config
         ),
     )
 

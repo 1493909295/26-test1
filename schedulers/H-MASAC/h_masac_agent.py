@@ -2,13 +2,14 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 import math
 from pathlib import Path
-from typing import Any, Dict, Optional, Union
+from typing import  Dict, Optional, Union
 import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 from h_sac_model import (RoutingDiscreteActor, RoutingTwinDiscreteCritic,hard_update,soft_update,  LocalHostDiscreteActor,LocalHostTwinCritic,)
 from routing_replay_buffer import (RoutingReplayBatch,RoutingReplayBuffer,)
+from host_replay_buffer import (HostReplayBatch, HostReplayBuffer,)
 
 __all__ = (
     # Routing MASAC
@@ -22,7 +23,7 @@ __all__ = (
 
 
 # 超参数配置
-@dataclass(frozen=True)
+
 @dataclass(frozen=True)
 class RoutingMASACConfig:
     gamma: float = 0.99
@@ -48,6 +49,10 @@ class RoutingMASACConfig:
 
 @dataclass(frozen=True)
 class HostSACConfig:
+    """
+    单个 DC 的 Independent Local Host SAC 配置。
+    """
+
     gamma: float = 0.99
     tau: float = 0.005
 
@@ -62,6 +67,9 @@ class HostSACConfig:
     target_entropy_ratio: float = 0.2
 
     max_grad_norm: Optional[float] = 10.0
+
+    policy_update_interval: int = 1
+    target_update_interval: int = 1
 
     device: Optional[str] = None
     seed: int = 42
@@ -91,6 +99,28 @@ class RoutingTensorBatch:
     # 当前 RoutingReplayBuffer 已不保存 forced transition，
     # 暂时保留该字段以兼容现有训练检查接口。
     is_forced_action: torch.Tensor
+
+@dataclass(frozen=True)
+class HostTensorBatch:
+    """
+    HostReplayBatch 转换为 GPU Tensor 后的内部结构。
+
+    Host 层采用：
+        One Job
+        -> One Host Decision
+        -> One terminal transition
+    """
+
+    host_obs: torch.Tensor
+
+    actions: torch.Tensor
+    rewards: torch.Tensor
+
+    next_host_obs: torch.Tensor
+
+    terminated: torch.Tensor
+    truncated: torch.Tensor
+    done: torch.Tensor
 
 class RoutingMASAC:
     def __init__(
@@ -1009,6 +1039,613 @@ class LocalHostSAC:
         return int(
             action_tensor.item()
         )
+
+    def update(
+            self,
+            replay_buffer: HostReplayBuffer,
+            batch_size: int,
+    ) -> Dict[str, Union[float, torch.Tensor]]:
+        """
+        从当前 DC 自己的 HostReplayBuffer
+        采样并执行一次 Local Host SAC 更新。
+
+        Host Replay 中所有经验都是：
+
+            One Job
+            -> One Host Decision
+            -> terminal
+
+        因而不会使用其他 Job 的 Host Observation
+        作为 bootstrap next state。
+        """
+
+        batch_size = int(
+            batch_size
+        )
+
+        replay_batch = replay_buffer.sample(
+            batch_size=batch_size,
+            replace=False,
+        )
+
+        batch = self._batch_to_tensors(
+            replay_batch
+        )
+
+        critic_info = self._update_critic(
+            batch
+        )
+
+        self.update_step += 1
+
+        nan_value = torch.full(
+            (),
+            float("nan"),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        actor_loss_value = nan_value
+        alpha_loss_value = nan_value
+        entropy_value = nan_value
+        target_entropy_value = nan_value
+
+        if (
+                self.update_step
+                % int(
+            self.config.policy_update_interval
+        )
+                == 0
+        ):
+            actor_info = self._update_actor(
+                batch
+            )
+
+            alpha_info = self._update_alpha(
+                batch
+            )
+
+            actor_loss_value = (
+                actor_info["actor_loss"]
+            )
+
+            entropy_value = (
+                actor_info["policy_entropy"]
+            )
+
+            alpha_loss_value = (
+                alpha_info["alpha_loss"]
+            )
+
+            target_entropy_value = (
+                alpha_info["target_entropy"]
+            )
+
+        if (
+                self.update_step
+                % int(
+            self.config.target_update_interval
+        )
+                == 0
+        ):
+            soft_update(
+                target_network=(
+                    self.target_critic
+                ),
+
+                source_network=(
+                    self.critic
+                ),
+
+                tau=float(
+                    self.config.tau
+                ),
+            )
+
+        return {
+            "update_step":
+                torch.tensor(
+                    float(self.update_step),
+                    dtype=torch.float32,
+                    device=self.device,
+                ),
+
+            "critic_loss":
+                critic_info["critic_loss"],
+
+            "q1_loss":
+                critic_info["q1_loss"],
+
+            "q2_loss":
+                critic_info["q2_loss"],
+
+            "mean_q1":
+                critic_info["mean_q1"],
+
+            "mean_q2":
+                critic_info["mean_q2"],
+
+            "mean_target_q":
+                critic_info[
+                    "mean_target_q"
+                ],
+
+            "actor_loss":
+                actor_loss_value,
+
+            "alpha_loss":
+                alpha_loss_value,
+
+            "alpha":
+                self.alpha.detach(),
+
+            "policy_entropy":
+                entropy_value,
+
+            "target_entropy":
+                target_entropy_value,
+        }
+
+    def _batch_to_tensors(
+            self,
+            batch: HostReplayBatch,
+    ) -> HostTensorBatch:
+
+        return HostTensorBatch(
+            host_obs=torch.as_tensor(
+                batch.host_obs,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+
+            actions=torch.as_tensor(
+                batch.actions,
+                dtype=torch.long,
+                device=self.device,
+            ),
+
+            rewards=torch.as_tensor(
+                batch.rewards,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+
+            next_host_obs=torch.as_tensor(
+                batch.next_host_obs,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+
+            terminated=torch.as_tensor(
+                batch.terminated,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+
+            truncated=torch.as_tensor(
+                batch.truncated,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+
+            done=torch.as_tensor(
+                batch.done,
+                dtype=torch.float32,
+                device=self.device,
+            ),
+        )
+
+    def _update_critic(
+            self,
+            batch: HostTensorBatch,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Local Host Critic update。
+
+        当前 Host Transition 永远 terminal：
+
+            done = 1
+
+        所以 TD target：
+
+            y = r
+
+        不使用其他 Job 的 Host Observation bootstrap。
+        """
+
+        if not bool(
+                torch.all(
+                    batch.done
+                    > 0.5
+                ).item()
+        ):
+            raise RuntimeError(
+                "HostReplayBuffer 中出现 "
+                "non-terminal Host transition。"
+            )
+
+        target_q = (
+            batch.rewards.detach()
+        )
+
+        q1_all, q2_all = (
+            self.critic(
+                batch.host_obs
+            )
+        )
+
+        action_index = (
+            batch.actions.unsqueeze(1)
+        )
+
+        q1 = q1_all.gather(
+            dim=1,
+            index=action_index,
+        ).squeeze(1)
+
+        q2 = q2_all.gather(
+            dim=1,
+            index=action_index,
+        ).squeeze(1)
+
+        q1_loss = F.mse_loss(
+            q1,
+            target_q,
+        )
+
+        q2_loss = F.mse_loss(
+            q2,
+            target_q,
+        )
+
+        critic_loss = (
+                q1_loss
+                + q2_loss
+        )
+
+        self.critic_optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        critic_loss.backward()
+
+        if (
+                self.config.max_grad_norm
+                is not None
+        ):
+            torch.nn.utils.clip_grad_norm_(
+                self.critic.parameters(),
+                float(
+                    self.config.max_grad_norm
+                ),
+            )
+
+        self.critic_optimizer.step()
+
+        return {
+            "critic_loss":
+                critic_loss.detach(),
+
+            "q1_loss":
+                q1_loss.detach(),
+
+            "q2_loss":
+                q2_loss.detach(),
+
+            "mean_q1":
+                q1.detach().mean(),
+
+            "mean_q2":
+                q2.detach().mean(),
+
+            "mean_target_q":
+                target_q.detach().mean(),
+        }
+
+    def _update_actor(
+            self,
+            batch: HostTensorBatch,
+    ) -> Dict[str, torch.Tensor]:
+
+        action_probs, action_log_probs, _ = (
+            self.actor.get_policy(
+                batch.host_obs
+            )
+        )
+
+        with torch.no_grad():
+            q1_values, q2_values = (
+                self.critic(
+                    batch.host_obs
+                )
+            )
+
+            min_q_values = torch.minimum(
+                q1_values,
+                q2_values,
+            )
+
+        actor_loss = (
+                action_probs
+                * (
+                        self.alpha.detach()
+                        * action_log_probs
+                        - min_q_values
+                )
+        ).sum(
+            dim=-1
+        ).mean()
+
+        self.actor_optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        actor_loss.backward()
+
+        if (
+                self.config.max_grad_norm
+                is not None
+        ):
+            torch.nn.utils.clip_grad_norm_(
+                self.actor.parameters(),
+                float(
+                    self.config.max_grad_norm
+                ),
+            )
+
+        self.actor_optimizer.step()
+
+        policy_entropy = -(
+                action_probs
+                * action_log_probs
+        ).sum(
+            dim=-1
+        ).mean()
+
+        return {
+            "actor_loss":
+                actor_loss.detach(),
+
+            "policy_entropy":
+                policy_entropy.detach(),
+        }
+
+    def _update_alpha(
+            self,
+            batch: HostTensorBatch,
+    ) -> Dict[str, torch.Tensor]:
+
+        with torch.no_grad():
+            action_probs, action_log_probs, _ = (
+                self.actor.get_policy(
+                    batch.host_obs
+                )
+            )
+
+            policy_entropy = -(
+                    action_probs
+                    * action_log_probs
+            ).sum(
+                dim=-1
+            )
+
+            target_entropy = torch.full_like(
+                policy_entropy,
+                float(
+                    self.config
+                        .target_entropy_ratio
+                )
+                * math.log(
+                    max(
+                        self.action_dim,
+                        1,
+                    )
+                ),
+            )
+
+        alpha_loss = (
+                self.log_alpha
+                * (
+                        policy_entropy.detach()
+                        - target_entropy.detach()
+                )
+        ).mean()
+
+        self.alpha_optimizer.zero_grad(
+            set_to_none=True
+        )
+
+        alpha_loss.backward()
+
+        self.alpha_optimizer.step()
+
+        with torch.no_grad():
+            self.log_alpha.clamp_(
+                min=-20.0,
+                max=5.0,
+            )
+
+        return {
+            "alpha_loss":
+                alpha_loss.detach(),
+
+            "target_entropy":
+                target_entropy
+                    .detach()
+                    .mean(),
+        }
+
+    def train_mode(
+            self,
+    ) -> None:
+
+        self.actor.train()
+        self.critic.train()
+        self.target_critic.eval()
+
+    def eval_mode(
+            self,
+    ) -> None:
+
+        self.actor.eval()
+        self.critic.eval()
+        self.target_critic.eval()
+
+    def save(
+            self,
+            file_path: Union[
+                str,
+                Path,
+            ],
+    ) -> None:
+
+        file_path = Path(
+            file_path
+        )
+
+        file_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        checkpoint = {
+            "algorithm_role":
+                "local_host_sac",
+
+            "obs_dim":
+                self.obs_dim,
+
+            "action_dim":
+                self.action_dim,
+
+            "config":
+                asdict(
+                    self.config
+                ),
+
+            "actor_state_dict":
+                self.actor.state_dict(),
+
+            "critic_state_dict":
+                self.critic.state_dict(),
+
+            "target_critic_state_dict":
+                self.target_critic
+                    .state_dict(),
+
+            "actor_optimizer_state_dict":
+                self.actor_optimizer
+                    .state_dict(),
+
+            "critic_optimizer_state_dict":
+                self.critic_optimizer
+                    .state_dict(),
+
+            "alpha_optimizer_state_dict":
+                self.alpha_optimizer
+                    .state_dict(),
+
+            "log_alpha":
+                self.log_alpha
+                    .detach()
+                    .cpu(),
+
+            "update_step":
+                int(
+                    self.update_step
+                ),
+        }
+
+        torch.save(
+            checkpoint,
+            file_path,
+        )
+
+    def load(
+            self,
+            file_path: Union[
+                str,
+                Path,
+            ],
+            load_optimizers: bool = True,
+    ) -> None:
+
+        checkpoint = torch.load(
+            Path(file_path),
+            map_location=self.device,
+            weights_only=False,
+        )
+
+        role = checkpoint.get(
+            "algorithm_role"
+        )
+
+        if (
+                role is not None
+                and role
+                != "local_host_sac"
+        ):
+            raise RuntimeError(
+                "当前 checkpoint "
+                "不是 Local Host SAC："
+                f"{role!r}"
+            )
+
+        self.actor.load_state_dict(
+            checkpoint[
+                "actor_state_dict"
+            ]
+        )
+
+        self.critic.load_state_dict(
+            checkpoint[
+                "critic_state_dict"
+            ]
+        )
+
+        self.target_critic.load_state_dict(
+            checkpoint[
+                "target_critic_state_dict"
+            ]
+        )
+
+        with torch.no_grad():
+            self.log_alpha.copy_(
+                checkpoint[
+                    "log_alpha"
+                ].to(
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            )
+
+        if load_optimizers:
+            self.actor_optimizer.load_state_dict(
+                checkpoint[
+                    "actor_optimizer_state_dict"
+                ]
+            )
+
+            self.critic_optimizer.load_state_dict(
+                checkpoint[
+                    "critic_optimizer_state_dict"
+                ]
+            )
+
+            self.alpha_optimizer.load_state_dict(
+                checkpoint[
+                    "alpha_optimizer_state_dict"
+                ]
+            )
+
+        self.update_step = int(
+            checkpoint.get(
+                "update_step",
+                0,
+            )
+        )
+
+
 
 
 
