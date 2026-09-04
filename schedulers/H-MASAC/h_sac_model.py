@@ -8,6 +8,22 @@ import config as conf
 
 DEFAULT_EPS = 1e-8
 
+__all__ = (
+    # Routing MASAC
+    "RoutingDiscreteActor",
+    "RoutingDiscreteQNetwork",
+    "RoutingTwinDiscreteCritic",
+
+    # Local Host SAC
+    "LocalHostDiscreteActor",
+    "LocalHostQNetwork",
+    "LocalHostTwinCritic",
+
+    # Common network update helpers
+    "hard_update",
+    "soft_update",
+)
+
 # 把智能体整数编号转换成 one-hot 向量
 def build_agent_one_hot(agent_indices: torch.Tensor, num_agents: int) -> torch.Tensor:
 
@@ -184,7 +200,32 @@ class RoutingDiscreteActor(nn.Module):
         )
 
 # 离散Q网络
-class DiscreteQNetwork(nn.Module):
+class RoutingDiscreteQNetwork(nn.Module):
+    """
+    Routing MASAC 的 centralized discrete Q network。
+
+    输入：
+        global_state
+            CTDE 训练阶段的 Routing centralized state
+
+        agent_indices
+            当前正在做 Routing decision 的 Edge DC identity
+
+    网络内部：
+        global_state
+            +
+        agent one-hot
+
+    输出：
+        当前 Routing Agent 对全部 Routing actions 的 Q values。
+
+    注意：
+        1. 这是 Routing 层 Critic；
+        2. 不属于 Local Host SAC；
+        3. 不读取 Host Observation；
+        4. 不与任何 LocalHostQNetwork 共享参数。
+    """
+
     def __init__(
             self,
             global_state_dim: int,
@@ -192,94 +233,235 @@ class DiscreteQNetwork(nn.Module):
             num_agents: int,
             hidden_dim: int = conf.Q_NET_HIDDEN_DIM,
     ) -> None:
-
         super().__init__()
-        global_state_dim = int(global_state_dim)
-        action_dim = int(action_dim)
-        num_agents = int(num_agents)
-        hidden_dim = int(hidden_dim)
 
-        # 保存网络结构参数。
-        self.global_state_dim = global_state_dim
-        self.action_dim = action_dim
-        self.num_agents = num_agents
-        self.hidden_dim = hidden_dim
+        self.global_state_dim = int(
+            global_state_dim
+        )
 
-        critic_input_dim = global_state_dim + num_agents
-        self.fc1 = nn.Linear(critic_input_dim, hidden_dim,)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim,)
-        self.output_layer = nn.Linear(hidden_dim,action_dim,)
+        self.action_dim = int(
+            action_dim
+        )
 
-        # 初始化各层参数。
-        initialize_linear_layer(self.fc1, gain=nn.init.calculate_gain("relu"),)
-        initialize_linear_layer(self.fc2, gain=nn.init.calculate_gain("relu"),)
-        initialize_linear_layer(self.output_layer, gain=conf.Q_NET_GAIN,)
+        self.num_agents = int(
+            num_agents
+        )
 
-    # 计算当前智能体所有动作的 Q 值
+        self.hidden_dim = int(
+            hidden_dim
+        )
+
+        if self.global_state_dim <= 0:
+            raise ValueError(
+                "Routing global_state_dim 必须 > 0"
+            )
+
+        if self.action_dim <= 0:
+            raise ValueError(
+                "Routing action_dim 必须 > 0"
+            )
+
+        if self.num_agents <= 0:
+            raise ValueError(
+                "Routing num_agents 必须 > 0"
+            )
+
+        # ==========================================================
+        # CTDE Critic Input
+        #
+        # Centralized Routing State
+        #       +
+        # 当前 Routing Agent identity
+        # ==========================================================
+
+        critic_input_dim = (
+            self.global_state_dim
+            + self.num_agents
+        )
+
+        self.fc1 = nn.Linear(
+            critic_input_dim,
+            self.hidden_dim,
+        )
+
+        self.fc2 = nn.Linear(
+            self.hidden_dim,
+            self.hidden_dim,
+        )
+
+        self.output_layer = nn.Linear(
+            self.hidden_dim,
+            self.action_dim,
+        )
+
+        initialize_linear_layer(
+            self.fc1,
+            gain=nn.init.calculate_gain(
+                "relu"
+            ),
+        )
+
+        initialize_linear_layer(
+            self.fc2,
+            gain=nn.init.calculate_gain(
+                "relu"
+            ),
+        )
+
+        initialize_linear_layer(
+            self.output_layer,
+            gain=conf.Q_NET_GAIN,
+        )
+
     def forward(
             self,
             global_state: torch.Tensor,
             agent_indices: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        返回当前 Routing Agent 对全部 Routing actions
+        的 centralized Q values。
+        """
 
-        # 智能体编号one-hot编码
-        agent_one_hot = build_agent_one_hot(agent_indices=agent_indices, num_agents=self.num_agents,)
+        agent_one_hot = build_agent_one_hot(
+            agent_indices=(
+                agent_indices
+            ),
 
-        # 把 one-hot 移动到全局状态所在设备。
-        agent_one_hot = agent_one_hot.to(device=global_state.device,)
+            num_agents=(
+                self.num_agents
+            ),
+        )
 
-        # 统一数据类型。
-        agent_one_hot = agent_one_hot.to(dtype=global_state.dtype,)
+        agent_one_hot = agent_one_hot.to(
+            device=global_state.device,
+            dtype=global_state.dtype,
+        )
 
-        # 拼接全局状态和当前智能体身份信息。
-        critic_input = torch.cat([global_state, agent_one_hot],dim=-1,)
+        critic_input = torch.cat(
+            [
+                global_state,
+                agent_one_hot,
+            ],
+            dim=-1,
+        )
 
-        # 第一层特征提取。
-        hidden = F.relu(self.fc1(critic_input))
+        hidden = F.relu(
+            self.fc1(
+                critic_input
+            )
+        )
 
-        # 第二层特征提取。
-        hidden = F.relu(self.fc2(hidden))
+        hidden = F.relu(
+            self.fc2(
+                hidden
+            )
+        )
 
-        q_values = self.output_layer(hidden)
-        return q_values
+        return self.output_layer(
+            hidden
+        )
 
 # 双Q Critic
-class TwinDiscreteCritic(nn.Module):
-    def __init__(
-        self,
-        global_state_dim: int,
-        action_dim: int,
-        num_agents: int,
-        hidden_dim: int = 256,
-    ) -> None:
+class RoutingTwinDiscreteCritic(nn.Module):
+    """
+    Routing MASAC 的 centralized Twin-Q Critic。
 
+    两个 Q 网络：
+
+        Q1(global_state, agent_id)
+        Q2(global_state, agent_id)
+
+    完全服务于 Routing MASAC + CTDE。
+
+    不与任何 Local Host SAC Critic 共享：
+        - 参数
+        - Optimizer
+        - Target Critic
+        - ReplayBuffer
+    """
+
+    def __init__(
+            self,
+            global_state_dim: int,
+            action_dim: int,
+            num_agents: int,
+            hidden_dim: int = conf.Q_NET_HIDDEN_DIM,
+    ) -> None:
         super().__init__()
 
-        self.q1 = DiscreteQNetwork(
-            global_state_dim=global_state_dim,
-            action_dim=action_dim,
-            num_agents=num_agents,
-            hidden_dim=hidden_dim,
+        self.q1 = RoutingDiscreteQNetwork(
+            global_state_dim=(
+                global_state_dim
+            ),
+
+            action_dim=(
+                action_dim
+            ),
+
+            num_agents=(
+                num_agents
+            ),
+
+            hidden_dim=(
+                hidden_dim
+            ),
         )
 
-        self.q2 = DiscreteQNetwork(
-            global_state_dim=global_state_dim,
-            action_dim=action_dim,
-            num_agents=num_agents,
-            hidden_dim=hidden_dim,
+        self.q2 = RoutingDiscreteQNetwork(
+            global_state_dim=(
+                global_state_dim
+            ),
+
+            action_dim=(
+                action_dim
+            ),
+
+            num_agents=(
+                num_agents
+            ),
+
+            hidden_dim=(
+                hidden_dim
+            ),
         )
 
-# 同时返回Q1 Q2对全部动作的估计
     def forward(
-        self,
-        global_state: torch.Tensor,
-        agent_indices: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+            self,
+            global_state: torch.Tensor,
+            agent_indices: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """
+        同时返回 Q1 / Q2 对全部 Routing actions 的估计。
+        """
 
-        q1_values = self.q1(global_state=global_state, agent_indices=agent_indices,)
-        q2_values = self.q2(global_state=global_state, agent_indices=agent_indices,)
+        q1_values = self.q1(
+            global_state=(
+                global_state
+            ),
 
-        return q1_values, q2_values
+            agent_indices=(
+                agent_indices
+            ),
+        )
+
+        q2_values = self.q2(
+            global_state=(
+                global_state
+            ),
+
+            agent_indices=(
+                agent_indices
+            ),
+        )
+
+        return (
+            q1_values,
+            q2_values,
+        )
 
 # 把 source_network 的全部参数完整复制给 target_network，一般在算法初始化时调用一次
 def hard_update(target_network: nn.Module, source_network: nn.Module) -> None:
@@ -433,6 +615,9 @@ class LocalHostQNetwork(nn.Module):
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
 
+        self.hidden_dim = int(
+            hidden_dim
+        )
         self.fc1 = nn.Linear(
             self.obs_dim,
             hidden_dim,

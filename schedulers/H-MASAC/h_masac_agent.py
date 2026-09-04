@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from h_sac_model import (RoutingDiscreteActor, TwinDiscreteCritic,hard_update,soft_update,  LocalHostDiscreteActor,LocalHostTwinCritic,)
+from h_sac_model import (RoutingDiscreteActor, RoutingTwinDiscreteCritic,hard_update,soft_update,  LocalHostDiscreteActor,LocalHostTwinCritic,)
 from routing_replay_buffer import (RoutingReplayBatch,RoutingReplayBuffer,)
 
 
@@ -117,20 +117,46 @@ class DiscreteMASAC:
         ).to(self.device)
 
         # 创建在线双 Critic
-        self.critic = TwinDiscreteCritic(
-            global_state_dim=global_state_dim,
-            action_dim=action_dim,
-            num_agents=num_agents,
-            hidden_dim=config.critic_hidden_dim,
-        ).to(self.device)
+        self.critic = RoutingTwinDiscreteCritic(
+            global_state_dim=(
+                global_state_dim
+            ),
+
+            action_dim=(
+                action_dim
+            ),
+
+            num_agents=(
+                num_agents
+            ),
+
+            hidden_dim=(
+                config.critic_hidden_dim
+            ),
+        ).to(
+            self.device
+        )
 
         # 创建目标双 Critic
-        self.target_critic = TwinDiscreteCritic(
-            global_state_dim=global_state_dim,
-            action_dim=action_dim,
-            num_agents=num_agents,
-            hidden_dim=config.critic_hidden_dim,
-        ).to(self.device)
+        self.target_critic = RoutingTwinDiscreteCritic(
+            global_state_dim=(
+                global_state_dim
+            ),
+
+            action_dim=(
+                action_dim
+            ),
+
+            num_agents=(
+                num_agents
+            ),
+
+            hidden_dim=(
+                config.critic_hidden_dim
+            ),
+        ).to(
+            self.device
+        )
 
         # 初始化时让目标 Critic 参数完全等于在线 Critic
         hard_update(
