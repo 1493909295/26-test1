@@ -116,6 +116,14 @@ Log_interval = 1            # 每多少episode打印一次统计信息
 Checkpoint_Interval = 100        # 每多少个episode保存一次带编号的checkpoint
 Checkpoint_Dir = "model/H-MASAC/checkpoints"
 Log_csv_Path = "result/H-MASAC/train_log.csv"
+H_MASAC_EPISODE_LOG_CSV_PATH = (
+    "result/H-MASAC/episode_log.csv"
+)
+
+H_MASAC_DC_LOG_CSV_PATH = (
+    "result/H-MASAC/dc_log.csv"
+)
+
 Old_Env_Path = None         #可选的旧环境文件路径,为 None 时，CloudEdgeEnv 会按自己的默认逻辑生成新环境
 Resume_Checkpoint = None         #可选的断点模型路径,为 None 表示从头训练。
 Vary_Episode_Seed: bool = True          # 是否在每个 episode 使用不同但可复现的 seed

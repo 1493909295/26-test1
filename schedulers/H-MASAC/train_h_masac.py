@@ -1,12 +1,10 @@
 from __future__ import annotations
-
 import csv
 import json
 import random
 import sys
 import os
 import time
-
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -14,21 +12,9 @@ from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
 import torch
 from datetime import datetime
-# 找根目录
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-H_MASAC_DIR = Path(__file__).resolve().parent
-# 找环境代码
-ENVIRONMENT_DIR = PROJECT_ROOT / "environment"
-if str(H_MASAC_DIR) not in sys.path:
-    sys.path.insert(0, str(H_MASAC_DIR))
-
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from h_masac_agent import (
     RoutingMASAC,
     RoutingMASACConfig,
-
     LocalHostSAC,
     HostSACConfig,
 )
@@ -41,6 +27,10 @@ import config as conf
 from routing_observation import (RoutingObservationBuilder,)
 from routing_centralized_state import (RoutingCentralizedStateBuilder,)
 from host_observation import (HostObservationBuilder,)
+
+# 找根目录
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+H_MASAC_DIR = Path(__file__).resolve().parent
 
 CHECKPOINT_SCHEMA_VERSION = 2
 
@@ -68,215 +58,591 @@ UPDATE_TENSOR_METRIC_NAMES = ("critic_loss",
         "policy_entropy",
         "target_entropy",)
 
+# 找环境代码
+ENVIRONMENT_DIR = PROJECT_ROOT / "environment"
+if str(H_MASAC_DIR) not in sys.path:
+    sys.path.insert(0, str(H_MASAC_DIR))
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 @dataclass(frozen=True)
 class TrainConfig:
-    num_episodes: int = (
-        conf.Episodes
-    )
 
-    # ==========================================================
-    # Replay
-    # ==========================================================
+    num_episodes: int = (conf.Episodes)
 
-    routing_replay_capacity: int = (
-        conf.ROUTING_REPLAY_CAPACITY
-    )
+    routing_replay_capacity: int = (conf.ROUTING_REPLAY_CAPACITY)
+    host_replay_capacity: int = (conf.HOST_REPLAY_CAPACITY)
+    routing_batch_size: int = (conf.ROUTING_BATCH_SIZE)
+    routing_random_warmup_steps: int = (conf.ROUTING_RANDOM_WARMUP_STEPS)
+    routing_learning_starts: int = (conf.ROUTING_LEARNING_STARTS)
+    routing_train_every: int = (conf.ROUTING_TRAIN_EVERY)
+    routing_updates_per_train: int = (conf.ROUTING_UPDATES_PER_TRAIN)
 
-    host_replay_capacity: int = (
-        conf.HOST_REPLAY_CAPACITY
-    )
+    host_batch_size: int = (conf.HOST_BATCH_SIZE)
+    host_random_warmup_steps: int = (conf.HOST_RANDOM_WARMUP_STEPS)
+    host_learning_starts: int = (conf.HOST_LEARNING_STARTS)
+    host_train_every: int = (conf.HOST_TRAIN_EVERY)
+    host_updates_per_train: int = (conf.HOST_UPDATES_PER_TRAIN)
 
-    # ==========================================================
-    # Routing MASAC training schedule
-    # ==========================================================
-
-    routing_batch_size: int = (
-        conf.ROUTING_BATCH_SIZE
-    )
-
-    routing_random_warmup_steps: int = (
-        conf.ROUTING_RANDOM_WARMUP_STEPS
-    )
-
-    routing_learning_starts: int = (
-        conf.ROUTING_LEARNING_STARTS
-    )
-
-    routing_train_every: int = (
-        conf.ROUTING_TRAIN_EVERY
-    )
-
-    routing_updates_per_train: int = (
-        conf.ROUTING_UPDATES_PER_TRAIN
-    )
-
-    # ==========================================================
-    # Local Host SAC training schedule
-    # ==========================================================
-
-    host_batch_size: int = (
-        conf.HOST_BATCH_SIZE
-    )
-
-    host_random_warmup_steps: int = (
-        conf.HOST_RANDOM_WARMUP_STEPS
-    )
-
-    host_learning_starts: int = (
-        conf.HOST_LEARNING_STARTS
-    )
-
-    host_train_every: int = (
-        conf.HOST_TRAIN_EVERY
-    )
-
-    host_updates_per_train: int = (
-        conf.HOST_UPDATES_PER_TRAIN
-    )
-
-    # ==========================================================
     # Three-stage training
-    # ==========================================================
-
-    host_pretrain_episodes: int = (
-        conf.HOST_PRETRAIN_EPISODES
-    )
-
-    routing_train_episodes: int = (
-        conf.ROUTING_TRAIN_EPISODES
-    )
-
-    joint_finetune_episodes: int = (
-        conf.JOINT_FINETUNE_EPISODES
-    )
-
-    log_interval: int = (
-        conf.Log_interval
-    )
-
-    checkpoint_interval: int = (
-        conf.Checkpoint_Interval
-    )
-
+    host_pretrain_episodes: int = (conf.HOST_PRETRAIN_EPISODES)
+    routing_train_episodes: int = (conf.ROUTING_TRAIN_EPISODES)
+    joint_finetune_episodes: int = (conf.JOINT_FINETUNE_EPISODES)
+    log_interval: int = (conf.Log_interval)
+    checkpoint_interval: int = (conf.Checkpoint_Interval)
     seed: int = conf.Seed
+    checkpoint_dir: str = (conf.Checkpoint_Dir)
+    episode_log_csv_path: str = (conf.H_MASAC_EPISODE_LOG_CSV_PATH)
+    dc_log_csv_path: str = (conf.H_MASAC_DC_LOG_CSV_PATH)
+    old_env_path: Optional[str] = (conf.Old_Env_Path)
+    resume_checkpoint: Optional[str] = (conf.Resume_Checkpoint)
+    vary_episode_seed: bool = ( conf.Vary_Episode_Seed)
+    use_neighbor_historical_feedback: bool = ( conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK)
 
-    checkpoint_dir: str = (
-        conf.Checkpoint_Dir
-    )
-
-    log_csv_path: str = (
-        conf.Log_csv_Path
-    )
-
-    old_env_path: Optional[str] = (
-        conf.Old_Env_Path
-    )
-
-    resume_checkpoint: Optional[str] = (
-        conf.Resume_Checkpoint
-    )
-
-    vary_episode_seed: bool = (
-        conf.Vary_Episode_Seed
-    )
-
-    use_neighbor_historical_feedback: bool = (
-        conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK
-    )
-
+# Two-Level Scheduler 三阶段训练状态。
 class TrainingStage( str,Enum,):
-    """
-    Two-Level Scheduler 三阶段训练状态。
-    """
+    HOST_PRETRAIN = ("host_pretrain")
+    ROUTING_TRAIN = ("routing_train")
+    JOINT_FINETUNE = ("joint_finetune")
 
-    HOST_PRETRAIN = (
-        "host_pretrain"
-    )
-
-    ROUTING_TRAIN = (
-        "routing_train"
-    )
-
-    JOINT_FINETUNE = (
-        "joint_finetune"
-    )
-
-# 统计一个 episode 运行期间的统计信息
+#  H-MASAC 一个 Episode 内的双层训练统计
 @dataclass
 class EpisodeStatistics:
+
     episode: int
     episode_seed: int
     training_stage: str
+
+    # System / Routing Reward Bookkeeping
     per_agent_returns: Dict[str, float]
     episode_return: float = 0.0
-    decision_count: int = 0
-    normal_action_count: int = 0
-    forced_action_count: int = 0
-    random_action_count: int = 0
-    policy_action_count: int = 0
-    local_action_count: int = 0
-    edge_action_count: int = 0
-    cloud_action_count: int = 0
-    drop_action_count: int = 0
-    # Routing MASAC 当前 Episode 的梯度更新次数。
+
+    # Routing Behavior
+    routing_decision_count: int = 0
+    routing_forced_action_count: int = 0
+    routing_orchestrator_action_count: int = 0
+    routing_random_action_count: int = 0
+    routing_policy_action_count: int = 0
+    routing_self_count: int = 0
+    routing_edge_count: int = 0
+    routing_cloud_count: int = 0
+    routing_drop_count: int = 0
+
+    # Host Behavior
+    host_decision_count: int = 0
+    host_random_action_count: int = 0
+    host_policy_action_count: int = 0
+    host_started_count: int = 0
+    host_queued_count: int = 0
+    host_dropped_count: int = 0
+
+    # Gradient Update Counts
     routing_update_count: int = 0
-
-    # 所有 Local Host SAC 在当前 Episode
-    # 合计完成的梯度更新次数。
     host_update_count: int = 0
-    update_metric_sums: Dict[str, float] = field(default_factory=dict)
-    update_metric_counts: Dict[str, int] = field(default_factory=dict)
 
-    # 记录 Transition 奖励和动作来源
-    def record_transition(
+    # Routing Update Metrics
+    routing_update_metric_sums: Dict[ str, float,] = field(default_factory=dict)
+    routing_update_metric_counts: Dict[str,int,] = field(default_factory=dict)
+
+    # Host Update Metrics：全系统聚合
+    host_update_metric_sums: Dict[str,float,] = field(default_factory=dict)
+    host_update_metric_counts: Dict[str,int,] = field(default_factory=dict)
+
+    # Host Update Metrics：逐 DC
+    host_update_metric_sums_by_dc: Dict[str, Dict[str, float],] = field(default_factory=dict)
+    host_update_metric_counts_by_dc: Dict[ str,Dict[str, int],] = field(default_factory=dict)
+    
+    # ==========================================================
+    # Per-DC Counters
+    #
+    # 不把 DC 数写死在 dataclass 中。
+    # 通过 dc_id 动态创建。
+    # ==============================================================
+
+    dc_counters: Dict[
+        str,
+        Dict[str, int],
+    ] = field(
+        default_factory=dict
+    )
+
+    # ==========================================================
+    # Routing Source -> Target Matrix
+    #
+    # 示例：
+    #
+    # {
+    #     "DC1": {
+    #         "DC1": 100,
+    #         "DC2": 20,
+    #         "cloud": 5
+    #     }
+    # }
+    # ==============================================================
+
+    routing_source_target_counts: Dict[
+        str,
+        Dict[str, int],
+    ] = field(
+        default_factory=dict
+    )
+
+    # ==========================================================
+    # Finalized Causal Trace Statistics
+    # ==============================================================
+
+    terminal_trace_flushed_count: int = 0
+
+    routing_transition_flushed_count: int = 0
+    host_transition_flushed_count: int = 0
+
+    routing_edge_hop_total: int = 0
+    multi_hop_job_count: int = 0
+    max_routing_hops: int = 0
+
+    # 两层自己的 Replay reward。
+    # 只能作为训练诊断量，不能相加作为 system return。
+    routing_layer_reward_sum: float = 0.0
+    host_layer_reward_sum: float = 0.0
+
+    # ==========================================================
+    # Internal Helpers
+    # ==============================================================
+
+    def _inc_dc(
+            self,
+            dc_id: str,
+            metric_name: str,
+            delta: int = 1,
+    ) -> None:
+
+        dc_id = str(
+            dc_id
+        )
+
+        dc_metrics = (
+            self.dc_counters
+            .setdefault(
+                dc_id,
+                {},
+            )
+        )
+
+        dc_metrics[
+            metric_name
+        ] = int(
+            dc_metrics.get(
+                metric_name,
+                0,
+            )
+            + int(delta)
+        )
+
+    @staticmethod
+    def _accumulate_metric(
+            sums: Dict[str, float],
+            counts: Dict[str, int],
+            metric_name: str,
+            metric_value: float,
+    ) -> None:
+
+        metric_value = float(
+            metric_value
+        )
+
+        if not np.isfinite(
+                metric_value
+        ):
+            return
+
+        sums[
+            metric_name
+        ] = float(
+            sums.get(
+                metric_name,
+                0.0,
+            )
+            + metric_value
+        )
+
+        counts[
+            metric_name
+        ] = int(
+            counts.get(
+                metric_name,
+                0,
+            )
+            + 1
+        )
+
+    # ==========================================================
+    # Routing Decision Statistics
+    # ==============================================================
+
+    def record_routing_decision(
             self,
             agent_id: str,
             reward: float,
             action_type: str,
             action_source: str,
+            target_dc_id: Optional[str],
     ) -> None:
 
-        reward = float(reward)
+        agent_id = str(
+            agent_id
+        )
+
+        action_type = str(
+            action_type
+        )
+
+        action_source = str(
+            action_source
+        )
+
+        reward = float(
+            reward
+        )
+
+        target_dc_id = (
+            None
+            if target_dc_id is None
+            else str(target_dc_id)
+        )
+
+        # ------------------------------------------------------
+        # System reward bookkeeping
+        # ------------------------------------------------------
+
         self.episode_return += reward
-        self.per_agent_returns[agent_id] = (self.per_agent_returns.get(agent_id, 0.0) + reward)
-        self.decision_count += 1
+
+        self.per_agent_returns[
+            agent_id
+        ] = float(
+            self.per_agent_returns.get(
+                agent_id,
+                0.0,
+            )
+            + reward
+        )
+
+        # ------------------------------------------------------
+        # Routing decision source
+        # ------------------------------------------------------
+
+        self.routing_decision_count += 1
+
+        self._inc_dc(
+            agent_id,
+            "routing_decisions",
+        )
 
         if action_source == "forced":
-            self.forced_action_count += 1
+
+            self.routing_forced_action_count += 1
+
+        elif action_source == "orchestrator":
+
+            self.routing_orchestrator_action_count += 1
+
         elif action_source == "random":
-            self.random_action_count += 1
-            self.normal_action_count += 1
+
+            self.routing_random_action_count += 1
+
         elif action_source == "policy":
-            self.policy_action_count += 1
-            self.normal_action_count += 1
+
+            self.routing_policy_action_count += 1
+
+        else:
+            raise ValueError(
+                "未知 Routing action_source："
+                f"{action_source}"
+            )
+
+        # ------------------------------------------------------
+        # Routing action semantics
+        # ------------------------------------------------------
 
         if action_type == "self":
-            self.local_action_count += 1
+
+            self.routing_self_count += 1
+
+            self._inc_dc(
+                agent_id,
+                "route_self_count",
+            )
+
         elif action_type == "edge_dc":
-            self.edge_action_count += 1
+
+            if target_dc_id is None:
+                raise RuntimeError(
+                    "统计 Edge Routing 时缺少 target_dc_id。"
+                )
+
+            self.routing_edge_count += 1
+
+            self._inc_dc(
+                agent_id,
+                "route_out_edge_count",
+            )
+
+            self._inc_dc(
+                target_dc_id,
+                "route_in_edge_count",
+            )
+
         elif action_type == "cloud":
-            self.cloud_action_count += 1
+
+            self.routing_cloud_count += 1
+
+            self._inc_dc(
+                agent_id,
+                "route_cloud_count",
+            )
+
         elif action_type == "drop":
-            self.drop_action_count += 1
 
-    # 记录由于 Job 后续完成/超时产生的延迟 reward
-    def record_reward_correction(self, agent_id: str, reward_delta: float,) -> None:
-        agent_id = str(agent_id)
-        reward_delta = float(reward_delta)
-        self.episode_return += (reward_delta)
-        self.per_agent_returns[agent_id] = (self.per_agent_returns.get(agent_id, 0.0,) + reward_delta)
+            self.routing_drop_count += 1
 
+            self._inc_dc(
+                agent_id,
+                "route_drop_count",
+            )
 
-    # 记录一次 MASAC.update() 返回的训练指标
+        else:
+            raise ValueError(
+                "未知 Routing action_type："
+                f"{action_type}"
+            )
+
+        # ------------------------------------------------------
+        # Source -> Target Matrix
+        #
+        # Drop 没有真实 target，显式记录为 "__drop__"。
+        # ------------------------------------------------------
+
+        target_key = (
+            str(target_dc_id)
+            if target_dc_id is not None
+            else "__drop__"
+        )
+
+        source_targets = (
+            self.routing_source_target_counts
+            .setdefault(
+                agent_id,
+                {},
+            )
+        )
+
+        source_targets[
+            target_key
+        ] = int(
+            source_targets.get(
+                target_key,
+                0,
+            )
+            + 1
+        )
+
+    # ==========================================================
+    # Host Decision Statistics
+    # ==============================================================
+
+    def record_host_decision(
+            self,
+            dc_id: str,
+            action_source: str,
+    ) -> None:
+
+        dc_id = str(
+            dc_id
+        )
+
+        action_source = str(
+            action_source
+        )
+
+        self.host_decision_count += 1
+
+        self._inc_dc(
+            dc_id,
+            "host_decisions",
+        )
+
+        if action_source == "random":
+
+            self.host_random_action_count += 1
+
+            self._inc_dc(
+                dc_id,
+                "host_random_count",
+            )
+
+        elif action_source == "policy":
+
+            self.host_policy_action_count += 1
+
+            self._inc_dc(
+                dc_id,
+                "host_policy_count",
+            )
+
+        else:
+            raise ValueError(
+                "未知 Host action_source："
+                f"{action_source}"
+            )
+
+    def record_host_result(
+            self,
+            dc_id: str,
+            execution_result: str,
+    ) -> None:
+
+        dc_id = str(
+            dc_id
+        )
+
+        execution_result = str(
+            execution_result
+        )
+
+        if execution_result == "started":
+
+            self.host_started_count += 1
+
+            self._inc_dc(
+                dc_id,
+                "host_started_count",
+            )
+
+        elif execution_result == "queued":
+
+            self.host_queued_count += 1
+
+            self._inc_dc(
+                dc_id,
+                "host_queued_count",
+            )
+
+        elif execution_result == "dropped":
+
+            self.host_dropped_count += 1
+
+            self._inc_dc(
+                dc_id,
+                "host_dropped_count",
+            )
+
+        else:
+            raise ValueError(
+                "未知 Host execution_result："
+                f"{execution_result}"
+            )
+
+    # ==========================================================
+    # Delayed Reward
+    # ==============================================================
+
+    def record_reward_correction(
+            self,
+            agent_id: str,
+            reward_delta: float,
+    ) -> None:
+
+        agent_id = str(
+            agent_id
+        )
+
+        reward_delta = float(
+            reward_delta
+        )
+
+        self.episode_return += (
+            reward_delta
+        )
+
+        self.per_agent_returns[
+            agent_id
+        ] = float(
+            self.per_agent_returns.get(
+                agent_id,
+                0.0,
+            )
+            + reward_delta
+        )
+
+    # ==========================================================
+    # Routing Update Metrics
+    # ==============================================================
+
     def record_routing_update(
             self,
-            update_info: Dict[
-                str,
-                float,
-            ],
+            update_info: Dict[str, float],
     ) -> None:
 
         self.routing_update_count += 1
+
+        for metric_name, metric_value in (
+                update_info.items()
+        ):
+
+            self._accumulate_metric(
+                sums=(
+                    self.routing_update_metric_sums
+                ),
+
+                counts=(
+                    self.routing_update_metric_counts
+                ),
+
+                metric_name=(
+                    metric_name
+                ),
+
+                metric_value=float(
+                    metric_value
+                ),
+            )
+
+    # ==========================================================
+    # Host Update Metrics
+    # ==============================================================
+
+    def record_host_update(
+            self,
+            dc_id: str,
+            update_info: Dict[str, float],
+    ) -> None:
+
+        dc_id = str(
+            dc_id
+        )
+
+        self.host_update_count += 1
+
+        self._inc_dc(
+            dc_id,
+            "host_updates",
+        )
+
+        dc_sums = (
+            self.host_update_metric_sums_by_dc
+            .setdefault(
+                dc_id,
+                {},
+            )
+        )
+
+        dc_counts = (
+            self.host_update_metric_counts_by_dc
+            .setdefault(
+                dc_id,
+                {},
+            )
+        )
 
         for metric_name, metric_value in (
                 update_info.items()
@@ -286,39 +652,199 @@ class EpisodeStatistics:
                 metric_value
             )
 
-            if not np.isfinite(
+            # 所有 Host SAC 的整体加权平均。
+            self._accumulate_metric(
+                sums=(
+                    self.host_update_metric_sums
+                ),
+
+                counts=(
+                    self.host_update_metric_counts
+                ),
+
+                metric_name=(
+                    metric_name
+                ),
+
+                metric_value=(
                     metric_value
-            ):
-                continue
-
-            self.update_metric_sums[
-                metric_name
-            ] = (
-                    self.update_metric_sums.get(
-                        metric_name,
-                        0.0,
-                    )
-                    + metric_value
+                ),
             )
 
-            self.update_metric_counts[
-                metric_name
-            ] = (
-                    self.update_metric_counts.get(
-                        metric_name,
-                        0,
-                    )
-                    + 1
+            # 当前 DC 自己的平均。
+            self._accumulate_metric(
+                sums=dc_sums,
+                counts=dc_counts,
+                metric_name=(
+                    metric_name
+                ),
+                metric_value=(
+                    metric_value
+                ),
             )
 
-    # 返回某个训练指标在当前episode中的平均值
-    def mean_metric(self, metric_name: str) -> float:
-        count = self.update_metric_counts.get(metric_name, 0)
-        if count == 0:
-            return float("nan")
-        return float(
-            self.update_metric_sums[metric_name] / count
+    # ==========================================================
+    # Metric Mean Helpers
+    # ==============================================================
+
+    def mean_routing_metric(
+            self,
+            metric_name: str,
+    ) -> float:
+
+        count = (
+            self.routing_update_metric_counts
+            .get(
+                metric_name,
+                0,
+            )
         )
+
+        if count <= 0:
+            return float("nan")
+
+        return float(
+            self.routing_update_metric_sums[
+                metric_name
+            ]
+            / count
+        )
+
+    def mean_host_metric(
+            self,
+            metric_name: str,
+            dc_id: Optional[str] = None,
+    ) -> float:
+
+        if dc_id is None:
+
+            sums = (
+                self.host_update_metric_sums
+            )
+
+            counts = (
+                self.host_update_metric_counts
+            )
+
+        else:
+
+            dc_id = str(
+                dc_id
+            )
+
+            sums = (
+                self.host_update_metric_sums_by_dc
+                .get(
+                    dc_id,
+                    {},
+                )
+            )
+
+            counts = (
+                self.host_update_metric_counts_by_dc
+                .get(
+                    dc_id,
+                    {},
+                )
+            )
+
+        count = counts.get(
+            metric_name,
+            0,
+        )
+
+        if count <= 0:
+            return float("nan")
+
+        return float(
+            sums[
+                metric_name
+            ]
+            / count
+        )
+
+    # ==========================================================
+    # Finalized Job Causal Trace
+    #
+    # 必须在 Replay 写入成功以后调用。
+    # ==============================================================
+
+    def record_finalized_trace(
+            self,
+            finalized_trace: FinalizedJobTrace,
+    ) -> None:
+
+        self.terminal_trace_flushed_count += 1
+
+        routing_transition_count = len(
+            finalized_trace.routing_transitions
+        )
+
+        self.routing_transition_flushed_count += (
+            routing_transition_count
+        )
+
+        if (
+                finalized_trace.host_transition
+                is not None
+        ):
+            self.host_transition_flushed_count += 1
+
+        # ------------------------------------------------------
+        # Multi-hop 统计的是 Edge -> Edge forwarding 次数。
+        # Self 本身不是 Edge forwarding hop。
+        # ------------------------------------------------------
+
+        edge_hops = sum(
+            1
+            for routing_step
+            in finalized_trace.routing_steps
+            if (
+                routing_step.action_type
+                == "edge_dc"
+            )
+        )
+
+        self.routing_edge_hop_total += int(
+            edge_hops
+        )
+
+        self.max_routing_hops = max(
+            self.max_routing_hops,
+            int(edge_hops),
+        )
+
+        if edge_hops >= 2:
+            self.multi_hop_job_count += 1
+
+        # ------------------------------------------------------
+        # 两层 Replay reward 分开统计。
+        #
+        # 注意：
+        # Routing reward + Host reward
+        # 不能作为 system reward。
+        # ------------------------------------------------------
+
+        self.routing_layer_reward_sum += float(
+            sum(
+                float(
+                    transition.reward
+                )
+                for transition
+                in finalized_trace.routing_transitions
+            )
+        )
+
+        if (
+                finalized_trace.host_transition
+                is not None
+        ):
+            self.host_layer_reward_sum += float(
+                finalized_trace
+                .host_transition
+                .reward
+            )
+
 
 def validate_training_stage_config(
         train_config: TrainConfig,
@@ -632,47 +1158,186 @@ def choose_random_host_action(
 
 
 
-# 批量记录连续若干次 MASAC.update() 的训练指标，避免每次 update 内部执行大量 cuda_tensor.item()
-def record_update_block(stats: EpisodeStatistics, update_infos: list[ Dict[str, Union[float, torch.Tensor]]],) -> None:
+def _convert_update_block_to_cpu(
+        update_infos: list[
+            Dict[
+                str,
+                Union[
+                    float,
+                    torch.Tensor,
+                ],
+            ]
+        ],
+) -> list[Dict[str, float]]:
+    """
+    批量把一次连续 update block 的 GPU Tensor
+    转换成 CPU float。
+
+    Routing / Host 共用这一“数据转换”逻辑，
+    但转换后的训练指标分别进入自己的统计容器。
+    """
+
     if not update_infos:
-        return
+        return []
 
     update_rows = []
 
     for update_info in update_infos:
-        metric_row = torch.stack([update_info[metric_name]
-                for metric_name
-                in UPDATE_TENSOR_METRIC_NAMES
-            ],
-            dim=0,
+
+        reference_value = (
+            update_info[
+                "critic_loss"
+            ]
         )
+
+        reference_device = (
+            reference_value.device
+            if torch.is_tensor(
+                reference_value
+            )
+            else torch.device("cpu")
+        )
+
+        metric_tensors = []
+
+        for metric_name in (
+                UPDATE_TENSOR_METRIC_NAMES
+        ):
+
+            metric_value = (
+                update_info[
+                    metric_name
+                ]
+            )
+
+            if torch.is_tensor(
+                    metric_value
+            ):
+                metric_tensor = (
+                    metric_value
+                    .detach()
+                    .to(
+                        device=reference_device,
+                        dtype=torch.float32,
+                    )
+                    .reshape(())
+                )
+
+            else:
+                metric_tensor = torch.tensor(
+                    float(
+                        metric_value
+                    ),
+                    dtype=torch.float32,
+                    device=reference_device,
+                )
+
+            metric_tensors.append(
+                metric_tensor
+            )
 
         update_rows.append(
-            metric_row
+            torch.stack(
+                metric_tensors,
+                dim=0,
+            )
         )
-    update_matrix = torch.stack(update_rows, dim=0,)
-    update_matrix_cpu = (update_matrix.detach().cpu().numpy())
 
-    for row in update_matrix_cpu:
-        cpu_update_info = {
+    update_matrix = torch.stack(
+        update_rows,
+        dim=0,
+    )
+
+    update_matrix_cpu = (
+        update_matrix
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    return [
+        {
             metric_name: float(
-                row[metric_index]
+                row[
+                    metric_index
+                ]
             )
             for metric_index, metric_name
             in enumerate(
                 UPDATE_TENSOR_METRIC_NAMES
             )
-         }
-        stats.record_routing_update(
-            cpu_update_info
+        }
+        for row
+        in update_matrix_cpu
+    ]
+
+
+def record_routing_update_block(
+        stats: EpisodeStatistics,
+        update_infos: list[
+            Dict[
+                str,
+                Union[
+                    float,
+                    torch.Tensor,
+                ],
+            ]
+        ],
+) -> None:
+    """
+    只记录 Routing MASAC update 指标。
+    """
+
+    for update_info in (
+        _convert_update_block_to_cpu(
+            update_infos
         )
+    ):
+        stats.record_routing_update(
+            update_info
+        )
+
+
+def record_host_update_block(
+        stats: EpisodeStatistics,
+        dc_id: str,
+        update_infos: list[
+            Dict[
+                str,
+                Union[
+                    float,
+                    torch.Tensor,
+                ],
+            ]
+        ],
+) -> None:
+    """
+    只记录指定 DC 的 Local Host SAC update 指标。
+    """
+
+    for update_info in (
+        _convert_update_block_to_cpu(
+            update_infos
+        )
+    ):
+        stats.record_host_update(
+            dc_id=dc_id,
+            update_info=(
+                update_info
+            ),
+        )
+
 
 def flush_finalized_trace_to_replay(
         finalized_trace: FinalizedJobTrace,
+
         routing_replay_buffer:
         RoutingReplayBuffer,
+
         host_replay_buffers:
         Dict[str, HostReplayBuffer],
+
+        stats: EpisodeStatistics,
 ) -> None:
     """
     把一个已经完整 Finalize 的 Job
@@ -750,13 +1415,29 @@ def flush_finalized_trace_to_replay(
     # ==========================================================
 
     if (
-        host_transition is not None
-        and host_replay_buffer is not None
+            host_transition is not None
+            and host_replay_buffer is not None
     ):
-
         host_replay_buffer.add(
             host_transition
         )
+
+    # ==============================================================
+    # Routing / Host 两个 ReplayBuffer 全部写入成功以后，
+    # 才把这条完整 Job 因果链计入 Episode 日志。
+    #
+    # 这样日志中的：
+    #
+    #   terminal_trace_flushed_count
+    #   routing_transition_flushed_count
+    #   host_transition_flushed_count
+    #
+    # 与真正成功写入 Replay 的经验严格一致。
+    # ==============================================================
+
+    stats.record_finalized_trace(
+        finalized_trace
+    )
 
 def consume_environment_reward_corrections(
         env: CloudEdgeEnv,
@@ -882,6 +1563,8 @@ def consume_environment_reward_corrections(
                 host_replay_buffers=(
                     host_replay_buffers
                 ),
+
+                stats=stats,
             )
 
             # ==================================================
@@ -3356,20 +4039,87 @@ def load_two_layer_checkpoint_if_needed(
     )
 
 # 写训练日志用的
-def build_run_log_path(base_log_path: str) -> Path:
-    base_path = Path(base_log_path)
-    if not base_path.is_absolute():
-        base_path = (PROJECT_ROOT/base_path)
-    base_path = base_path.resolve()
-    run_start_time = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
+def build_timestamped_log_path(
+        base_log_path: str,
+        run_start_time: str,
+) -> Path:
+    """
+    根据统一 run timestamp 生成一份日志路径。
+    """
+
+    base_path = Path(
+        base_log_path
     )
+
+    if not base_path.is_absolute():
+
+        base_path = (
+            PROJECT_ROOT
+            / base_path
+        )
+
+    base_path = (
+        base_path.resolve()
+    )
+
     log_file_name = (
         f"{base_path.stem}_"
         f"{run_start_time}"
         f"{base_path.suffix}"
     )
-    return base_path.parent / log_file_name
+
+    return (
+        base_path.parent
+        / log_file_name
+    )
+
+
+def build_run_log_paths(
+        episode_base_log_path: str,
+        dc_base_log_path: str,
+) -> Tuple[Path, Path]:
+    """
+    为同一次训练生成 Episode Log 和 DC Log。
+
+    两个 CSV 必须共用完全相同的 timestamp，
+    才能保证离线分析时可以一一匹配。
+    """
+
+    run_start_time = (
+        datetime.now()
+        .strftime(
+            "%Y%m%d_%H%M%S"
+        )
+    )
+
+    episode_log_path = (
+        build_timestamped_log_path(
+            base_log_path=(
+                episode_base_log_path
+            ),
+
+            run_start_time=(
+                run_start_time
+            ),
+        )
+    )
+
+    dc_log_path = (
+        build_timestamped_log_path(
+            base_log_path=(
+                dc_base_log_path
+            ),
+
+            run_start_time=(
+                run_start_time
+            ),
+        )
+    )
+
+    return (
+        episode_log_path,
+        dc_log_path,
+    )
 
 # 把一个 episode 的统计信息追加到 CSV 文件
 def append_csv_log(csv_path: Path, row: Dict[str, Any],) -> None:
@@ -3404,378 +4154,1354 @@ def append_csv_log(csv_path: Path, row: Dict[str, Any],) -> None:
 
 # 把 episode 统计整理成固定结构的 CSV 行
 def build_episode_log_row(
-    stats: EpisodeStatistics,
-    env: Any,
+        stats: EpisodeStatistics,
+        env: Any,
 
-    routing_replay_buffer:
-    RoutingReplayBuffer,
+        routing_replay_buffer:
+        RoutingReplayBuffer,
 
-    host_replay_buffers:
-    Dict[str, HostReplayBuffer],
+        host_replay_buffers:
+        Dict[str, HostReplayBuffer],
 
-    routing_masac: RoutingMASAC,
+        routing_masac:
+        RoutingMASAC,
 
-    global_decision_steps: int,
-    routing_normal_action_steps: int,
-    wall_time_seconds: float,
+        host_sac_agents:
+        Dict[str, LocalHostSAC],
+
+        host_training_action_steps:
+        Dict[str, int],
+
+        pending_trace_store:
+        PendingJobTraceStore,
+
+        global_decision_steps: int,
+
+        routing_normal_action_steps: int,
+
+        wall_time_seconds: float,
+
+        service_metrics:
+        Dict[str, Any],
+
+        energy_metrics:
+        Dict[str, Any],
+
+        load_metrics:
+        Dict[str, Any],
 ) -> Dict[str, Any]:
-    # 当前 episode 总任务数。
-    total_jobs = int(len(getattr(env, "jobs", [])))
+    """
+    构造 H-MASAC Episode-level CSV。
 
-    # 从 host 完成队列统计完成任务数。
-    completed_jobs = count_completed_jobs(env)
+    Episode Log 只保存：
+        - System outcome
+        - Workload / Energy / aggregate load
+        - Routing aggregate
+        - Host aggregate
+        - Causal Trace health
 
-    # 从环境丢弃记录统计丢弃任务数。
-    dropped_jobs = int(
-        len(getattr(env, "dropped_jobs_info", []))
+    每个 DC / Host 的细节移动到 dc_log.csv。
+    """
+
+    total_jobs = int(
+        len(
+            getattr(
+                env,
+                "jobs",
+                [],
+            )
+        )
     )
 
-    # 没有进入完成或丢弃终态的任务数量。
-    unresolved_jobs = int(total_jobs - completed_jobs - dropped_jobs)
-    queued_jobs = int(getattr( env, "queued_jobs", 0,))
-    started_from_waiting_jobs = int(getattr( env, "started_from_waiting_jobs", 0,))
-    waiting_timeout_drops = int(getattr( env, "waiting_timeout_drops", 0,))
-    max_waiting_queue_length = int(getattr( env, "max_waiting_queue_length", 0,))
-    remaining_waiting_jobs = count_waiting_jobs(env)
-    service_metrics = calculate_service_metrics(env)
-    energy_metrics = (calculate_episode_energy_metrics(env))
-    load_metrics = (calculate_episode_load_metrics(env))
+    completed_jobs = int(
+        count_completed_jobs(
+            env
+        )
+    )
 
-    # 返回固定列顺序的字典。
-    return {
-        "episode": int(stats.episode),
-        "episode_seed": int(stats.episode_seed),
-        "training_stage": str(
-            stats.training_stage
-        ),
-        "episode_return": float(stats.episode_return),
-        "energy_normalization_j": float(conf.ENERGY_NORMALIZATION_J),
-        "energy_cost_weight": float(conf.ENERGY_COST_WEIGHT),
-        "energy_optimization_enabled": bool(float(conf.ENERGY_COST_WEIGHT) > 0.0),
-        "decision_count": int(stats.decision_count),
-        "normal_action_count": int(stats.normal_action_count),
-        "forced_action_count": int(stats.forced_action_count),
-        "random_action_count": int(stats.random_action_count),
-        "policy_action_count": int(stats.policy_action_count),
-        "local_action_count": int(stats.local_action_count),
-        "edge_action_count": int(stats.edge_action_count),
-        "cloud_action_count": int(stats.cloud_action_count),
-        "drop_action_count": int(stats.drop_action_count),
-        "local_action_rate": safe_ratio(stats.local_action_count, stats.decision_count,),
-        "edge_action_rate": safe_ratio(stats.edge_action_count,stats.decision_count,),
-        "cloud_action_rate": safe_ratio(stats.cloud_action_count,stats.decision_count,),
-        "drop_action_rate": safe_ratio(stats.drop_action_count, stats.decision_count,),
-        # "unknown_action_count": int(stats.unknown_action_count),
-        "total_jobs": total_jobs,
-        "completed_jobs": completed_jobs,
-        "dropped_jobs": dropped_jobs,
-        "completion_rate": safe_ratio(completed_jobs, total_jobs,),
-        "drop_rate": safe_ratio(dropped_jobs, total_jobs,),
-        "queue_admission_rate": safe_ratio( queued_jobs,total_jobs,),
-        "waiting_timeout_drop_rate": safe_ratio(waiting_timeout_drops, total_jobs,),
-        "sla_satisfied_jobs": int(service_metrics["sla_satisfied_jobs"]),
-        "sla_violated_completed_jobs": int(service_metrics["sla_violated_completed_jobs"]),
-        "sla_satisfaction_rate": float(service_metrics["sla_satisfaction_rate"]),
-        "sla_violation_rate": float(service_metrics["sla_violation_rate"]),
-        "mean_sla_violation_degree": float(service_metrics["mean_sla_violation_degree"]),
-        "total_completion_time": float(service_metrics["total_completion_time"]),
-        "avg_completion_time": float(service_metrics["avg_completion_time"]),
-        "unresolved_jobs": unresolved_jobs,
-        "queued_jobs": queued_jobs,
-        "started_from_waiting_jobs": started_from_waiting_jobs,
-        "waiting_timeout_drops": waiting_timeout_drops,
-        "max_waiting_queue_length": max_waiting_queue_length,
-        "remaining_waiting_jobs": remaining_waiting_jobs,
-        "simulation_end_time": float(getattr(env, "current_time", 0.0)),
-        "routing_episode_updates": int(
-    stats.routing_update_count
-),
+    dropped_jobs = int(
+        len(
+            getattr(
+                env,
+                "dropped_jobs_info",
+                [],
+            )
+        )
+    )
 
-"host_episode_updates": int(
-    stats.host_update_count
-),
-        "global_decision_steps": int(global_decision_steps),
-        "routing_normal_action_steps": int(
-            routing_normal_action_steps
-        ),
-        "routing_replay_size": int(len(routing_replay_buffer)),
-        "routing_replay_trainable_size": int(routing_replay_buffer.num_trainable_actions),
-        "host_replay_size_total": int(sum(len(buffer) for buffer in host_replay_buffers.values())),
-        "host_replay_size_by_dc": json.dumps({dc_id: int(len(buffer)) for dc_id, buffer in host_replay_buffers.items()},ensure_ascii=False,sort_keys=True,),
-        "routing_masac_update_step": int(
-    routing_masac.update_step
-),
-        "critic_loss": stats.mean_metric("critic_loss"),
-        "q1_loss": stats.mean_metric("q1_loss"),
-        "q2_loss": stats.mean_metric("q2_loss"),
-        "actor_loss": stats.mean_metric("actor_loss"),
-        "alpha_loss": stats.mean_metric("alpha_loss"),
-        "alpha": float( routing_masac.alpha.detach().cpu().item()),
-        "policy_entropy": stats.mean_metric("policy_entropy"),
-        "target_entropy": stats.mean_metric("target_entropy"),
-        "mean_q1": stats.mean_metric("mean_q1"),
-        "mean_q2": stats.mean_metric("mean_q2"),
-        "mean_target_q": stats.mean_metric("mean_target_q"),
-        "wall_time_seconds": float(wall_time_seconds),
-        "workload_total_cpu_request":load_metrics["workload_total_cpu_request"],
-        "workload_mean_cpu_request":load_metrics["workload_mean_cpu_request"],
-        "workload_max_cpu_request":load_metrics["workload_max_cpu_request"],
-        "workload_total_gpu_request":load_metrics["workload_total_gpu_request"],
-        "workload_mean_gpu_request":load_metrics["workload_mean_gpu_request"],
-        "workload_max_gpu_request":load_metrics["workload_max_gpu_request"],
-        "workload_gpu_job_ratio":load_metrics["workload_gpu_job_ratio"],
-        "workload_total_duration_s":load_metrics["workload_total_duration_s"],
-        "workload_mean_duration_s": load_metrics["workload_mean_duration_s"],
-        "workload_p95_duration_s":load_metrics["workload_p95_duration_s"],
-        "workload_max_duration_s":load_metrics["workload_max_duration_s"],
-        "workload_arrival_span_s":load_metrics["workload_arrival_span_s"],
-        "workload_observed_arrival_rate":load_metrics["workload_observed_arrival_rate"],
-        "edge_completed_jobs":load_metrics["edge_completed_jobs"],
-        "edge_total_cpu_capacity":load_metrics["edge_total_cpu_capacity"],
-        "edge_total_gpu_capacity":load_metrics["edge_total_gpu_capacity"],
-        "edge_cpu_resource_seconds":load_metrics["edge_cpu_resource_seconds"],
-        "edge_gpu_resource_seconds":load_metrics["edge_gpu_resource_seconds"],
-        "edge_avg_cpu_load":load_metrics["edge_avg_cpu_load"],
-        "edge_peak_cpu_load":load_metrics[ "edge_peak_cpu_load"],
-        "edge_avg_gpu_load":load_metrics["edge_avg_gpu_load"],
-        "edge_peak_gpu_load":load_metrics["edge_peak_gpu_load"],
-        "edge_avg_running_jobs":load_metrics["edge_avg_running_jobs"],
-        "edge_peak_running_jobs":load_metrics["edge_peak_running_jobs"],
-        "edge_host_avg_cpu_load_mean":load_metrics["edge_host_avg_cpu_load_mean"],
-        "edge_host_avg_cpu_load_std":load_metrics["edge_host_avg_cpu_load_std"],
-        "edge_host_avg_cpu_load_p95":load_metrics["edge_host_avg_cpu_load_p95"],
-        "edge_host_avg_gpu_load_mean": load_metrics[ "edge_host_avg_gpu_load_mean"],
-        "edge_host_avg_gpu_load_std":load_metrics["edge_host_avg_gpu_load_std"],
-        "edge_host_busy_ratio_mean":load_metrics["edge_host_busy_ratio_mean"],
-        "edge_host_busy_ratio_max":load_metrics["edge_host_busy_ratio_max"],
-        "cloud_completed_jobs":load_metrics["cloud_completed_jobs"],
-        "cloud_cpu_resource_seconds":load_metrics[ "cloud_cpu_resource_seconds"],
-        "cloud_gpu_resource_seconds":load_metrics[ "cloud_gpu_resource_seconds"],
-        "cloud_avg_used_cpu":load_metrics["cloud_avg_used_cpu"],
-        "cloud_peak_used_cpu":load_metrics[ "cloud_peak_used_cpu"],
-        "cloud_avg_used_gpu": load_metrics["cloud_avg_used_gpu"],
-        "cloud_peak_used_gpu":load_metrics["cloud_peak_used_gpu"],
-        "cloud_avg_running_jobs":load_metrics["cloud_avg_running_jobs"],
-        "cloud_peak_running_jobs":load_metrics["cloud_peak_running_jobs"],
-        "cloud_busy_ratio": load_metrics["cloud_busy_ratio" ],
-        "episode_energy_time_s":energy_metrics["episode_energy_time_s"],
-        "energy_time_gap_s":energy_metrics["energy_time_gap_s"],
-        "edge_idle_energy_j":energy_metrics["edge_idle_energy_j"],
-        "edge_cpu_dynamic_energy_j":energy_metrics["edge_cpu_dynamic_energy_j"],
-        "edge_gpu_dynamic_energy_j":energy_metrics["edge_gpu_dynamic_energy_j"],
-        "edge_total_energy_j":energy_metrics["edge_total_energy_j"],
-        "cloud_compute_energy_j":energy_metrics["cloud_compute_energy_j"],
-        "system_compute_energy_j":energy_metrics["system_compute_energy_j"],
-        "system_dynamic_compute_energy_j":energy_metrics["system_dynamic_compute_energy_j"],
-        "transfer_energy_j":energy_metrics["transfer_energy_j"],
-        "edge_edge_transfer_energy_j":energy_metrics["edge_edge_transfer_energy_j"],
-        "edge_cloud_transfer_energy_j":energy_metrics["edge_cloud_transfer_energy_j"],
-        "total_system_energy_j":energy_metrics["total_system_energy_j"],
-        "total_system_energy_kwh":energy_metrics["total_system_energy_kwh"],
-        "edge_idle_avg_power_w":
-            energy_metrics[
-                "edge_idle_avg_power_w"
-            ],
+    unresolved_jobs = int(
+        total_jobs
+        - completed_jobs
+        - dropped_jobs
+    )
 
-        "edge_cpu_dynamic_avg_power_w":
-            energy_metrics[
-                "edge_cpu_dynamic_avg_power_w"
-            ],
+    queued_jobs = int(
+        getattr(
+            env,
+            "queued_jobs",
+            0,
+        )
+    )
 
-        "edge_gpu_dynamic_avg_power_w":
-            energy_metrics[
-                "edge_gpu_dynamic_avg_power_w"
-            ],
+    started_from_waiting_jobs = int(
+        getattr(
+            env,
+            "started_from_waiting_jobs",
+            0,
+        )
+    )
 
-        "edge_total_avg_power_w":
-            energy_metrics[
-                "edge_total_avg_power_w"
-            ],
+    waiting_timeout_drops = int(
+        getattr(
+            env,
+            "waiting_timeout_drops",
+            0,
+        )
+    )
 
-        "cloud_compute_avg_power_w":
-            energy_metrics[
-                "cloud_compute_avg_power_w"
-            ],
+    max_waiting_queue_length = int(
+        getattr(
+            env,
+            "max_waiting_queue_length",
+            0,
+        )
+    )
 
-        "system_compute_avg_power_w":
-            energy_metrics[
-                "system_compute_avg_power_w"
-            ],
+    remaining_waiting_jobs = int(
+        count_waiting_jobs(
+            env
+        )
+    )
 
-        "transfer_equivalent_avg_power_w":
-            energy_metrics[
-                "transfer_equivalent_avg_power_w"
-            ],
+    host_alpha_values = [
+        float(
+            host_agent.alpha
+            .detach()
+            .cpu()
+            .item()
+        )
+        for host_agent
+        in host_sac_agents.values()
+    ]
 
-        "system_total_equivalent_avg_power_w":
-            energy_metrics[
-                "system_total_equivalent_avg_power_w"
-            ],
-        "edge_idle_energy_share":
-            energy_metrics[
-                "edge_idle_energy_share"
-            ],
+    host_alpha_mean = (
+        float(
+            np.mean(
+                host_alpha_values
+            )
+        )
+        if host_alpha_values
+        else float("nan")
+    )
 
-        "edge_cpu_dynamic_energy_share":
-            energy_metrics[
-                "edge_cpu_dynamic_energy_share"
-            ],
+    host_update_step_total = int(
+        sum(
+            int(
+                host_agent.update_step
+            )
+            for host_agent
+            in host_sac_agents.values()
+        )
+    )
 
-        "edge_gpu_dynamic_energy_share":
-            energy_metrics[
-                "edge_gpu_dynamic_energy_share"
-            ],
+    host_training_steps_total = int(
+        sum(
+            int(step_count)
+            for step_count
+            in host_training_action_steps.values()
+        )
+    )
 
-        "cloud_compute_energy_share":
-            energy_metrics[
-                "cloud_compute_energy_share"
-            ],
+    # ==========================================================
+    # Explicit Two-Level Log Columns
+    # ==============================================================
 
-        "transfer_energy_share":
-            energy_metrics[
-                "transfer_energy_share"
-            ],
-        "task_compute_energy_j":
-            energy_metrics[
-                "task_compute_energy_j"
-            ],
+    row: Dict[str, Any] = {
+        # ------------------------------------------------------
+        # Run Identity
+        # ------------------------------------------------------
 
-        "task_transfer_energy_j":
-            energy_metrics[
-                "task_transfer_energy_j"
-            ],
+        "episode":
+            int(
+                stats.episode
+            ),
 
-        "task_attributable_energy_j":
-            energy_metrics[
-                "task_attributable_energy_j"
-            ],
+        "episode_seed":
+            int(
+                stats.episode_seed
+            ),
 
-        "task_compute_energy_per_completed_job_j":
-            energy_metrics[
-                "task_compute_energy_per_completed_job_j"
-            ],
+        "training_stage":
+            str(
+                stats.training_stage
+            ),
 
-        "task_attributable_energy_per_total_job_j":
-            energy_metrics[
-                "task_attributable_energy_per_total_job_j"
-            ],
+        "cloud_enabled":
+            bool(
+                getattr(
+                    env,
+                    "enable_cloud_action",
+                    False,
+                )
+            ),
 
-        "system_energy_per_completed_job_j":
-            energy_metrics[
-                "system_energy_per_completed_job_j"
-            ],
+        "neighbor_feedback_enabled":
+            bool(
+                conf
+                .USE_NEIGHBOR_HISTORICAL_FEEDBACK
+            ),
 
-        "system_energy_per_total_job_j":
-            energy_metrics[
-                "system_energy_per_total_job_j"
-            ],
-        "transfer_split_gap_j":
-            energy_metrics[
-                "transfer_split_gap_j"
-            ],
+        "wall_time_seconds":
+            float(
+                wall_time_seconds
+            ),
 
-        "transfer_job_accounting_gap_j":
-            energy_metrics[
-                "transfer_job_accounting_gap_j"
-            ],
-        "per_agent_returns": json.dumps(
-            stats.per_agent_returns,
-            ensure_ascii=False,
-            sort_keys=True,
-        ),
-        # 每个 DC 的 Episode 负载详细信息。
-        "dc_load_details":
-            load_metrics[
-                "dc_load_details"
-            ],
+        "simulation_end_time":
+            float(
+                getattr(
+                    env,
+                    "current_time",
+                    0.0,
+                )
+            ),
 
-        # 每一台 Edge Host 的 Episode 负载详细信息。
-        "edge_host_load_details":
-            load_metrics[
-                "edge_host_load_details"
-            ],
+        # ------------------------------------------------------
+        # System Objective
+        #
+        # 不把 Host layer reward 再加一次。
+        # ------------------------------------------------------
 
+        "system_episode_reward":
+            float(
+                stats.episode_return
+            ),
+
+        "total_jobs":
+            total_jobs,
+
+        "completed_jobs":
+            completed_jobs,
+
+        "dropped_jobs":
+            dropped_jobs,
+
+        "unresolved_jobs":
+            unresolved_jobs,
+
+        "completion_rate":
+            safe_ratio(
+                completed_jobs,
+                total_jobs,
+            ),
+
+        "drop_rate":
+            safe_ratio(
+                dropped_jobs,
+                total_jobs,
+            ),
+
+        "queued_jobs":
+            queued_jobs,
+
+        "queue_admission_rate":
+            safe_ratio(
+                queued_jobs,
+                total_jobs,
+            ),
+
+        "started_from_waiting_jobs":
+            started_from_waiting_jobs,
+
+        "waiting_timeout_drops":
+            waiting_timeout_drops,
+
+        "waiting_timeout_drop_rate":
+            safe_ratio(
+                waiting_timeout_drops,
+                total_jobs,
+            ),
+
+        "max_waiting_queue_length":
+            max_waiting_queue_length,
+
+        "remaining_waiting_jobs":
+            remaining_waiting_jobs,
+
+        # ------------------------------------------------------
+        # Reward / Energy Configuration
+        # ------------------------------------------------------
+
+        "energy_normalization_j":
+            float(
+                conf
+                .ENERGY_NORMALIZATION_J
+            ),
+
+        "energy_cost_weight":
+            float(
+                conf
+                .ENERGY_COST_WEIGHT
+            ),
+
+        "energy_optimization_enabled":
+            bool(
+                float(
+                    conf
+                    .ENERGY_COST_WEIGHT
+                )
+                > 0.0
+            ),
+
+        # ------------------------------------------------------
+        # Routing Behavior
+        # ------------------------------------------------------
+
+        "routing_decision_count":
+            int(
+                stats
+                .routing_decision_count
+            ),
+
+        "routing_actor_controlled_count":
+            int(
+                stats.routing_random_action_count
+                + stats.routing_policy_action_count
+            ),
+
+        "routing_forced_action_count":
+            int(
+                stats
+                .routing_forced_action_count
+            ),
+
+        "routing_orchestrator_action_count":
+            int(
+                stats
+                .routing_orchestrator_action_count
+            ),
+
+        "routing_random_action_count":
+            int(
+                stats
+                .routing_random_action_count
+            ),
+
+        "routing_policy_action_count":
+            int(
+                stats
+                .routing_policy_action_count
+            ),
+
+        "routing_self_count":
+            int(
+                stats.routing_self_count
+            ),
+
+        "routing_self_rate":
+            safe_ratio(
+                stats.routing_self_count,
+                stats.routing_decision_count,
+            ),
+
+        "routing_edge_count":
+            int(
+                stats.routing_edge_count
+            ),
+
+        "routing_edge_rate":
+            safe_ratio(
+                stats.routing_edge_count,
+                stats.routing_decision_count,
+            ),
+
+        "routing_cloud_count":
+            int(
+                stats.routing_cloud_count
+            ),
+
+        "routing_cloud_rate":
+            safe_ratio(
+                stats.routing_cloud_count,
+                stats.routing_decision_count,
+            ),
+
+        "routing_drop_count":
+            int(
+                stats.routing_drop_count
+            ),
+
+        "routing_drop_rate":
+            safe_ratio(
+                stats.routing_drop_count,
+                stats.routing_decision_count,
+            ),
+
+        "multi_hop_job_count":
+            int(
+                stats.multi_hop_job_count
+            ),
+
+        "multi_hop_job_rate":
+            safe_ratio(
+                stats.multi_hop_job_count,
+                stats.terminal_trace_flushed_count,
+            ),
+
+        "avg_routing_edge_hops_per_job":
+            safe_ratio(
+                stats.routing_edge_hop_total,
+                stats.terminal_trace_flushed_count,
+            ),
+
+        "max_routing_hops":
+            int(
+                stats.max_routing_hops
+            ),
+
+        "routing_source_target_matrix_json":
+            json.dumps(
+                stats
+                .routing_source_target_counts,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+
+        "routing_reward_by_agent_json":
+            json.dumps(
+                stats.per_agent_returns,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+
+        # ------------------------------------------------------
+        # Host Behavior
+        # ------------------------------------------------------
+
+        "host_decision_count":
+            int(
+                stats.host_decision_count
+            ),
+
+        "host_random_action_count":
+            int(
+                stats
+                .host_random_action_count
+            ),
+
+        "host_policy_action_count":
+            int(
+                stats
+                .host_policy_action_count
+            ),
+
+        "host_started_count":
+            int(
+                stats.host_started_count
+            ),
+
+        "host_started_rate":
+            safe_ratio(
+                stats.host_started_count,
+                stats.host_decision_count,
+            ),
+
+        "host_queued_count":
+            int(
+                stats.host_queued_count
+            ),
+
+        "host_queued_rate":
+            safe_ratio(
+                stats.host_queued_count,
+                stats.host_decision_count,
+            ),
+
+        "host_dropped_count":
+            int(
+                stats.host_dropped_count
+            ),
+
+        "host_dropped_rate":
+            safe_ratio(
+                stats.host_dropped_count,
+                stats.host_decision_count,
+            ),
+
+        # ------------------------------------------------------
+        # Routing MASAC Learning
+        # ------------------------------------------------------
+
+        "routing_episode_updates":
+            int(
+                stats.routing_update_count
+            ),
+
+        "routing_replay_size":
+            int(
+                len(
+                    routing_replay_buffer
+                )
+            ),
+
+        "routing_replay_trainable_size":
+            int(
+                routing_replay_buffer
+                .num_trainable_actions
+            ),
+
+        "routing_update_step":
+            int(
+                routing_masac.update_step
+            ),
+
+        "routing_global_decision_steps":
+            int(
+                global_decision_steps
+            ),
+
+        "routing_training_action_steps":
+            int(
+                routing_normal_action_steps
+            ),
+
+        "routing_critic_loss":
+            stats.mean_routing_metric(
+                "critic_loss"
+            ),
+
+        "routing_q1_loss":
+            stats.mean_routing_metric(
+                "q1_loss"
+            ),
+
+        "routing_q2_loss":
+            stats.mean_routing_metric(
+                "q2_loss"
+            ),
+
+        "routing_actor_loss":
+            stats.mean_routing_metric(
+                "actor_loss"
+            ),
+
+        "routing_alpha_loss":
+            stats.mean_routing_metric(
+                "alpha_loss"
+            ),
+
+        "routing_alpha":
+            float(
+                routing_masac.alpha
+                .detach()
+                .cpu()
+                .item()
+            ),
+
+        "routing_policy_entropy":
+            stats.mean_routing_metric(
+                "policy_entropy"
+            ),
+
+        "routing_target_entropy":
+            stats.mean_routing_metric(
+                "target_entropy"
+            ),
+
+        "routing_mean_q1":
+            stats.mean_routing_metric(
+                "mean_q1"
+            ),
+
+        "routing_mean_q2":
+            stats.mean_routing_metric(
+                "mean_q2"
+            ),
+
+        "routing_mean_target_q":
+            stats.mean_routing_metric(
+                "mean_target_q"
+            ),
+
+        # ------------------------------------------------------
+        # Host SAC Aggregate Learning
+        # ------------------------------------------------------
+
+        "host_episode_updates":
+            int(
+                stats.host_update_count
+            ),
+
+        "host_replay_size_total":
+            int(
+                sum(
+                    len(buffer)
+                    for buffer
+                    in host_replay_buffers.values()
+                )
+            ),
+
+        "host_training_action_steps_total":
+            host_training_steps_total,
+
+        "host_update_step_total":
+            host_update_step_total,
+
+        "host_critic_loss":
+            stats.mean_host_metric(
+                "critic_loss"
+            ),
+
+        "host_q1_loss":
+            stats.mean_host_metric(
+                "q1_loss"
+            ),
+
+        "host_q2_loss":
+            stats.mean_host_metric(
+                "q2_loss"
+            ),
+
+        "host_actor_loss":
+            stats.mean_host_metric(
+                "actor_loss"
+            ),
+
+        "host_alpha_loss":
+            stats.mean_host_metric(
+                "alpha_loss"
+            ),
+
+        "host_alpha_mean":
+            host_alpha_mean,
+
+        "host_policy_entropy":
+            stats.mean_host_metric(
+                "policy_entropy"
+            ),
+
+        "host_target_entropy":
+            stats.mean_host_metric(
+                "target_entropy"
+            ),
+
+        "host_mean_q1":
+            stats.mean_host_metric(
+                "mean_q1"
+            ),
+
+        "host_mean_q2":
+            stats.mean_host_metric(
+                "mean_q2"
+            ),
+
+        "host_mean_target_q":
+            stats.mean_host_metric(
+                "mean_target_q"
+            ),
+
+        # ------------------------------------------------------
+        # Layer Reward Diagnostics
+        #
+        # 禁止做：
+        # system_episode_reward =
+        # routing_layer_reward_sum + host_layer_reward_sum
+        # ------------------------------------------------------
+
+        "routing_layer_reward_sum":
+            float(
+                stats.routing_layer_reward_sum
+            ),
+
+        "host_layer_reward_sum":
+            float(
+                stats.host_layer_reward_sum
+            ),
+
+        # ------------------------------------------------------
+        # Causal Trace Health
+        # ------------------------------------------------------
+
+        "terminal_trace_flushed_count":
+            int(
+                stats
+                .terminal_trace_flushed_count
+            ),
+
+        "routing_transition_flushed_count":
+            int(
+                stats
+                .routing_transition_flushed_count
+            ),
+
+        "host_transition_flushed_count":
+            int(
+                stats
+                .host_transition_flushed_count
+            ),
+
+        "pending_trace_count_end":
+            int(
+                pending_trace_store
+                .pending_trace_count
+            ),
+
+        "finalized_trace_count_end":
+            int(
+                pending_trace_store
+                .finalized_trace_count
+            ),
+
+        "causal_terminal_job_gap":
+            int(
+                total_jobs
+                - stats
+                .terminal_trace_flushed_count
+            ),
     }
 
+    # ==========================================================
+    # Existing System Metrics
+    #
+    # 这些属于真实 workload/service/load/energy，
+    # 与 Routing / Host 学习器无关，因此继续保留。
+    # ==============================================================
+
+    row.update(
+        service_metrics
+    )
+
+    row.update(
+        energy_metrics
+    )
+
+    # DC/Host 详细 JSON 移到 dc_log.csv。
+    # Episode Log 只保留 aggregate load metrics。
+    for metric_name, metric_value in (
+            load_metrics.items()
+    ):
+
+        if metric_name in {
+            "dc_load_details",
+            "edge_host_load_details",
+        }:
+            continue
+
+        row[
+            metric_name
+        ] = metric_value
+
+    return row
+
+
+def build_dc_log_rows(
+        stats: EpisodeStatistics,
+        env: Any,
+
+        host_sac_agents:
+        Dict[str, LocalHostSAC],
+
+        host_replay_buffers:
+        Dict[str, HostReplayBuffer],
+
+        host_training_action_steps:
+        Dict[str, int],
+
+        load_metrics:
+        Dict[str, Any],
+) -> list[Dict[str, Any]]:
+    """
+    构造 H-MASAC DC-level 日志。
+
+    每个 Episode：
+        每个 Edge DC 产生一行。
+
+    用于分别诊断：
+        Routing Agent 行为
+        Local Host SAC
+        当前 DC Resource Load
+    """
+
+    raw_dc_load_details = (
+        load_metrics.get(
+            "dc_load_details",
+            "{}",
+        )
+    )
+
+    raw_host_load_details = (
+        load_metrics.get(
+            "edge_host_load_details",
+            "{}",
+        )
+    )
+
+    dc_load_details = (
+        json.loads(
+            raw_dc_load_details
+        )
+        if isinstance(
+            raw_dc_load_details,
+            str,
+        )
+        else dict(
+            raw_dc_load_details
+        )
+    )
+
+    host_load_details = (
+        json.loads(
+            raw_host_load_details
+        )
+        if isinstance(
+            raw_host_load_details,
+            str,
+        )
+        else dict(
+            raw_host_load_details
+        )
+    )
+
+    rows: list[
+        Dict[str, Any]
+    ] = []
+
+    for dc_id_raw in (
+        env.edge_dc_ids
+    ):
+
+        dc_id = str(
+            dc_id_raw
+        )
+
+        dc_stats = (
+            stats.dc_counters.get(
+                dc_id,
+                {},
+            )
+        )
+
+        dc_load = (
+            dc_load_details.get(
+                dc_id,
+                {},
+            )
+        )
+
+        host_agent = (
+            host_sac_agents[
+                dc_id
+            ]
+        )
+
+        host_replay = (
+            host_replay_buffers[
+                dc_id
+            ]
+        )
+
+        dc_host_load_details = {
+            host_key:
+                host_detail
+
+            for host_key, host_detail
+            in host_load_details.items()
+
+            if str(
+                host_key
+            ).startswith(
+                f"{dc_id}/"
+            )
+        }
+
+        source_target_counts = (
+            stats
+            .routing_source_target_counts
+            .get(
+                dc_id,
+                {},
+            )
+        )
+
+        row = {
+            # --------------------------------------------------
+            # Identity
+            # --------------------------------------------------
+
+            "episode":
+                int(
+                    stats.episode
+                ),
+
+            "episode_seed":
+                int(
+                    stats.episode_seed
+                ),
+
+            "training_stage":
+                str(
+                    stats.training_stage
+                ),
+
+            "dc_id":
+                dc_id,
+
+            # --------------------------------------------------
+            # Routing Behavior
+            # --------------------------------------------------
+
+            "routing_decisions":
+                int(
+                    dc_stats.get(
+                        "routing_decisions",
+                        0,
+                    )
+                ),
+
+            "route_self_count":
+                int(
+                    dc_stats.get(
+                        "route_self_count",
+                        0,
+                    )
+                ),
+
+            "route_out_edge_count":
+                int(
+                    dc_stats.get(
+                        "route_out_edge_count",
+                        0,
+                    )
+                ),
+
+            "route_in_edge_count":
+                int(
+                    dc_stats.get(
+                        "route_in_edge_count",
+                        0,
+                    )
+                ),
+
+            "route_cloud_count":
+                int(
+                    dc_stats.get(
+                        "route_cloud_count",
+                        0,
+                    )
+                ),
+
+            "route_drop_count":
+                int(
+                    dc_stats.get(
+                        "route_drop_count",
+                        0,
+                    )
+                ),
+
+            "routing_reward":
+                float(
+                    stats
+                    .per_agent_returns
+                    .get(
+                        dc_id,
+                        0.0,
+                    )
+                ),
+
+            "routing_out_targets_json":
+                json.dumps(
+                    source_target_counts,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+
+            # --------------------------------------------------
+            # Host Behavior
+            # --------------------------------------------------
+
+            "host_decision_count":
+                int(
+                    dc_stats.get(
+                        "host_decisions",
+                        0,
+                    )
+                ),
+
+            "host_random_count":
+                int(
+                    dc_stats.get(
+                        "host_random_count",
+                        0,
+                    )
+                ),
+
+            "host_policy_count":
+                int(
+                    dc_stats.get(
+                        "host_policy_count",
+                        0,
+                    )
+                ),
+
+            "host_started_count":
+                int(
+                    dc_stats.get(
+                        "host_started_count",
+                        0,
+                    )
+                ),
+
+            "host_queued_count":
+                int(
+                    dc_stats.get(
+                        "host_queued_count",
+                        0,
+                    )
+                ),
+
+            "host_dropped_count":
+                int(
+                    dc_stats.get(
+                        "host_dropped_count",
+                        0,
+                    )
+                ),
+
+            # --------------------------------------------------
+            # Local Host SAC
+            # --------------------------------------------------
+
+            "host_episode_updates":
+                int(
+                    dc_stats.get(
+                        "host_updates",
+                        0,
+                    )
+                ),
+
+            "host_training_action_steps":
+                int(
+                    host_training_action_steps.get(
+                        dc_id,
+                        0,
+                    )
+                ),
+
+            "host_replay_size":
+                int(
+                    len(
+                        host_replay
+                    )
+                ),
+
+            "host_update_step":
+                int(
+                    host_agent.update_step
+                ),
+
+            "host_critic_loss":
+                stats.mean_host_metric(
+                    "critic_loss",
+                    dc_id=dc_id,
+                ),
+
+            "host_q1_loss":
+                stats.mean_host_metric(
+                    "q1_loss",
+                    dc_id=dc_id,
+                ),
+
+            "host_q2_loss":
+                stats.mean_host_metric(
+                    "q2_loss",
+                    dc_id=dc_id,
+                ),
+
+            "host_actor_loss":
+                stats.mean_host_metric(
+                    "actor_loss",
+                    dc_id=dc_id,
+                ),
+
+            "host_alpha_loss":
+                stats.mean_host_metric(
+                    "alpha_loss",
+                    dc_id=dc_id,
+                ),
+
+            "host_alpha":
+                float(
+                    host_agent.alpha
+                    .detach()
+                    .cpu()
+                    .item()
+                ),
+
+            "host_policy_entropy":
+                stats.mean_host_metric(
+                    "policy_entropy",
+                    dc_id=dc_id,
+                ),
+
+            "host_target_entropy":
+                stats.mean_host_metric(
+                    "target_entropy",
+                    dc_id=dc_id,
+                ),
+
+            "host_mean_q1":
+                stats.mean_host_metric(
+                    "mean_q1",
+                    dc_id=dc_id,
+                ),
+
+            "host_mean_q2":
+                stats.mean_host_metric(
+                    "mean_q2",
+                    dc_id=dc_id,
+                ),
+
+            "host_mean_target_q":
+                stats.mean_host_metric(
+                    "mean_target_q",
+                    dc_id=dc_id,
+                ),
+
+            # --------------------------------------------------
+            # DC Resource Load
+            # --------------------------------------------------
+
+            "dc_completed_jobs":
+                int(
+                    dc_load.get(
+                        "completed_jobs",
+                        0,
+                    )
+                ),
+
+            "dc_cpu_capacity":
+                float(
+                    dc_load.get(
+                        "cpu_capacity",
+                        0.0,
+                    )
+                ),
+
+            "dc_gpu_capacity":
+                float(
+                    dc_load.get(
+                        "gpu_capacity",
+                        0.0,
+                    )
+                ),
+
+            "dc_avg_cpu_load":
+                float(
+                    dc_load.get(
+                        "avg_cpu_load",
+                        0.0,
+                    )
+                ),
+
+            "dc_peak_cpu_load":
+                float(
+                    dc_load.get(
+                        "peak_cpu_load",
+                        0.0,
+                    )
+                ),
+
+            "dc_avg_gpu_load":
+                float(
+                    dc_load.get(
+                        "avg_gpu_load",
+                        0.0,
+                    )
+                ),
+
+            "dc_peak_gpu_load":
+                float(
+                    dc_load.get(
+                        "peak_gpu_load",
+                        0.0,
+                    )
+                ),
+
+            "dc_avg_running_jobs":
+                float(
+                    dc_load.get(
+                        "avg_running_jobs",
+                        0.0,
+                    )
+                ),
+
+            "dc_peak_running_jobs":
+                int(
+                    dc_load.get(
+                        "peak_running_jobs",
+                        0,
+                    )
+                ),
+
+            "dc_busy_ratio":
+                float(
+                    dc_load.get(
+                        "busy_ratio",
+                        0.0,
+                    )
+                ),
+
+            # 当前 DC 每台 Host 的详细负载。
+            "host_load_details_json":
+                json.dumps(
+                    dc_host_load_details,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+        }
+
+        rows.append(
+            row
+        )
+
+    return rows
+
 # 打印episode摘要
-def print_episode_summary(row: Dict[str, Any]) -> None:
-    # 提取可能为 NaN 的 Critic 损失。
-    critic_loss = float(row["critic_loss"])
+def print_episode_summary(
+        row: Dict[str, Any],
+) -> None:
+    """
+    打印 H-MASAC 双层训练摘要。
 
-    # 有限数值正常格式化，否则显示 nan。
-    critic_loss_text = (
-        f"{critic_loss:.6f}"
-        if np.isfinite(critic_loss)
-        else "nan"
+    System / Routing / Host / Causal 分行显示，
+    不再沿用单 MASAC 混合输出格式。
+    """
+
+    def format_float(
+            value: Any,
+            precision: int = 6,
+    ) -> str:
+
+        value = float(
+            value
+        )
+
+        if not np.isfinite(
+                value
+        ):
+            return "nan"
+
+        return (
+            f"{value:.{precision}f}"
+        )
+
+    print(
+        f"Episode "
+        f"{int(row['episode']):5d} | "
+        f"stage="
+        f"{row['training_stage']} | "
+        f"system_R="
+        f"{float(row['system_episode_reward']):9.4f} | "
+        f"completed="
+        f"{int(row['completed_jobs']):5d} | "
+        f"dropped="
+        f"{int(row['dropped_jobs']):5d} | "
+        f"SLA_vio="
+        f"{float(row['sla_violation_rate']):6.2%} | "
+        f"avg_T="
+        f"{float(row['avg_completion_time']):8.2f}s"
     )
 
-    # 打印主要训练指标。
-    # 打印 Episode 核心训练指标。
     print(
-        f"Episode {int(row['episode']):5d} | "
-        f"return={float(row['episode_return']):9.4f} | "
-        f"sla_vio={float(row['sla_violation_rate']):6.2%} | "
-        f"avg_T={float(row['avg_completion_time']):8.2f}s | "
-        f"completed={int(row['completed_jobs']):5d} | "
-        f"dropped={int(row['dropped_jobs']):5d} | "
-        f"local={int(row['local_action_count']):5d} | "
-        f"edge={int(row['edge_action_count']):5d} | "
-        f"cloud={int(row['cloud_action_count']):5d}"
+        f"  Routing | "
+        f"decisions="
+        f"{int(row['routing_decision_count']):5d} | "
+        f"Self="
+        f"{int(row['routing_self_count']):5d} "
+        f"({float(row['routing_self_rate']):6.2%}) | "
+        f"Edge="
+        f"{int(row['routing_edge_count']):5d} "
+        f"({float(row['routing_edge_rate']):6.2%}) | "
+        f"Cloud="
+        f"{int(row['routing_cloud_count']):5d} "
+        f"({float(row['routing_cloud_rate']):6.2%}) | "
+        f"multi-hop="
+        f"{int(row['multi_hop_job_count']):4d}"
     )
 
-    # 打印本轮负载情况。
     print(
-        f"  Load   | "
-        f"EdgeCPU(avg/peak)="
+        f"  R-Train | "
+        f"buffer="
+        f"{int(row['routing_replay_trainable_size']):7d} | "
+        f"updates="
+        f"{int(row['routing_episode_updates']):5d} | "
+        f"critic="
+        f"{format_float(row['routing_critic_loss'])} | "
+        f"alpha="
+        f"{format_float(row['routing_alpha'], 5)} | "
+        f"entropy="
+        f"{format_float(row['routing_policy_entropy'], 5)}"
+    )
+
+    print(
+        f"  Host    | "
+        f"decisions="
+        f"{int(row['host_decision_count']):5d} | "
+        f"started="
+        f"{int(row['host_started_count']):5d} | "
+        f"queued="
+        f"{int(row['host_queued_count']):5d} | "
+        f"dropped="
+        f"{int(row['host_dropped_count']):5d}"
+    )
+
+    print(
+        f"  H-Train | "
+        f"buffer="
+        f"{int(row['host_replay_size_total']):7d} | "
+        f"updates="
+        f"{int(row['host_episode_updates']):5d} | "
+        f"critic="
+        f"{format_float(row['host_critic_loss'])} | "
+        f"alpha_mean="
+        f"{format_float(row['host_alpha_mean'], 5)} | "
+        f"entropy="
+        f"{format_float(row['host_policy_entropy'], 5)}"
+    )
+
+    print(
+        f"  Causal  | "
+        f"terminal="
+        f"{int(row['terminal_trace_flushed_count']):5d} | "
+        f"routing_T="
+        f"{int(row['routing_transition_flushed_count']):5d} | "
+        f"host_T="
+        f"{int(row['host_transition_flushed_count']):5d} | "
+        f"pending="
+        f"{int(row['pending_trace_count_end']):3d} | "
+        f"gap="
+        f"{int(row['causal_terminal_job_gap']):3d}"
+    )
+
+    print(
+        f"  Load    | "
+        f"EdgeCPU="
         f"{float(row['edge_avg_cpu_load']):6.2%}/"
         f"{float(row['edge_peak_cpu_load']):6.2%} | "
-        f"EdgeGPU(avg/peak)="
+        f"EdgeGPU="
         f"{float(row['edge_avg_gpu_load']):6.2%}/"
         f"{float(row['edge_peak_gpu_load']):6.2%} | "
         f"HostCPUStd="
-        f"{float(row['edge_host_avg_cpu_load_std']):6.2%} | "
-        f"CloudCPU(avg/peak)="
-        f"{float(row['cloud_avg_used_cpu']):8.2f}/"
-        f"{float(row['cloud_peak_used_cpu']):8.2f} | "
-        f"CloudGPU(avg/peak)="
-        f"{float(row['cloud_avg_used_gpu']):8.2f}/"
-        f"{float(row['cloud_peak_used_gpu']):8.2f}"
+        f"{float(row['edge_host_avg_cpu_load_std']):6.2%}"
     )
 
-    # 打印本轮 Energy / Power。
     print(
-        f"  Energy | "
+        f"  Energy  | "
         f"total="
         f"{float(row['total_system_energy_kwh']):10.6f} kWh | "
         f"per_job="
         f"{float(row['system_energy_per_completed_job_j']):10.2f} J | "
         f"avgP="
-        f"{float(row['system_total_equivalent_avg_power_w']):10.2f} W | "
-        f"EdgeIdle="
-        f"{float(row['edge_idle_energy_share']):6.2%} | "
-        f"EdgeCPU="
-        f"{float(row['edge_cpu_dynamic_energy_share']):6.2%} | "
-        f"EdgeGPU="
-        f"{float(row['edge_gpu_dynamic_energy_share']):6.2%} | "
-        f"Cloud="
-        f"{float(row['cloud_compute_energy_share']):6.2%} | "
-        f"Transfer="
-        f"{float(row['transfer_energy_share']):6.2%}"
-    )
-
-    # MASAC 本身训练状态。
-    print(
-        f"  Routing MASAC | "
-        f"routing_buffer="
-        f"{int(row['routing_replay_trainable_size']):7d} | "
-        f"host_buffer="
-        f"{int(row['host_replay_size_total']):7d} | "
-        f"routing_updates="
-f"{int(row['routing_episode_updates']):5d} | "
-f"host_updates="
-f"{int(row['host_episode_updates']):5d} | "
-        f"critic_loss={critic_loss_text} | "
-        f"alpha={float(row['alpha']):.5f}"
+        f"{float(row['system_total_equivalent_avg_power_w']):10.2f} W"
     )
 
 
@@ -4235,29 +5961,99 @@ def train(
         ),
     )
 
-    # 把保存路径转换成 Path
-    checkpoint_dir = Path(train_config.checkpoint_dir)
-    log_csv_path = build_run_log_path(train_config.log_csv_path)
+    checkpoint_dir = Path(
+        train_config.checkpoint_dir
+    )
 
-    # 创建 checkpoint 目录
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    log_csv_path.parent.mkdir(parents=True, exist_ok=True,)
+    # ==============================================================
+    # Two-Level Training Logs
+    #
+    # 同一次训练共用相同 timestamp：
+    #
+    #   episode_log_YYYYMMDD_HHMMSS.csv
+    #   dc_log_YYYYMMDD_HHMMSS.csv
+    # ==============================================================
 
-    current_log_pointer_path = (log_csv_path.parent / "current_train_log.txt")
-    current_log_pointer_path.write_text(str(log_csv_path.resolve()), encoding="utf-8",)
+    (
+        episode_log_csv_path,
+        dc_log_csv_path,
+    ) = build_run_log_paths(
+        episode_base_log_path=(
+            train_config
+                .episode_log_csv_path
+        ),
+
+        dc_base_log_path=(
+            train_config
+                .dc_log_csv_path
+        ),
+    )
+
+    checkpoint_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    episode_log_csv_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    dc_log_csv_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ==============================================================
+    # Compatibility Pointer
+    #
+    # current_train_log.txt 继续指向主 Episode Log，
+    # 防止已有服务器查看脚本失效。
+    # ==============================================================
+
+    current_log_pointer_path = (
+            episode_log_csv_path.parent
+            / "current_train_log.txt"
+    )
+
+    current_log_pointer_path.write_text(
+        str(
+            episode_log_csv_path.resolve()
+        ),
+        encoding="utf-8",
+    )
+
+    # 新增 DC 日志 pointer。
+    current_dc_log_pointer_path = (
+            dc_log_csv_path.parent
+            / "current_dc_log.txt"
+    )
+
+    current_dc_log_pointer_path.write_text(
+        str(
+            dc_log_csv_path.resolve()
+        ),
+        encoding="utf-8",
+    )
 
     print(
         "\n"
         "============================================================\n"
-        "📊 本次训练日志\n"
-        f"CSV Path : {log_csv_path.resolve()}\n"
-        f"Pointer  : {current_log_pointer_path.resolve()}\n"
+        "📊 H-MASAC 双层训练日志\n"
+        f"Episode CSV : "
+        f"{episode_log_csv_path.resolve()}\n"
+        f"DC CSV      : "
+        f"{dc_log_csv_path.resolve()}\n"
+        f"Episode Ptr : "
+        f"{current_log_pointer_path.resolve()}\n"
+        f"DC Ptr      : "
+        f"{current_dc_log_pointer_path.resolve()}\n"
         "\n"
-        "每个 Episode 完成后会立即追加一行并写入磁盘。\n"
-        "训练过程中可以直接读取该 CSV 查看已完成 Episode。\n"
+        "每个 Episode 结束后立即 flush + fsync。\n"
         "============================================================\n",
         flush=True,
     )
+
 
     try:
         # 从 start_episode 训练到 num_episodes，包含最后一个 episode。
@@ -4620,6 +6416,27 @@ def train(
                             ]
                         ),
                     )
+                    stats.record_host_decision(
+                        dc_id=(
+                            host_dc_id
+                        ),
+
+                        action_source=(
+                            host_action_source
+                        ),
+                    )
+
+                    stats.record_host_result(
+                        dc_id=(
+                            host_dc_id
+                        ),
+
+                        execution_result=str(
+                            host_result[
+                                "execution_result"
+                            ]
+                        ),
+                    )
 
                     # ==========================================================
                     # execute_pending_host_action() 内部会继续推进事件，
@@ -4720,10 +6537,16 @@ def train(
                                     )
                                 )
 
-                            stats.host_update_count += int(
-                                len(
+                            record_host_update_block(
+                                stats=stats,
+
+                                dc_id=(
+                                    host_dc_id
+                                ),
+
+                                update_infos=(
                                     host_update_infos
-                                )
+                                ),
                             )
 
                     decision = None
@@ -4861,7 +6684,23 @@ def train(
                 decision = next_decision
 
                 # 记录这条经验的奖励和动作类型
-                stats.record_transition(
+                # ==============================================================
+                # Routing Layer Episode Statistics
+                #
+                # RoutingActionResult 已经由 Collector 根据 Environment
+                # 的真实动作语义生成。
+                #
+                # 这里同时记录：
+                #   - source DC
+                #   - target DC
+                #   - action type
+                #   - action source
+                #   - immediate reward
+                #
+                # 从而可以生成完整 source -> target Routing Matrix。
+                # ==============================================================
+
+                stats.record_routing_decision(
                     agent_id=(
                         routing_result.agent_id
                     ),
@@ -4879,6 +6718,11 @@ def train(
                     action_source=(
                         routing_result
                             .action_source
+                    ),
+
+                    target_dc_id=(
+                        routing_result
+                            .target_dc_id
                     ),
                 )
 
@@ -4918,6 +6762,8 @@ def train(
                         host_replay_buffers=(
                             host_replay_buffers
                         ),
+
+                        stats=stats,
                     )
 
                     pending_trace_store.pop_finalized_trace(
@@ -5034,8 +6880,9 @@ def train(
                             update_info
                         )
 
-                    record_update_block(
+                    record_routing_update_block(
                         stats=stats,
+
                         update_infos=(
                             update_info_block
                         ),
@@ -5068,41 +6915,160 @@ def train(
             # 计算当前 episode 的真实运行秒数。
             wall_time_seconds = (time.perf_counter() - episode_wall_start)
 
-            # 日志记录
-            log_row = build_episode_log_row(
-                stats=stats,
+            # ==============================================================
+            # Episode-level Physical Metrics
+            #
+            # 三套真实系统指标只计算一次，
+            # Episode Log / DC Log 共用同一份 snapshot。
+            # ==============================================================
 
-                env=env,
+            service_metrics = (
+                calculate_service_metrics(
+                    env
+                )
+            )
 
-                routing_replay_buffer=(
-                    routing_replay_buffer
+            energy_metrics = (
+                calculate_episode_energy_metrics(
+                    env
+                )
+            )
+
+            load_metrics = (
+                calculate_episode_load_metrics(
+                    env
+                )
+            )
+
+            # ==============================================================
+            # Episode Log
+            # ==============================================================
+
+            episode_log_row = (
+                build_episode_log_row(
+                    stats=stats,
+
+                    env=env,
+
+                    routing_replay_buffer=(
+                        routing_replay_buffer
+                    ),
+
+                    host_replay_buffers=(
+                        host_replay_buffers
+                    ),
+
+                    routing_masac=(
+                        routing_masac
+                    ),
+
+                    host_sac_agents=(
+                        host_sac_agents
+                    ),
+
+                    host_training_action_steps=(
+                        host_training_action_steps
+                    ),
+
+                    pending_trace_store=(
+                        pending_trace_store
+                    ),
+
+                    global_decision_steps=(
+                        global_decision_steps
+                    ),
+
+                    routing_normal_action_steps=(
+                        routing_normal_action_steps
+                    ),
+
+                    wall_time_seconds=(
+                        wall_time_seconds
+                    ),
+
+                    service_metrics=(
+                        service_metrics
+                    ),
+
+                    energy_metrics=(
+                        energy_metrics
+                    ),
+
+                    load_metrics=(
+                        load_metrics
+                    ),
+                )
+            )
+
+            # ==============================================================
+            # Per-DC Log
+            # ==============================================================
+
+            dc_log_rows = (
+                build_dc_log_rows(
+                    stats=stats,
+
+                    env=env,
+
+                    host_sac_agents=(
+                        host_sac_agents
+                    ),
+
+                    host_replay_buffers=(
+                        host_replay_buffers
+                    ),
+
+                    host_training_action_steps=(
+                        host_training_action_steps
+                    ),
+
+                    load_metrics=(
+                        load_metrics
+                    ),
+                )
+            )
+
+            # ==============================================================
+            # Immediate Disk Persistence
+            # ==============================================================
+
+            append_csv_log(
+                csv_path=(
+                    episode_log_csv_path
                 ),
 
-                host_replay_buffers=(
-                    host_replay_buffers
-                ),
-
-                routing_masac=(
-                    routing_masac
-                ),
-
-                global_decision_steps=(
-                    global_decision_steps
-                ),
-
-                routing_normal_action_steps=(
-                    routing_normal_action_steps
-                ),
-
-                wall_time_seconds=(
-                    wall_time_seconds
+                row=(
+                    episode_log_row
                 ),
             )
-            append_csv_log(csv_path=log_csv_path, row=log_row,)
 
-            # 到达日志打印间隔时，在终端输出摘要。
-            if episode % int(train_config.log_interval) == 0:
-                print_episode_summary(log_row)
+            for dc_log_row in (
+                    dc_log_rows
+            ):
+                append_csv_log(
+                    csv_path=(
+                        dc_log_csv_path
+                    ),
+
+                    row=(
+                        dc_log_row
+                    ),
+                )
+
+            # ==============================================================
+            # Console Summary
+            # ==============================================================
+
+            if (
+                    episode
+                    % int(
+                train_config.log_interval
+            )
+                    == 0
+            ):
+                print_episode_summary(
+                    episode_log_row
+                )
 
             stage_boundary_checkpoint_name = (
                 training_stage_boundary_checkpoint_name(
@@ -5450,7 +7416,13 @@ def main() -> None:
         checkpoint_interval=conf.Checkpoint_Interval,
         seed=conf.Seed,
         checkpoint_dir=conf.Checkpoint_Dir,
-        log_csv_path=conf.Log_csv_Path,
+        episode_log_csv_path=(
+            conf.H_MASAC_EPISODE_LOG_CSV_PATH
+        ),
+
+        dc_log_csv_path=(
+            conf.H_MASAC_DC_LOG_CSV_PATH
+        ),
         old_env_path=conf.Old_Env_Path,
         resume_checkpoint=conf.Resume_Checkpoint,
         vary_episode_seed=conf.Vary_Episode_Seed
