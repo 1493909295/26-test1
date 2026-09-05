@@ -397,28 +397,19 @@ class CloudEdgeEnv(AECEnv):
         # 环境重置标记
         self.has_reset = False
 
-        self.timeout_drop_penalty = float(conf.TIMEOUT_DROP_PENALTY)
-        self.resource_drop_penalty = float(conf.RESOURCE_DROP_PENALTY)
-        self.task_completion_reward = float(conf.TASK_COMPLETION_REWARD)
-        self.completion_time_cost_weight = float(conf.COMPLETION_TIME_COST_WEIGHT)
-        self.sla_violation_cost_weight = float(conf.SLA_VIOLATION_COST_WEIGHT)
-
         self.energy_normalization_j = float(conf.ENERGY_NORMALIZATION_J)
-        self.energy_cost_weight = float(conf.ENERGY_COST_WEIGHT)
 
-        # self.waiting_time_cost_weight = float(conf.WAITING_TIME_COST_WEIGHT)
-        # self.execution_time_cost_weight = float(conf.EXECUTION_TIME_COST_WEIGHT)
-        self.queue_admission_cost_weight = float(conf.QUEUE_ADMISSION_COST_WEIGHT)
-        # self.edge_forward_base_penalty = float(conf.EDGE_FORWARD_BASE_PENALTY)
-        # self.edge_latency_cost_weight = float(conf.EDGE_LATENCY_COST_WEIGHT)
-        # self.edge_deadline_risk_cost_weight = float(conf.EDGE_DEADLINE_RISK_COST_WEIGHT)
-        # self.cloud_latency_cost_weight = float(conf.CLOUD_LATENCY_COST_WEIGHT)
-        self.remote_offload_base_penalty = float(conf.REMOTE_OFFLOAD_BASE_PENALTY)
-        self.remote_latency_cost_weight = float(conf.REMOTE_LATENCY_COST_WEIGHT)
+        self.pending_job_outcome_events: List[
+            Dict[str, Any]
+        ] = []
 
-        self.sla_risk_cost_weight = float(conf.SLA_RISK_COST_WEIGHT)
-        # 等待被处理的奖励修正事件列表
-        self.pending_reward_corrections: List[Dict[str, Any]] = []
+        # 最近一次 Routing action 真实产生的物理事实。
+        #
+        # env.step() 不返回值，因此 Collector 在 step() 结束后
+        # 通过 pop_last_routing_action_facts() 获取。
+        self.last_routing_action_facts: Optional[
+            Dict[str, Any]
+        ] = None
 
         self._init_normalization_stats()
         
@@ -611,7 +602,11 @@ class CloudEdgeEnv(AECEnv):
         self.started_from_waiting_jobs = 0
         self.waiting_timeout_drops = 0
         self.max_waiting_queue_length = 0
-        self.pending_reward_corrections = []
+        # 每个 Episode 都重新清空 Environment Fact Queue。
+        self.pending_job_outcome_events = []
+
+        # 当前还没有执行 Routing action。
+        self.last_routing_action_facts = None
 
         # 重置 PettingZoo AEC 必需状态
         self.rewards = {
@@ -788,9 +783,19 @@ class CloudEdgeEnv(AECEnv):
 
         ##################### 处理当前任务动作 ######################################
 
-        action_value = int(action)
-        should_drop = self._should_drop_arrival_job(acting_job_id)
-        action_reward: Optional[float] = None
+        action_value = int(
+            action
+        )
+
+        should_drop = (
+            self._should_drop_arrival_job(
+                acting_job_id
+            )
+        )
+
+        # 每次 step 必须产生且只能产生一份
+        # Routing Action Fact。
+        self.last_routing_action_facts = None
 
         if should_drop:
             # if action_value != self.drop_action:
@@ -805,12 +810,26 @@ class CloudEdgeEnv(AECEnv):
                 drop_reasion="等待超时",
             )
 
-            action_reward = self._compute_action_reward(
-                job_id=acting_job_id,
-                action_type="drop",
-                success=False,
-                transfer_latency=0.0,
-                failure_reason="等待超时",
+            self.last_routing_action_facts = (
+                self._build_routing_action_facts(
+                    job=acting_job,
+
+                    source_dc_id=(
+                        acting_agent
+                    ),
+
+                    action_type="drop",
+
+                    target_dc_id=None,
+
+                    transfer_latency_s=0.0,
+
+                    transfer_energy_j=0.0,
+
+                    failure_reason=(
+                        "waiting_timeout"
+                    ),
+                )
             )
 
         else:
@@ -825,8 +844,27 @@ class CloudEdgeEnv(AECEnv):
                 self.pending_host_job_id = acting_job_id
                 self.pending_host_dc_id = acting_agent
 
-                action_reward = 0.0
-                self.rewards[acting_agent] = float(action_reward)
+                self.last_routing_action_facts = (
+                    self._build_routing_action_facts(
+                        job=acting_job,
+
+                        source_dc_id=(
+                            acting_agent
+                        ),
+
+                        action_type="self",
+
+                        target_dc_id=(
+                            acting_agent
+                        ),
+                    )
+                )
+
+                # PettingZoo reward 这里只作为接口兼容字段。
+                # H-MASAC 不再从 env.rewards 获取训练 Reward。
+                self.rewards[
+                    acting_agent
+                ] = 0.0
                 self._clear_current_decision()
 
                 self.agent_selection = None
@@ -838,25 +876,71 @@ class CloudEdgeEnv(AECEnv):
 
             elif action_type in {"edge_dc", "cloud"}:
                 target_dc_id = decoded_action["target_dc_id"]
-                arrival_event_time = self._enqueue_transfer_arrival_event(
-                    job=acting_job,
-                    source_dc_id=acting_agent,
-                    target_dc_id=str(target_dc_id),
+                transfer_energy_before_j = float(
+                    acting_job.transfer_energy_j
                 )
-                transfer_latency = (
-                        float(arrival_event_time)
-                        - float(self.current_time)
+
+                arrival_event_time = (
+                    self._enqueue_transfer_arrival_event(
+                        job=acting_job,
+
+                        source_dc_id=(
+                            acting_agent
+                        ),
+
+                        target_dc_id=str(
+                            target_dc_id
+                        ),
+                    )
                 )
-                action_reward = self._compute_action_reward(
-                    job_id=acting_job_id,
-                    action_type=action_type,
-                    success=True,
-                    transfer_latency=transfer_latency,
-                    failure_reason=None,
+
+                transfer_latency_s = (
+                        float(
+                            arrival_event_time
+                        )
+                        - float(
+                    self.current_time
+                )
+                )
+
+                transfer_energy_j = max(
+                    float(
+                        acting_job.transfer_energy_j
+                    )
+                    - transfer_energy_before_j,
+                    0.0,
+                )
+
+                self.last_routing_action_facts = (
+                    self._build_routing_action_facts(
+                        job=acting_job,
+
+                        source_dc_id=(
+                            acting_agent
+                        ),
+
+                        action_type=(
+                            action_type
+                        ),
+
+                        target_dc_id=str(
+                            target_dc_id
+                        ),
+
+                        transfer_latency_s=(
+                            transfer_latency_s
+                        ),
+
+                        transfer_energy_j=(
+                            transfer_energy_j
+                        ),
+                    )
                 )
 
         # 完成动作的收尾
-        self.rewards[acting_agent] = float(action_reward)
+        self.rewards[
+            acting_agent
+        ] = 0.0
         self._clear_current_decision()
 
 
@@ -1005,29 +1089,7 @@ class CloudEdgeEnv(AECEnv):
 
         if execution_result == "dropped":
 
-            dropped_job = (
-                self.job_map[
-                    job_id
-                ]
-            )
-
-            task_energy_cost = (
-                self._calculate_task_energy_cost(
-                    job=dropped_job
-                )
-            )
-
-            energy_penalty = float(
-                self.energy_cost_weight
-                * task_energy_cost
-            )
-
             if host_arrival_timeout:
-
-                reward_delta = -float(
-                    self.timeout_drop_penalty
-                    + energy_penalty
-                )
 
                 reason = (
                     "local_host_arrival_timeout"
@@ -1035,24 +1097,34 @@ class CloudEdgeEnv(AECEnv):
 
             else:
 
-                reward_delta = -float(
-                    self.resource_drop_penalty
-                    + energy_penalty
-                )
-
                 reason = (
                     "local_host_resource_failure"
                 )
 
-            self._record_reward_correction(
-                job_id=job_id,
+            # ==========================================================
+            # Environment 只记录 terminal outcome。
+            #
+            # Timeout / Resource / Energy penalty
+            # 全部由 TrainingRewardModel 计算。
+            # ==============================================================
 
-                reward_delta=(
-                    reward_delta
+            self._record_job_outcome_event(
+                job_id=(
+                    job_id
                 ),
 
-                reason=reason,
+                reason=(
+                    reason
+                ),
+
+                terminal=True,
             )
+
+
+
+
+
+
 
         # Host decision 已消费。
         self.pending_host_job_id = None
@@ -1176,21 +1248,29 @@ class CloudEdgeEnv(AECEnv):
                         )
                     )
                     if cloud_result == "dropped":
-                        dropped_job = self.job_map[event_job_id]
-                        task_energy_cost = (self._calculate_task_energy_cost(job=dropped_job))
-                        energy_penalty = float(self.energy_cost_weight * task_energy_cost)
 
                         if cloud_arrival_timeout:
-                            reward_delta = -float(self.timeout_drop_penalty + energy_penalty)
-                            reason = "cloud_arrival_timeout"
-                        else:
-                            reward_delta = -float(self.resource_drop_penalty + energy_penalty)
-                            reason = "cloud_resource_failure"
 
-                        self._record_reward_correction(
-                            job_id=event_job_id,
-                            reward_delta=reward_delta,
-                            reason=reason,
+                            reason = (
+                                "cloud_arrival_timeout"
+                            )
+
+                        else:
+
+                            reason = (
+                                "cloud_resource_failure"
+                            )
+
+                        self._record_job_outcome_event(
+                            job_id=(
+                                event_job_id
+                            ),
+
+                            reason=(
+                                reason
+                            ),
+
+                            terminal=True,
                         )
 
                     # Cloud arrival 不需要暂停 AEC 环境，
@@ -1800,29 +1880,7 @@ class CloudEdgeEnv(AECEnv):
         elapsed_time = self._get_elapsed_service_time(job)
         return (elapsed_time + max(float(extra_latency), 0.0) + float(job.duration))
 
-    # 计算归一化 SLA 违约严重程度
-    def _calculate_sla_violation_degree(self, job: Job, completion_time: float,) -> float:
-        completion_time = max(float(completion_time), 0.0,)
-        sla_limit = self._get_sla_completion_limit(job)
-        drop_limit = self._get_drop_completion_limit(job)
-        violation_window = max(drop_limit - sla_limit, self.norm_eps,)
 
-        violation_degree = (completion_time - sla_limit) / violation_window
-
-        return float(np.clip(violation_degree, 0.0, 1.0,))
-
-    # 归一化真实任务完成时间
-    def _calculate_completion_time_cost(self, completion_time: float,) -> float:
-        global_completion_scale = max(self.drop_deadline_ratio * float(self.max_job_duration), self.norm_eps,)
-        completion_time_cost = (max(float(completion_time), 0.0) / global_completion_scale)
-
-        return float(np.clip(completion_time_cost, 0.0, 1.0,))
-
-    # 计算任务级 Energy Reward Cost
-    def _calculate_task_energy_cost(self,job: Job,) -> float:
-        attributable_energy_j = float(job.get_total_attributable_energy())
-        energy_cost = (attributable_energy_j / float(self.energy_normalization_j))
-        return float(energy_cost)
 
     # 任务是否丢弃判断
     def _should_drop_arrival_job(self, job_id: str) -> bool:
@@ -2047,14 +2105,16 @@ class CloudEdgeEnv(AECEnv):
                     drop_reasion="等待超时",
                 )
 
-                self.waiting_timeout_drops += 1
-                drop_energy_cost = (self._calculate_task_energy_cost(job=dropped_job))
-                drop_energy_penalty = float(self.energy_cost_weight * drop_energy_cost)
+                self._record_job_outcome_event(
+                    job_id=str(
+                        dropped_job.job_id
+                    ),
 
-                self._record_reward_correction(
-                    job_id=str(dropped_job.job_id),
-                    reward_delta=-float(self.timeout_drop_penalty + drop_energy_penalty),
-                    reason="waiting_timeout",
+                    reason=(
+                        "waiting_timeout"
+                    ),
+
+                    terminal=True,
                 )
                 continue
 
@@ -2097,20 +2157,19 @@ class CloudEdgeEnv(AECEnv):
             attributable_compute_energy_j = (calculate_edge_task_attributable_compute_energy_j(job=finished_job,host=target_host,))
 
         finished_job.set_compute_energy(attributable_compute_energy_j)
-        turnaround_time = (finished_job.get_turnaround_time())
-        turnaround_time = max(float(turnaround_time),0.0,)
-        completion_time_cost = (self._calculate_completion_time_cost(completion_time=turnaround_time,))
-        sla_violation_degree = (self._calculate_sla_violation_degree(job=finished_job,completion_time=turnaround_time,))
 
-        task_energy_cost = (self._calculate_task_energy_cost(job=finished_job))
-        completion_reward = float(self.task_completion_reward)
-        completion_time_penalty = float(self.completion_time_cost_weight * completion_time_cost)
-        sla_violation_penalty = float(self.sla_violation_cost_weight * sla_violation_degree)
-        energy_penalty = float(self.energy_cost_weight * task_energy_cost)
+        self._record_job_outcome_event(
+            job_id=(
+                job_id
+            ),
 
-        final_reward_delta = (completion_reward - completion_time_penalty - sla_violation_penalty - energy_penalty)
+            reason=(
+                "completed"
+            ),
 
-        self._record_reward_correction(job_id=job_id,reward_delta=float(final_reward_delta),reason="completed",)
+            terminal=True,
+        )
+
 
         # 更新负载
         target_dc.calculate_dc_loads()
@@ -2290,34 +2349,279 @@ class CloudEdgeEnv(AECEnv):
                 f"details={blocked_waiting_details}"
             )
 
-    # 暂存一个与特定 Job 绑定的延迟奖励修正
-    def _record_reward_correction(self, job_id: str, reward_delta: float, reason: str,) -> None:
-        self.pending_reward_corrections.append(
-    {
-        "job_id": str(job_id),
+    def _record_job_outcome_event(
+            self,
+            *,
+            job_id: str,
+            reason: str,
+            terminal: bool = True,
+    ) -> None:
+        """
+        记录已经真实发生的 Job outcome facts。
 
-        "reward_delta": float(
-            reward_delta
-        ),
+        Environment 在这里不计算任何 RL Reward。
+        """
 
-        "reason": str(reason),
+        job_id = str(
+            job_id
+        )
 
-        # ======================================================
-        # Causal Trace 使用真实物理事件时间，
-        # 不能用 Trainer 稍后 pop correction 的时间代替。
-        # ======================================================
-        "env_time": float(
-            self.current_time
-        ),
-    }
-)
+        job = self.job_map[
+            job_id
+        ]
 
-    # 取走 env.step() 推进事件期间产生的全部延迟奖励
-    def pop_reward_corrections(self,) -> List[Dict[str, Any]]:
-        corrections = list(self.pending_reward_corrections)
-        self.pending_reward_corrections.clear()
-        return corrections
+        completion_time_s = None
 
+        if (
+                job.finish_time
+                is not None
+        ):
+            completion_time_s = (
+                job.get_turnaround_time()
+            )
+
+            if completion_time_s is not None:
+                completion_time_s = max(
+                    float(
+                        completion_time_s
+                    ),
+                    0.0,
+                )
+
+        waiting_time_s = None
+
+        if job.start_time is not None:
+            waiting_time_s = max(
+                float(
+                    job.start_time
+                )
+                - float(
+                    job.arrive_time
+                ),
+                0.0,
+            )
+
+        execution_time_s = None
+
+        if job.start_time is not None:
+            execution_end_time = (
+                float(
+                    job.finish_time
+                )
+                if job.finish_time is not None
+                else float(
+                    self.current_time
+                )
+            )
+
+            execution_time_s = max(
+                execution_end_time
+                - float(
+                    job.start_time
+                ),
+                0.0,
+            )
+
+        self.pending_job_outcome_events.append(
+            {
+                "job_id":
+                    job_id,
+
+                "reason":
+                    str(
+                        reason
+                    ),
+
+                "terminal":
+                    bool(
+                        terminal
+                    ),
+
+                "env_time":
+                    float(
+                        self.current_time
+                    ),
+
+                "job_duration_s":
+                    float(
+                        job.duration
+                    ),
+
+                "elapsed_service_time_s":
+                    float(
+                        self._get_elapsed_service_time(
+                            job
+                        )
+                    ),
+
+                "completion_time_s":
+                    completion_time_s,
+
+                "waiting_time_s":
+                    waiting_time_s,
+
+                "execution_time_s":
+                    execution_time_s,
+
+                "compute_energy_j":
+                    float(
+                        job.compute_energy_j
+                    ),
+
+                "transfer_energy_j":
+                    float(
+                        job.transfer_energy_j
+                    ),
+
+                "edge_edge_transfer_energy_j":
+                    float(
+                        job
+                            .edge_edge_transfer_energy_j
+                    ),
+
+                "edge_cloud_transfer_energy_j":
+                    float(
+                        job
+                            .edge_cloud_transfer_energy_j
+                    ),
+
+                "total_attributable_energy_j":
+                    float(
+                        job
+                            .get_total_attributable_energy()
+                    ),
+            }
+        )
+
+    def pop_job_outcome_events(
+            self,
+    ) -> List[Dict[str, Any]]:
+        """
+        取走从上一次 Trainer 消费以后产生的所有
+        Environment Job Outcome Facts。
+        """
+
+        events = list(
+            self.pending_job_outcome_events
+        )
+
+        self.pending_job_outcome_events.clear()
+
+        return events
+
+
+
+    def _build_routing_action_facts(
+            self,
+            *,
+            job: Job,
+            source_dc_id: str,
+            action_type: str,
+            target_dc_id: Optional[str],
+            transfer_latency_s: float = 0.0,
+            transfer_energy_j: float = 0.0,
+            failure_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        构造一次 Routing action 已经真实发生后的物理事实。
+
+        本函数不计算 Reward。
+        """
+
+        return {
+            "job_id":
+                str(
+                    job.job_id
+                ),
+
+            "source_dc_id":
+                str(
+                    source_dc_id
+                ),
+
+            "target_dc_id":
+                (
+                    None
+                    if target_dc_id is None
+                    else str(
+                        target_dc_id
+                    )
+                ),
+
+            "action_type":
+                str(
+                    action_type
+                ),
+
+            "env_time":
+                float(
+                    self.current_time
+                ),
+
+            "job_duration_s":
+                float(
+                    job.duration
+                ),
+
+            "elapsed_service_time_s":
+                float(
+                    self._get_elapsed_service_time(
+                        job
+                    )
+                ),
+
+            "transfer_latency_s":
+                max(
+                    float(
+                        transfer_latency_s
+                    ),
+                    0.0,
+                ),
+
+            "transfer_energy_j":
+                max(
+                    float(
+                        transfer_energy_j
+                    ),
+                    0.0,
+                ),
+
+            "total_attributable_energy_j":
+                float(
+                    job
+                        .get_total_attributable_energy()
+                ),
+
+            "failure_reason":
+                (
+                    None
+                    if failure_reason is None
+                    else str(
+                        failure_reason
+                    )
+                ),
+        }
+
+    def pop_last_routing_action_facts(
+            self,
+    ) -> Dict[str, Any]:
+        """
+        返回并清空最近一次 Routing action 的事实快照。
+        """
+
+        if self.last_routing_action_facts is None:
+            raise RuntimeError(
+                "当前没有可供 Trainer 消费的 "
+                "Routing action facts。"
+            )
+
+        facts = dict(
+            self.last_routing_action_facts
+        )
+
+        self.last_routing_action_facts = None
+
+        return facts
 
     # 清除调度决策执行时的临时变量
     def _clear_current_decision(self) -> None:
@@ -2325,139 +2629,7 @@ class CloudEdgeEnv(AECEnv):
         self.current_dc_id = None
         self.current_agent_id = None
 
-    # 计算动作的即时奖励
-    def _compute_action_reward(
-            self,
-            job_id: str,
-            action_type: str,
-            success: bool,
-            transfer_latency: float = 0.0,
-            failure_reason: Optional[str] = None,
-            queue_length_after_action: int = 0,
-    ) -> float:
 
-        job_id = str(job_id)
-        action_type = str(action_type)
-        job = self.job_map[job_id]
-
-        # 丢任务惩罚
-        if action_type == "drop" or not success:
-            task_energy_cost = (self._calculate_task_energy_cost(job=job))
-            energy_penalty = float(self.energy_cost_weight * task_energy_cost)
-
-            if failure_reason == "等待超时":
-                return -float(self.timeout_drop_penalty + energy_penalty)
-
-            if failure_reason == "资源不足":
-                return -float(self.resource_drop_penalty + energy_penalty)
-
-        # job执行成本
-        # duration_cost = self._normalize(value=float(job.duration), scale=float(self.max_job_duration),)
-
-        # 本地执行
-        if action_type == "local_host":
-            local_cost = 0.0
-
-            # 本地host执行，但是进入了等待队列
-            if int(queue_length_after_action) > 0:
-                queue_length = float(queue_length_after_action)
-
-                # 评估等待队列拥挤程度，用queue_length + 1是为了让结果处于[0,1)
-                queue_congestion_ratio = (queue_length / (queue_length + 1.0))
-                elapsed_time = (self._get_elapsed_service_time(job))
-                pre_execution_sla_budget = max((self.sla_deadline_ratio - 1.0) * float(job.duration), self.norm_eps,)
-                sla_budget_consumed_ratio = float(np.clip(elapsed_time / pre_execution_sla_budget, 0.0, 1.0,))
-                # 综合排队风险
-                queue_admission_risk = (0.5 * queue_congestion_ratio + 0.5 * sla_budget_consumed_ratio)
-                local_cost += (self.queue_admission_cost_weight * queue_admission_risk)
-
-            return -float(local_cost)
-
-        # # 边边转发
-        # if action_type == "edge_dc":
-        #     transfer_latency = float(transfer_latency)
-        #
-        #     edge_latency_cost = self._normalize(
-        #         value=transfer_latency,
-        #         scale=float(
-        #             self.max_edge_latency
-        #         ),
-        #     )
-        #
-        #     predicted_completion_time = (
-        #         self._predict_completion_time_if_start_now(
-        #             job=job,
-        #             extra_latency=transfer_latency,
-        #         )
-        #     )
-        #
-        #     predicted_sla_violation_degree = (
-        #         self._calculate_sla_violation_degree(
-        #             job=job,
-        #             completion_time=predicted_completion_time,
-        #         )
-        #     )
-        #
-        #     return -float(
-        #         self.edge_forward_base_penalty
-        #         + self.edge_latency_cost_weight
-        #         * edge_latency_cost
-        #         + self.sla_risk_cost_weight
-        #         * predicted_sla_violation_degree
-        #     )
-        #
-        # # 云边转发
-        # if action_type == "cloud":
-        #     transfer_latency = float(
-        #         transfer_latency
-        #     )
-        #
-        #     cloud_latency_cost = self._normalize(
-        #         value=transfer_latency,
-        #         scale=float(
-        #             self.max_cloud_latency
-        #         ),
-        #     )
-        #
-        #     # Cloud 与 Edge 使用完全相同的 SLA 定义。
-        #     predicted_completion_time = (
-        #         self._predict_completion_time_if_start_now(
-        #             job=job,
-        #             extra_latency=transfer_latency,
-        #         )
-        #     )
-        #
-        #     predicted_sla_violation_degree = (
-        #         self._calculate_sla_violation_degree(
-        #             job=job,
-        #             completion_time=predicted_completion_time,
-        #         )
-        #     )
-        #
-        #     return -float(
-        #         self.cloud_latency_cost_weight
-        #         * cloud_latency_cost
-        #         + self.sla_risk_cost_weight
-        #         * predicted_sla_violation_degree
-        #     )
-
-        #
-
-        # 远程卸载即时 Reward，Edge→Edge 与 Edge→Cloud 使用完全相同的 Reward 结构
-        if action_type in {"edge_dc", "cloud"}:
-
-            transfer_latency = float(transfer_latency)
-
-            remote_latency_cost = self._normalize(value=transfer_latency, scale=float(self.max_latency),)
-
-            predicted_completion_time = (self._predict_completion_time_if_start_now(job=job,extra_latency=transfer_latency,))
-            predicted_sla_violation_degree = (self._calculate_sla_violation_degree(job=job, completion_time=predicted_completion_time,))
-
-            return -float(
-                self.remote_offload_base_penalty
-                + self.remote_latency_cost_weight * remote_latency_cost
-                + self.sla_risk_cost_weight * predicted_sla_violation_degree
-            )
 
     # 检查好一个 episode 是否结束
     def _check_episode_finished(self) -> bool:

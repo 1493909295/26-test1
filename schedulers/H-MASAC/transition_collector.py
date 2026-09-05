@@ -7,7 +7,9 @@ from numpy.typing import NDArray
 from routing_observation import (RoutingObservationBuilder,)
 from routing_centralized_state import (RoutingCentralizedStateBuilder,)
 from pending_job_trace import (PendingJobTraceStore,)
-
+from training_reward import (
+    HMasacTrainingRewardModel,
+)
 FloatArray = NDArray[np.float32]
 
 
@@ -36,7 +38,7 @@ class CloudEdgeEnvLike(Protocol):
 
     # 把str类型的agent id映射成数字
     agent_name_mapping: Mapping[str, int]
-    rewards: Mapping[str, float]
+
 
     # 正常停止与异常停止标记，但我其实没实现异常停止 ·_·
     terminations: Mapping[str, bool]
@@ -47,6 +49,11 @@ class CloudEdgeEnvLike(Protocol):
     # def state(self) -> np.ndarray:
     #     ...
     def step(self, action: Optional[int]) -> None:
+        ...
+
+    def pop_last_routing_action_facts(
+            self,
+    ) -> Dict[str, Any]:
         ...
 
 # 动作执行前快照捕捉，True代表不可重新赋值
@@ -161,6 +168,9 @@ class TransitionCollector:
 
             pending_trace_store:
             PendingJobTraceStore,
+
+            training_reward_model:
+            HMasacTrainingRewardModel,
     ) -> None:
 
         self.env = env
@@ -176,7 +186,9 @@ class TransitionCollector:
         self.pending_trace_store = (
             pending_trace_store
         )
-
+        self.training_reward_model = (
+            training_reward_model
+        )
         # ==========================================================
         # Collector 现在统计的是实际执行的 Routing actions，
         # 不再统计“生成了多少条 Replay Transition”。
@@ -190,35 +202,9 @@ class TransitionCollector:
     # 重置计数器
     def reset_episode(self) -> None:
         self.episode_routing_action_count = 0
-        self.routing_observation_builder.reset_episode()
 
-    # 获取决策状态快照
-    # def capture_decision(self) -> DecisionSnapshot:
-    #     self._require_reset()
-    #     agent_id = self._get_live_selected_agent()
-    #     job_id = str(self.env.current_job_id)
-    #     observation = self.env.observe(agent_id)
-    #
-    #     # 把局部观测转成独立 float32 数组，避免对同一块内存的引用
-    #     local_obs = np.asarray(observation["observation"], dtype=np.float32).copy()
-    #
-    #     # 把动作掩码转成独立 int8 数组
-    #     action_mask = np.asarray(observation["action_mask"],dtype=np.int8).copy()
-    #
-    #     # 获取同一决策时刻的集中式全局状态
-    #     global_state = np.asarray(self.env.state(), dtype=np.float32).copy()
-    #
-    #     return DecisionSnapshot(
-    #         agent_id=agent_id,
-    #         agent_index=int(self.env.agent_name_mapping[agent_id]),
-    #         job_id=job_id,
-    #         env_time=float(self.env.current_time),
-    #         local_obs=local_obs,
-    #         action_mask=action_mask,
-    #         global_state=global_state,
-    #         forced_action=self._get_forced_action(job_id),
-    #     )
-    # 执行一次动作并生成完整的经验
+
+
 
     # 获取当前环境所对应的决策状态快照
     def _build_current_decision_snapshot(self,) -> DecisionSnapshot:
@@ -610,7 +596,16 @@ class TransitionCollector:
             action
         )
 
+        # ==============================================================
+        # 5. 从 Environment 获取真实 Routing Action Facts。
+        #
+        # Environment 不再提供 H-MASAC training reward。
+        # ==============================================================
 
+        routing_action_facts = (
+            self.env
+                .pop_last_routing_action_facts()
+        )
 
         # ==========================================================
         # 6. 保存本次 Routing action 的即时 reward。
@@ -620,9 +615,10 @@ class TransitionCollector:
         # ==========================================================
 
         immediate_reward = float(
-            self.env.rewards[
-                decision.agent_id
-            ]
+            self.training_reward_model
+                .calculate_routing_immediate_reward(
+                routing_action_facts
+            )
         )
 
         # ==========================================================

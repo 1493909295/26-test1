@@ -30,6 +30,10 @@ from host_observation import (HostObservationBuilder,)
 from neighbor_feedback import (
     NeighborHistoricalFeedbackStore,
 )
+from training_reward import (
+    TrainingRewardConfig,
+    HMasacTrainingRewardModel,
+)
 
 # 找根目录
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -361,7 +365,7 @@ class EpisodeStatistics:
     # Delayed Reward
     # ==============================================================
 
-    def record_reward_correction(
+    def record_delayed_training_reward(
             self,
             agent_id: str,
             reward_delta: float,
@@ -1264,7 +1268,7 @@ def flush_finalized_trace_to_replay(
             finalized_trace
         )
 
-def consume_environment_reward_corrections(
+def consume_environment_outcome_events(
         env: CloudEdgeEnv,
 
         pending_trace_store:
@@ -1283,6 +1287,9 @@ def consume_environment_reward_corrections(
 
         collect_neighbor_historical_feedback:
         bool,
+
+        training_reward_model:
+        HMasacTrainingRewardModel,
 ) -> None:
     """
     第十九步以后：
@@ -1304,42 +1311,58 @@ def consume_environment_reward_corrections(
         不允许修改正式 ReplayBuffer。
     """
 
-    reward_corrections = (
-        env.pop_reward_corrections()
+    # ==============================================================
+    # Environment 只返回 Job Outcome Facts。
+    # ==============================================================
+
+    outcome_events = (
+        env.pop_job_outcome_events()
     )
 
-    if not reward_corrections:
+    if not outcome_events:
         return
 
-    for correction in reward_corrections:
+    for outcome_event in (
+            outcome_events
+    ):
 
         job_id = str(
-            correction["job_id"]
-        )
-
-        reward_delta = float(
-            correction["reward_delta"]
+            outcome_event[
+                "job_id"
+            ]
         )
 
         reason = str(
-            correction.get(
-                "reason",
-                "",
-            )
+            outcome_event[
+                "reason"
+            ]
         )
 
         env_time = float(
-            correction.get(
-                "env_time",
-                env.current_time,
-            )
+            outcome_event[
+                "env_time"
+            ]
         )
 
         is_terminal = bool(
-            reason == "completed"
-            or reason
-            in TERMINAL_FAILURE_REASONS
+            outcome_event.get(
+                "terminal",
+                False,
+            )
         )
+
+        # ==========================================================
+        # 真正 Training Reward 在 Trainer 侧生成。
+        # ==============================================================
+
+        reward_delta = float(
+            training_reward_model
+                .calculate_outcome_reward(
+                outcome_event
+            )
+        )
+
+
 
         # ======================================================
         # 1. Reward Event 永远先进入因果链。
@@ -1421,7 +1444,7 @@ def consume_environment_reward_corrections(
 
             if correction_agent_id is not None:
 
-                stats.record_reward_correction(
+                stats.record_delayed_training_reward(
                     agent_id=(
                         correction_agent_id
                     ),
@@ -1466,7 +1489,7 @@ def consume_environment_reward_corrections(
 
         if correction_agent_id is not None:
 
-            stats.record_reward_correction(
+            stats.record_delayed_training_reward(
                 agent_id=(
                     correction_agent_id
                 ),
@@ -4302,7 +4325,7 @@ def build_episode_log_row(
         # 不把 Host layer reward 再加一次。
         # ------------------------------------------------------
 
-        "system_episode_reward":
+        "training_episode_reward":
             float(
                 stats.episode_return
             ),
@@ -5367,7 +5390,7 @@ def print_episode_summary(
         f"stage="
         f"{row['training_stage']} | "
         f"system_R="
-        f"{float(row['system_episode_reward']):9.4f} | "
+        f"{float(row['training_episode_reward']):9.4f} | "
         f"completed="
         f"{int(row['completed_jobs']):5d} | "
         f"dropped="
@@ -5796,6 +5819,86 @@ def train(
 
     pending_trace_store = PendingJobTraceStore()
 
+    # ==============================================================
+    # H-MASAC Training Reward Model
+    #
+    # Reward Model 属于 Trainer，
+    # Environment 只提供物理事实。
+    #
+    # 当前参数数值与第三十一步之前完全一致。
+    # ==============================================================
+
+    training_reward_model = (
+        HMasacTrainingRewardModel(
+            TrainingRewardConfig(
+                task_completion_reward=(
+                    conf.TASK_COMPLETION_REWARD
+                ),
+
+                completion_time_cost_weight=(
+                    conf
+                        .COMPLETION_TIME_COST_WEIGHT
+                ),
+
+                sla_violation_cost_weight=(
+                    conf
+                        .SLA_VIOLATION_COST_WEIGHT
+                ),
+
+                remote_offload_base_penalty=(
+                    conf
+                        .REMOTE_OFFLOAD_BASE_PENALTY
+                ),
+
+                remote_latency_cost_weight=(
+                    conf
+                        .REMOTE_LATENCY_COST_WEIGHT
+                ),
+
+                sla_risk_cost_weight=(
+                    conf
+                        .SLA_RISK_COST_WEIGHT
+                ),
+
+                timeout_drop_penalty=(
+                    conf.TIMEOUT_DROP_PENALTY
+                ),
+
+                resource_drop_penalty=(
+                    conf.RESOURCE_DROP_PENALTY
+                ),
+
+                energy_normalization_j=(
+                    conf.ENERGY_NORMALIZATION_J
+                ),
+
+                energy_cost_weight=(
+                    conf.ENERGY_COST_WEIGHT
+                ),
+
+                max_latency_s=float(
+                    env.max_latency
+                ),
+
+                max_job_duration_s=float(
+                    env.max_job_duration
+                ),
+
+                sla_deadline_ratio=float(
+                    env.sla_deadline_ratio
+                ),
+
+                drop_deadline_ratio=float(
+                    env.drop_deadline_ratio
+                ),
+
+                norm_eps=float(
+                    env.norm_eps
+                ),
+            )
+        )
+    )
+
     # 创建 Transition 采集器
     collector = TransitionCollector(
         env=env,
@@ -5810,6 +5913,11 @@ def train(
 
         pending_trace_store=(
             pending_trace_store
+        ),
+
+        # Training Reward 由 Trainer-side Reward Model 负责。
+        training_reward_model=(
+            training_reward_model
         ),
     )
 
@@ -6474,8 +6582,11 @@ def train(
                     # 再消费这些 delayed outcome。
                     # ==========================================================
 
-                    consume_environment_reward_corrections(
+                    consume_environment_outcome_events(
                         env=env,
+                        training_reward_model=(
+                            training_reward_model
+                        ),
 
                         pending_trace_store=(
                             pending_trace_store
@@ -6812,8 +6923,11 @@ def train(
 
 
 
-                consume_environment_reward_corrections(
+                consume_environment_outcome_events(
                     env=env,
+                    training_reward_model=(
+                        training_reward_model
+                    ),
 
                     pending_trace_store=(
                         pending_trace_store
@@ -6944,8 +7058,11 @@ def train(
             # 防止最后一批 terminal correction 留在 Environment 中。
             # ==============================================================
 
-            consume_environment_reward_corrections(
+            consume_environment_outcome_events(
                 env=env,
+                training_reward_model=(
+                    training_reward_model
+                ),
                 pending_trace_store=(
                     pending_trace_store
                 ),

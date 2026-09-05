@@ -63,15 +63,7 @@ class RoutingObservationBuilder:
 
         self.neighbor_feedback_provider = provider
 
-    def reset_episode(self) -> None:
-        """
-        重置 Collector 自己的 Episode 计数。
 
-        Routing History 已经直接保存在每个 Job 对象中，
-        ObservationBuilder 不再维护 Episode-local Routing 状态。
-        """
-
-        self.episode_routing_action_count = 0
 
     # 归一化辅助函数
     def _normalize(self, value: float,  scale: float,) -> float:
