@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List,Mapping,Optional
+from typing import List,Mapping
 import numpy as np
 from typing import Any, Optional
 
@@ -33,8 +33,8 @@ class RoutingObservationBuilder:
             for dc_id in env.edge_dc_ids
         ]
         self.link_target_dc_ids = (list(self.edge_dc_ids) + [str(env.cloud_id)])
-        self.job_edge_hop_counts: Dict[str, int] = {}
-        self.job_edge_transfer_latency_s: Dict[str, float,] = {}
+        # self.job_edge_hop_counts: Dict[str, int] = {}
+        # self.job_edge_transfer_latency_s: Dict[str, float,] = {}
         self.job_feat_dim = self.JOB_FEAT_DIM
         self.local_dc_feat_dim = (self.LOCAL_DC_BASE_FEAT_DIM + self.LOCAL_DC_ROUTING_FEAT_DIM)
         self.route_history_feat_dim = (self.ROUTE_HISTORY_FEAT_DIM)
@@ -63,105 +63,15 @@ class RoutingObservationBuilder:
 
         self.neighbor_feedback_provider = provider
 
-    # 重置单episode调度信息
     def reset_episode(self) -> None:
-        self.job_edge_hop_counts.clear()
-        self.job_edge_transfer_latency_s.clear()
+        """
+        重置 Collector 自己的 Episode 计数。
 
-    # 记录调度
-    def record_routing_action(self, job_id: str, action_type: str,source_dc_id: str, action: int,) -> None:
-        action_type = str(action_type)
+        Routing History 已经直接保存在每个 Job 对象中，
+        ObservationBuilder 不再维护 Episode-local Routing 状态。
+        """
 
-        if action_type != "edge_dc":
-            return
-
-        job_id = str(job_id)
-        source_dc_id = str(source_dc_id)
-        action = int(action)
-
-        # ==========================================================
-        # 根据统一 Routing action 编码获得目标 Edge DC。
-        # ==============================================================
-        if action not in self.env.routing_action_to_dc_id:
-            raise ValueError(
-                "无法从 Routing action 获得目标 Edge DC："
-                f"action={action}"
-            )
-
-        target_dc_id = str(
-            self.env.routing_action_to_dc_id[
-                action
-            ]
-        )
-
-        # 这里只检查 action_type 与动作含义是否一致。
-        #
-        # 这不是循环防护：
-        # DC1 -> DC3 -> DC1 依然完全合法。
-        if target_dc_id == source_dc_id:
-            raise RuntimeError(
-                "action_type=edge_dc，"
-                "但目标 DC 与源 DC 相同："
-                f"{source_dc_id}"
-            )
-
-        # ==========================================================
-        # 1. Edge -> Edge hop count
-        #
-        # 不存在 MAX_HOPS。
-        # 该值理论上可以无限增加。
-        # ==============================================================
-        self.job_edge_hop_counts[
-            job_id
-        ] = (
-                self.job_edge_hop_counts.get(
-                    job_id,
-                    0,
-                )
-                + 1
-        )
-
-        # ==========================================================
-        # 2. 累计本次真实 Edge -> Edge transmission latency
-        #
-        # 环境执行传输时本身也是读取 graph edge weight，
-        # 因此这里与真实物理传输模型保持一致。
-        # ==============================================================
-        if (
-                self.env.graph is None
-                or not self.env.graph.has_edge(
-            source_dc_id,
-            target_dc_id,
-        )
-        ):
-            raise RuntimeError(
-                "Routing History 找不到对应 Edge 链路："
-                f"{source_dc_id} -> {target_dc_id}"
-            )
-
-        hop_latency_s = max(
-            float(
-                self.env.graph[
-                    source_dc_id
-                ][
-                    target_dc_id
-                ].get(
-                    "weight",
-                    0.0,
-                )
-            ),
-            0.0,
-        )
-
-        self.job_edge_transfer_latency_s[
-            job_id
-        ] = (
-                self.job_edge_transfer_latency_s.get(
-                    job_id,
-                    0.0,
-                )
-                + hop_latency_s
-        )
+        self.episode_routing_action_count = 0
 
     # 归一化辅助函数
     def _normalize(self, value: float,  scale: float,) -> float:
@@ -537,8 +447,9 @@ class RoutingObservationBuilder:
         # ==============================================================
         hop_count = max(
             int(
-                self.job_edge_hop_counts.get(
-                    job_id,
+                getattr(
+                    job,
+                    "routing_hop_count",
                     0,
                 )
             ),
@@ -568,11 +479,16 @@ class RoutingObservationBuilder:
 
         # ==========================================================
         # 2. Cumulative Edge -> Edge transmission latency
-        # ==============================================================
+        #
+        # 该数值由 Environment 在真实 Edge -> Edge
+        # transmission event 被创建时更新。
+        # ==========================================================
+
         cumulative_latency_s = max(
             float(
-                self.job_edge_transfer_latency_s.get(
-                    job_id,
+                getattr(
+                    job,
+                    "cumulative_transfer_latency_s",
                     0.0,
                 )
             ),

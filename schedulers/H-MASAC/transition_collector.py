@@ -610,26 +610,7 @@ class TransitionCollector:
             action
         )
 
-        # ==========================================================
-        # 5. 动作已经真实发生，
-        #    现在才更新 Routing history。
-        # ==========================================================
 
-        self.routing_observation_builder.record_routing_action(
-            job_id=(
-                decision.job_id
-            ),
-
-            action_type=(
-                action_type
-            ),
-
-            source_dc_id=(
-                decision.agent_id
-            ),
-
-            action=action,
-        )
 
         # ==========================================================
         # 6. 保存本次 Routing action 的即时 reward。

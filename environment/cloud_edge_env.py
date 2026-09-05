@@ -1890,6 +1890,9 @@ class CloudEdgeEnv(AECEnv):
         else:
             self.edge_edge_transfer_energy_j += float(transfer_energy_j)
             job.add_edge_edge_transfer_energy(transfer_energy_j)
+            job.record_edge_routing_hop(
+                latency_s
+            )
 
         arrival_event_time = float(self.current_time) + latency_s
         job.set_target_datacenter(target_dc_id)

@@ -101,25 +101,11 @@ class TrainConfig:
     old_env_path: Optional[str] = (conf.Old_Env_Path)
     resume_checkpoint: Optional[str] = (conf.Resume_Checkpoint)
     vary_episode_seed: bool = ( conf.Vary_Episode_Seed)
-    collect_neighbor_historical_feedback: bool = (
-        conf.COLLECT_NEIGHBOR_HISTORICAL_FEEDBACK
-    )
-
-    use_neighbor_historical_feedback: bool = (
-        conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK
-    )
-
-    neighbor_feedback_ewma_alpha: float = (
-        conf.NEIGHBOR_FEEDBACK_EWMA_ALPHA
-    )
-
-    neighbor_feedback_age_scale_samples: float = (
-        conf.NEIGHBOR_FEEDBACK_AGE_SCALE_SAMPLES
-    )
-
-    neighbor_feedback_confidence_scale_samples: float = (
-        conf.NEIGHBOR_FEEDBACK_CONFIDENCE_SCALE_SAMPLES
-    )
+    collect_neighbor_historical_feedback: bool = (conf.COLLECT_NEIGHBOR_HISTORICAL_FEEDBACK)
+    use_neighbor_historical_feedback: bool = (conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK)
+    neighbor_feedback_ewma_alpha: float = (conf.NEIGHBOR_FEEDBACK_EWMA_ALPHA)
+    neighbor_feedback_age_scale_samples: float = (conf.NEIGHBOR_FEEDBACK_AGE_SCALE_SAMPLES)
+    neighbor_feedback_confidence_scale_samples: float = (conf.NEIGHBOR_FEEDBACK_CONFIDENCE_SCALE_SAMPLES)
 
 # Two-Level Scheduler 三阶段训练状态。
 class TrainingStage( str,Enum,):
@@ -220,124 +206,50 @@ class EpisodeStatistics:
 
         # System reward bookkeeping
         self.episode_return += reward
-        self.per_agent_returns[
-            agent_id
-        ] = float(
-            self.per_agent_returns.get(
-                agent_id,
-                0.0,
-            )
-            + reward
-        )
+        self.per_agent_returns[agent_id] = float(self.per_agent_returns.get(agent_id, 0.0,) + reward )
 
-        # ------------------------------------------------------
         # Routing decision source
-        # ------------------------------------------------------
-
         self.routing_decision_count += 1
-
-        self._inc_dc(
-            agent_id,
-            "routing_decisions",
-        )
+        self._inc_dc(agent_id,"routing_decisions",)
 
         if action_source == "forced":
-
             self.routing_forced_action_count += 1
-
         elif action_source == "orchestrator":
-
             self.routing_orchestrator_action_count += 1
-
         elif action_source == "random":
-
             self.routing_random_action_count += 1
-
         elif action_source == "policy":
-
             self.routing_policy_action_count += 1
-
         else:
-            raise ValueError(
-                "未知 Routing action_source："
-                f"{action_source}"
-            )
+            raise ValueError("未知 Routing action_source："f"{action_source}")
 
-        # ------------------------------------------------------
         # Routing action semantics
-        # ------------------------------------------------------
-
         if action_type == "self":
-
             self.routing_self_count += 1
-
-            self._inc_dc(
-                agent_id,
-                "route_self_count",
-            )
-
+            self._inc_dc(agent_id,"route_self_count",)
         elif action_type == "edge_dc":
-
             if target_dc_id is None:
-                raise RuntimeError(
-                    "统计 Edge Routing 时缺少 target_dc_id。"
-                )
-
+                raise RuntimeError("统计 Edge Routing 时缺少 target_dc_id。")
             self.routing_edge_count += 1
-
-            self._inc_dc(
-                agent_id,
-                "route_out_edge_count",
-            )
-
-            self._inc_dc(
-                target_dc_id,
-                "route_in_edge_count",
-            )
-
+            self._inc_dc(agent_id,"route_out_edge_count",)
+            self._inc_dc(target_dc_id,"route_in_edge_count",)
         elif action_type == "cloud":
-
             self.routing_cloud_count += 1
-
-            self._inc_dc(
-                agent_id,
-                "route_cloud_count",
-            )
-
+            self._inc_dc(agent_id,"route_cloud_count",)
         elif action_type == "drop":
-
             self.routing_drop_count += 1
-
-            self._inc_dc(
-                agent_id,
-                "route_drop_count",
-            )
-
+            self._inc_dc(agent_id,"route_drop_count",)
         else:
-            raise ValueError(
-                "未知 Routing action_type："
-                f"{action_type}"
-            )
+            raise ValueError("未知 Routing action_type："f"{action_type}")
 
-        # ------------------------------------------------------
+
         # Source -> Target Matrix
-        #
-        # Drop 没有真实 target，显式记录为 "__drop__"。
-        # ------------------------------------------------------
-
         target_key = (
             str(target_dc_id)
             if target_dc_id is not None
             else "__drop__"
         )
-
-        source_targets = (
-            self.routing_source_target_counts
-            .setdefault(
-                agent_id,
-                {},
-            )
-        )
+        source_targets = (self.routing_source_target_counts.setdefault( agent_id,{},))
 
         source_targets[
             target_key

@@ -32,10 +32,43 @@ class Job:
         self.edge_edge_transfer_energy_j = 0.0
         self.edge_cloud_transfer_energy_j = 0.0
 
+        self.routing_hop_count = 0
+        self.cumulative_transfer_latency_s = 0.0
+
 
     # 更新任务所属数据中心
     def set_target_datacenter(self, datacenter_id):
         self.target_datacenter = datacenter_id
+
+    # ==============================================================
+    # 记录一次已经真实发生的 Edge -> Edge Routing hop
+    #
+    # 注意：
+    #   这里只记录累计物理事实。
+    #
+    #   不记录：
+    #       source DC
+    #       target DC
+    #       route path
+    #       visited DC
+    #
+    #   这些完整因果信息继续属于 PendingJobTraceStore。
+    # ==============================================================
+
+    def record_edge_routing_hop(
+            self,
+            latency_s,
+    ):
+        latency_s = max(
+            float(latency_s),
+            0.0,
+        )
+
+        self.routing_hop_count += 1
+
+        self.cumulative_transfer_latency_s += (
+            latency_s
+        )
 
     # 设置任务到达时间
     def set_arrive_time(self, arrive_time):
