@@ -160,5 +160,9 @@ ENERGY_COST_WEIGHT = 0.30               #  控制 Energy objective 在联合 Rew
 # cloud 开关，false为关闭云
 ENABLE_CLOUD_ACTION = True
 
-# Neighbor Historical Feedback 开关，false为关闭反馈信息
-USE_NEIGHBOR_HISTORICAL_FEEDBACK = False
+# Neighbor Historical Feedback 开关，false为关闭收集反馈信息
+COLLECT_NEIGHBOR_HISTORICAL_FEEDBACK = True
+USE_NEIGHBOR_HISTORICAL_FEEDBACK = False    # 是否使用历史反馈影响决策
+NEIGHBOR_FEEDBACK_EWMA_ALPHA = 0.10     # 参数越大越重视最近成果，控制新结果对历史的影响性
+NEIGHBOR_FEEDBACK_AGE_SCALE_SAMPLES = 100.0 # 参数越大历史保留越久，判断历史多久没更新了
+NEIGHBOR_FEEDBACK_CONFIDENCE_SCALE_SAMPLES = 20.0   # 判断历史可信度

@@ -27,6 +27,9 @@ import config as conf
 from routing_observation import (RoutingObservationBuilder,)
 from routing_centralized_state import (RoutingCentralizedStateBuilder,)
 from host_observation import (HostObservationBuilder,)
+from neighbor_feedback import (
+    NeighborHistoricalFeedbackStore,
+)
 
 # 找根目录
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -98,7 +101,25 @@ class TrainConfig:
     old_env_path: Optional[str] = (conf.Old_Env_Path)
     resume_checkpoint: Optional[str] = (conf.Resume_Checkpoint)
     vary_episode_seed: bool = ( conf.Vary_Episode_Seed)
-    use_neighbor_historical_feedback: bool = ( conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK)
+    collect_neighbor_historical_feedback: bool = (
+        conf.COLLECT_NEIGHBOR_HISTORICAL_FEEDBACK
+    )
+
+    use_neighbor_historical_feedback: bool = (
+        conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK
+    )
+
+    neighbor_feedback_ewma_alpha: float = (
+        conf.NEIGHBOR_FEEDBACK_EWMA_ALPHA
+    )
+
+    neighbor_feedback_age_scale_samples: float = (
+        conf.NEIGHBOR_FEEDBACK_AGE_SCALE_SAMPLES
+    )
+
+    neighbor_feedback_confidence_scale_samples: float = (
+        conf.NEIGHBOR_FEEDBACK_CONFIDENCE_SCALE_SAMPLES
+    )
 
 # Two-Level Scheduler 三阶段训练状态。
 class TrainingStage( str,Enum,):
@@ -152,171 +173,53 @@ class EpisodeStatistics:
     # Host Update Metrics：逐 DC
     host_update_metric_sums_by_dc: Dict[str, Dict[str, float],] = field(default_factory=dict)
     host_update_metric_counts_by_dc: Dict[ str,Dict[str, int],] = field(default_factory=dict)
-    
-    # ==========================================================
+
     # Per-DC Counters
-    #
-    # 不把 DC 数写死在 dataclass 中。
-    # 通过 dc_id 动态创建。
-    # ==============================================================
+    dc_counters: Dict[str,Dict[str, int],] = field(default_factory=dict)
 
-    dc_counters: Dict[
-        str,
-        Dict[str, int],
-    ] = field(
-        default_factory=dict
-    )
-
-    # ==========================================================
     # Routing Source -> Target Matrix
-    #
-    # 示例：
-    #
-    # {
-    #     "DC1": {
-    #         "DC1": 100,
-    #         "DC2": 20,
-    #         "cloud": 5
-    #     }
-    # }
-    # ==============================================================
+    routing_source_target_counts: Dict[ str,Dict[str, int],] = field(default_factory=dict )
 
-    routing_source_target_counts: Dict[
-        str,
-        Dict[str, int],
-    ] = field(
-        default_factory=dict
-    )
-
-    # ==========================================================
     # Finalized Causal Trace Statistics
-    # ==============================================================
-
     terminal_trace_flushed_count: int = 0
-
     routing_transition_flushed_count: int = 0
     host_transition_flushed_count: int = 0
-
     routing_edge_hop_total: int = 0
     multi_hop_job_count: int = 0
     max_routing_hops: int = 0
-
-    # 两层自己的 Replay reward。
-    # 只能作为训练诊断量，不能相加作为 system return。
     routing_layer_reward_sum: float = 0.0
     host_layer_reward_sum: float = 0.0
 
-    # ==========================================================
-    # Internal Helpers
-    # ==============================================================
-
-    def _inc_dc(
-            self,
-            dc_id: str,
-            metric_name: str,
-            delta: int = 1,
-    ) -> None:
-
-        dc_id = str(
-            dc_id
-        )
-
-        dc_metrics = (
-            self.dc_counters
-            .setdefault(
-                dc_id,
-                {},
-            )
-        )
-
-        dc_metrics[
-            metric_name
-        ] = int(
-            dc_metrics.get(
-                metric_name,
-                0,
-            )
-            + int(delta)
-        )
+    def _inc_dc(self,dc_id: str, metric_name: str,delta: int = 1,) -> None:
+        dc_id = str(dc_id)
+        dc_metrics = (self.dc_counters.setdefault(dc_id,{},))
+        dc_metrics[metric_name] = int(dc_metrics.get(metric_name, 0,) + int(delta))
 
     @staticmethod
-    def _accumulate_metric(
-            sums: Dict[str, float],
-            counts: Dict[str, int],
-            metric_name: str,
-            metric_value: float,
-    ) -> None:
+    def _accumulate_metric(sums: Dict[str, float], counts: Dict[str, int], metric_name: str,  metric_value: float,) -> None:
 
-        metric_value = float(
-            metric_value
-        )
+        metric_value = float(metric_value)
 
-        if not np.isfinite(
-                metric_value
-        ):
+        if not np.isfinite(metric_value):
             return
 
-        sums[
-            metric_name
-        ] = float(
-            sums.get(
-                metric_name,
-                0.0,
-            )
-            + metric_value
-        )
+        sums[metric_name] = float(sums.get(metric_name, 0.0,) + metric_value)
+        counts[metric_name] = int(counts.get(metric_name, 0,) + 1)
 
-        counts[
-            metric_name
-        ] = int(
-            counts.get(
-                metric_name,
-                0,
-            )
-            + 1
-        )
-
-    # ==========================================================
     # Routing Decision Statistics
-    # ==============================================================
-
-    def record_routing_decision(
-            self,
-            agent_id: str,
-            reward: float,
-            action_type: str,
-            action_source: str,
-            target_dc_id: Optional[str],
-    ) -> None:
-
-        agent_id = str(
-            agent_id
-        )
-
-        action_type = str(
-            action_type
-        )
-
-        action_source = str(
-            action_source
-        )
-
-        reward = float(
-            reward
-        )
-
+    def record_routing_decision(self,agent_id: str,reward: float,action_type: str,action_source: str,target_dc_id: Optional[str],) -> None:
+        agent_id = str(agent_id)
+        action_type = str(action_type)
+        action_source = str(action_source)
+        reward = float(reward)
         target_dc_id = (
             None
             if target_dc_id is None
             else str(target_dc_id)
         )
 
-        # ------------------------------------------------------
         # System reward bookkeeping
-        # ------------------------------------------------------
-
         self.episode_return += reward
-
         self.per_agent_returns[
             agent_id
         ] = float(
@@ -1338,6 +1241,12 @@ def flush_finalized_trace_to_replay(
         Dict[str, HostReplayBuffer],
 
         stats: EpisodeStatistics,
+
+        neighbor_feedback_store:
+        NeighborHistoricalFeedbackStore,
+
+        collect_neighbor_historical_feedback:
+        bool,
 ) -> None:
     """
     把一个已经完整 Finalize 的 Job
@@ -1438,16 +1347,30 @@ def flush_finalized_trace_to_replay(
     stats.record_finalized_trace(
         finalized_trace
     )
+    if collect_neighbor_historical_feedback:
+        neighbor_feedback_store.update_from_finalized_trace(
+            finalized_trace
+        )
 
 def consume_environment_reward_corrections(
         env: CloudEdgeEnv,
+
         pending_trace_store:
         PendingJobTraceStore,
+
         routing_replay_buffer:
         RoutingReplayBuffer,
+
         host_replay_buffers:
         Dict[str, HostReplayBuffer],
+
         stats: EpisodeStatistics,
+
+        neighbor_feedback_store:
+        NeighborHistoricalFeedbackStore,
+
+        collect_neighbor_historical_feedback:
+        bool,
 ) -> None:
     """
     第十九步以后：
@@ -1565,6 +1488,14 @@ def consume_environment_reward_corrections(
                 ),
 
                 stats=stats,
+
+                neighbor_feedback_store=(
+                    neighbor_feedback_store
+                ),
+
+                collect_neighbor_historical_feedback=(
+                    collect_neighbor_historical_feedback
+                ),
             )
 
             # ==================================================
@@ -4174,6 +4105,7 @@ def build_episode_log_row(
 
         pending_trace_store:
         PendingJobTraceStore,
+        neighbor_feedback_store:NeighborHistoricalFeedbackStore,
 
         global_decision_steps: int,
 
@@ -4312,6 +4244,10 @@ def build_episode_log_row(
         )
     )
 
+    neighbor_feedback_summary = (
+        neighbor_feedback_store.summary()
+    )
+
     # ==========================================================
     # Explicit Two-Level Log Columns
     # ==============================================================
@@ -4344,11 +4280,94 @@ def build_episode_log_row(
                     False,
                 )
             ),
-
-        "neighbor_feedback_enabled":
+        "neighbor_feedback_collection_enabled":
             bool(
                 conf
-                .USE_NEIGHBOR_HISTORICAL_FEEDBACK
+                    .COLLECT_NEIGHBOR_HISTORICAL_FEEDBACK
+            ),
+
+        "neighbor_feedback_decision_enabled":
+            bool(
+                conf
+                    .USE_NEIGHBOR_HISTORICAL_FEEDBACK
+            ),
+
+        # ------------------------------------------------------
+        # 当前 Episode 内，
+        # 有多少 terminal Job 被 Feedback Store 消费。
+        #
+        # 正常情况下最终应该接近本 Episode 的 total_jobs。
+        # ------------------------------------------------------
+
+        "neighbor_feedback_episode_terminal_jobs_seen":
+            int(
+                neighbor_feedback_summary[
+                    "episode_terminal_jobs_seen"
+                ]
+            ),
+
+        # ------------------------------------------------------
+        # 当前 Episode 内真正产生多少条：
+        #
+        #   source Edge DC -> target Edge DC
+        #
+        # Historical Feedback Sample。
+        #
+        # 一个多跳 Job 可以产生多条 pair sample。
+        # ------------------------------------------------------
+
+        "neighbor_feedback_episode_pair_samples":
+            int(
+                neighbor_feedback_summary[
+                    "episode_pair_samples"
+                ]
+            ),
+
+        # ------------------------------------------------------
+        # 从训练开始到当前 Episode，
+        # Feedback Store 一共消费了多少 terminal Job。
+        #
+        # 这是跨 Episode 累积值。
+        # ------------------------------------------------------
+
+        "neighbor_feedback_total_terminal_jobs_seen":
+            int(
+                neighbor_feedback_summary[
+                    "terminal_jobs_seen"
+                ]
+            ),
+
+        # ------------------------------------------------------
+        # 从训练开始到当前 Episode，
+        # 一共形成了多少 source->target 历史样本。
+        #
+        # 同样是跨 Episode 累积值。
+        # ------------------------------------------------------
+
+        "neighbor_feedback_total_pair_samples":
+            int(
+                neighbor_feedback_summary[
+                    "total_pair_samples"
+                ]
+            ),
+
+        # ------------------------------------------------------
+        # 当前已有历史数据的有向 pair 数量。
+        #
+        # 例如：
+        #
+        #   DC1 -> DC2
+        #   DC1 -> DC3
+        #   DC2 -> DC5
+        #
+        # 分别算 3 个 active pair。
+        # ------------------------------------------------------
+
+        "neighbor_feedback_active_pair_count":
+            int(
+                neighbor_feedback_summary[
+                    "active_pair_count"
+                ]
             ),
 
         "wall_time_seconds":
@@ -4908,6 +4927,9 @@ def build_dc_log_rows(
 
         load_metrics:
         Dict[str, Any],
+
+        neighbor_feedback_store:
+        NeighborHistoricalFeedbackStore,
 ) -> list[Dict[str, Any]]:
     """
     构造 H-MASAC DC-level 日志。
@@ -4971,6 +4993,19 @@ def build_dc_log_rows(
 
         dc_id = str(
             dc_id_raw
+        )
+        neighbor_feedback_source_summary = (
+            neighbor_feedback_store
+                .source_summary(
+                dc_id
+            )
+        )
+
+        neighbor_feedback_snapshot = (
+            neighbor_feedback_store
+                .snapshot_for_source(
+                dc_id
+            )
         )
 
         dc_stats = (
@@ -5110,6 +5145,26 @@ def build_dc_log_rows(
             "routing_out_targets_json":
                 json.dumps(
                     source_target_counts,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            "neighbor_feedback_outgoing_pair_count":
+                int(
+                    neighbor_feedback_source_summary[
+                        "outgoing_pair_count"
+                    ]
+                ),
+
+            "neighbor_feedback_outgoing_sample_count":
+                int(
+                    neighbor_feedback_source_summary[
+                        "outgoing_sample_count"
+                    ]
+                ),
+
+            "neighbor_feedback_snapshot_json":
+                json.dumps(
+                    neighbor_feedback_snapshot,
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
@@ -5739,21 +5794,77 @@ def train(
         )
     }
 
+    # ==============================================================
+    # Neighbor Historical Feedback Store
+    #
+    # 第二十九步采用 Collect-Only 模式：
+    #
+    #   1. Job terminal 后真实收集 source -> target 历史结果；
+    #   2. Store 跨 Episode 持续保留；
+    #   3. 当前不把历史信息送进 Routing Actor。
+    #
+    # 为避免误操作，本步骤显式要求：
+    #
+    #   COLLECT = True
+    #   USE     = False
+    # ==============================================================
+
+    if (
+            train_config
+                    .use_neighbor_historical_feedback
+    ):
+        raise RuntimeError(
+            "第二十九步仍处于 Neighbor Historical Feedback "
+            "collect-only 阶段，"
+            "USE_NEIGHBOR_HISTORICAL_FEEDBACK "
+            "必须保持 False。"
+        )
+
+    neighbor_feedback_store = (
+        NeighborHistoricalFeedbackStore(
+            env=env,
+
+            ewma_alpha=(
+                train_config
+                    .neighbor_feedback_ewma_alpha
+            ),
+
+            age_scale_samples=(
+                train_config
+                    .neighbor_feedback_age_scale_samples
+            ),
+
+            confidence_scale_samples=(
+                train_config
+                    .neighbor_feedback_confidence_scale_samples
+            ),
+        )
+    )
 
     routing_observation_builder = (
         RoutingObservationBuilder(
             env=env,
 
-            # 当前默认 False：
-            # 只保留 Feedback Observation 接口，
-            # 不让历史结果参与 Routing 决策。
+            # ======================================================
+            # 第二十九步仍然 False。
+            #
+            # RoutingObservationBuilder 在 False 时会直接返回
+            # 全 0 Feedback block，并且不会查询 Provider。
+            #
+            # 因而虽然真实 Store 已经安装，
+            # 当前 Routing Actor 仍然完全看不到这些历史信息。
+            # ======================================================
+
             use_neighbor_historical_feedback=(
                 train_config
                     .use_neighbor_historical_feedback
             ),
 
-            # 当前阶段尚未建立 Historical Feedback Store。
-            neighbor_feedback_provider=None,
+            # Store 现在已经真实存在，
+            # 但当前仅作为未来 Provider 接口和日志数据源。
+            neighbor_feedback_provider=(
+                neighbor_feedback_store
+            ),
         )
     )
     routing_obs_dim = int(routing_observation_builder.obs_dim)
@@ -6068,6 +6179,7 @@ def train(
 
             # 重启环境
             pending_trace_store.reset_episode()
+            neighbor_feedback_store.reset_episode_counters()
             env.reset(seed=episode_seed)
 
             collector.reset_episode()
@@ -6466,6 +6578,14 @@ def train(
                         ),
 
                         stats=stats,
+                        neighbor_feedback_store=(
+                            neighbor_feedback_store
+                        ),
+
+                        collect_neighbor_historical_feedback=(
+                            train_config
+                                .collect_neighbor_historical_feedback
+                        ),
 
 
                     )
@@ -6764,6 +6884,14 @@ def train(
                         ),
 
                         stats=stats,
+                        neighbor_feedback_store=(
+                            neighbor_feedback_store
+                        ),
+
+                        collect_neighbor_historical_feedback=(
+                            train_config
+                                .collect_neighbor_historical_feedback
+                        ),
                     )
 
                     pending_trace_store.pop_finalized_trace(
@@ -6788,6 +6916,14 @@ def train(
                     ),
 
                     stats=stats,
+                    neighbor_feedback_store=(
+                        neighbor_feedback_store
+                    ),
+
+                    collect_neighbor_historical_feedback=(
+                        train_config
+                            .collect_neighbor_historical_feedback
+                    ),
 
 
                 )
@@ -6908,6 +7044,14 @@ def train(
                     host_replay_buffers
                 ),
                 stats=stats,
+                neighbor_feedback_store=(
+                    neighbor_feedback_store
+                ),
+
+                collect_neighbor_historical_feedback=(
+                    train_config
+                        .collect_neighbor_historical_feedback
+                ),
             )
             pending_trace_store.assert_no_open_trace()
             pending_trace_store.assert_no_unflushed_finalized_trace()
@@ -6973,6 +7117,9 @@ def train(
                     pending_trace_store=(
                         pending_trace_store
                     ),
+                    neighbor_feedback_store=(
+                        neighbor_feedback_store
+                    ),
 
                     global_decision_steps=(
                         global_decision_steps
@@ -7024,6 +7171,10 @@ def train(
 
                     load_metrics=(
                         load_metrics
+                    ),
+
+                    neighbor_feedback_store=(
+                        neighbor_feedback_store
                     ),
                 )
             )
@@ -7416,6 +7567,7 @@ def main() -> None:
         checkpoint_interval=conf.Checkpoint_Interval,
         seed=conf.Seed,
         checkpoint_dir=conf.Checkpoint_Dir,
+
         episode_log_csv_path=(
             conf.H_MASAC_EPISODE_LOG_CSV_PATH
         ),
@@ -7425,7 +7577,30 @@ def main() -> None:
         ),
         old_env_path=conf.Old_Env_Path,
         resume_checkpoint=conf.Resume_Checkpoint,
-        vary_episode_seed=conf.Vary_Episode_Seed
+        vary_episode_seed=conf.Vary_Episode_Seed,
+        # ==========================================================
+        # Neighbor Historical Feedback
+        # ==========================================================
+
+        collect_neighbor_historical_feedback=(
+            conf.COLLECT_NEIGHBOR_HISTORICAL_FEEDBACK
+        ),
+
+        use_neighbor_historical_feedback=(
+            conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK
+        ),
+
+        neighbor_feedback_ewma_alpha=(
+            conf.NEIGHBOR_FEEDBACK_EWMA_ALPHA
+        ),
+
+        neighbor_feedback_age_scale_samples=(
+            conf.NEIGHBOR_FEEDBACK_AGE_SCALE_SAMPLES
+        ),
+
+        neighbor_feedback_confidence_scale_samples=(
+            conf.NEIGHBOR_FEEDBACK_CONFIDENCE_SCALE_SAMPLES
+        ),
     )
 
     host_sac_config = (
