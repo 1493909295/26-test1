@@ -397,7 +397,7 @@ class CloudEdgeEnv(AECEnv):
         # 环境重置标记
         self.has_reset = False
 
-        self.energy_normalization_j = float(conf.ENERGY_NORMALIZATION_J)
+        # self.energy_normalization_j = float(conf.ENERGY_NORMALIZATION_J)
 
         self.pending_job_outcome_events: List[
             Dict[str, Any]

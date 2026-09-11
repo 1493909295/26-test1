@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "architecture": "h_masac_two_layer_routing_host_v1",
-  "saved_training_stage": "host_pretrain",
+  "saved_training_stage": "joint_finetune",
   "structure": {
     "cloud_enabled": true,
     "edge_dc_ids": [
@@ -174,18 +174,18 @@
     "joint_finetune_episodes": 300
   },
   "trainer_state": {
-    "next_episode": 2,
-    "global_decision_steps": 1000,
-    "routing_normal_action_steps": 0,
-    "routing_global_steps": 0,
+    "next_episode": 956,
+    "global_decision_steps": 1044545,
+    "routing_normal_action_steps": 844516,
+    "routing_global_steps": 844516,
     "host_training_action_steps": {
-      "DC-1": 197,
-      "DC-2": 192,
-      "DC-3": 204,
-      "DC-4": 216,
-      "DC-5": 191
+      "DC-1": 90442,
+      "DC-2": 93290,
+      "DC-3": 85230,
+      "DC-4": 89561,
+      "DC-5": 96469
     },
-    "host_global_steps": 1000,
-    "best_episode_return": 0.0
+    "host_global_steps": 454992,
+    "best_episode_return": 2309.5462899027348
   }
 }
