@@ -42,7 +42,7 @@ BGH_MASAC_DIR = Path(__file__).resolve().parent
 CHECKPOINT_SCHEMA_VERSION = 2
 
 CHECKPOINT_ARCHITECTURE = (
-    "h_masac_two_layer_routing_host_v1"
+     "bgh_masac_two_layer_routing_host_v1"
 )
 
 TERMINAL_FAILURE_REASONS = frozenset({
@@ -99,11 +99,13 @@ class TrainConfig:
     log_interval: int = (conf.Log_interval)
     checkpoint_interval: int = (conf.Checkpoint_Interval)
     seed: int = conf.Seed
-    checkpoint_dir: str = (conf.Checkpoint_Dir)
-    episode_log_csv_path: str = (conf.H_MASAC_EPISODE_LOG_CSV_PATH)
-    dc_log_csv_path: str = (conf.H_MASAC_DC_LOG_CSV_PATH)
+
+    checkpoint_dir: str = (conf.BGH_MASAC_CHECKPOINT_DIR)
+    episode_log_csv_path: str = (conf.BGH_MASAC_EPISODE_LOG_CSV_PATH)
+    dc_log_csv_path: str = (conf.BGH_MASAC_DC_LOG_CSV_PATH)
     old_env_path: Optional[str] = (conf.Old_Env_Path)
-    resume_checkpoint: Optional[str] = (conf.Resume_Checkpoint)
+    resume_checkpoint: Optional[str] = (conf.BGH_MASAC_RESUME_CHECKPOINT)
+
     vary_episode_seed: bool = ( conf.Vary_Episode_Seed)
     collect_neighbor_historical_feedback: bool = (conf.COLLECT_NEIGHBOR_HISTORICAL_FEEDBACK)
     use_neighbor_historical_feedback: bool = (conf.USE_NEIGHBOR_HISTORICAL_FEEDBACK)
@@ -117,7 +119,7 @@ class TrainingStage( str,Enum,):
     ROUTING_TRAIN = ("routing_train")
     JOINT_FINETUNE = ("joint_finetune")
 
-#  H-MASAC 一个 Episode 内的双层训练统计
+#   一个 Episode 内的双层训练统计
 @dataclass
 class EpisodeStatistics:
 
@@ -2618,7 +2620,7 @@ def build_checkpoint_structure_metadata(
         ],
 ) -> Dict[str, Any]:
     """
-    构造 H-MASAC checkpoint 的结构身份信息。
+    构造 checkpoint 的结构身份信息。
 
     这些信息不是训练指标，而是判断：
         “当前运行环境是否仍然与该 checkpoint 兼容”
@@ -3878,7 +3880,7 @@ def load_two_layer_checkpoint_if_needed(
     print(
         "\n"
         "============================================================\n"
-        "✅ Two-Level H-MASAC checkpoint 恢复成功\n"
+        "✅ Two-Level BGH-MASAC checkpoint 恢复成功\n"
         f"Routing checkpoint : {model_path}\n"
         f"Host directory     : {host_dir}\n"
         f"Trainer metadata   : {state_path}\n"
@@ -4058,7 +4060,7 @@ def build_episode_log_row(
         Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    构造 H-MASAC Episode-level CSV。
+    构造 BGH-MASAC Episode-level CSV。
 
     Episode Log 只保存：
         - System outcome
@@ -4867,7 +4869,7 @@ def build_dc_log_rows(
         NeighborHistoricalFeedbackStore,
 ) -> list[Dict[str, Any]]:
     """
-    构造 H-MASAC DC-level 日志。
+    构造 BGH-MASAC DC-level 日志。
 
     每个 Episode：
         每个 Edge DC 产生一行。
@@ -5360,7 +5362,7 @@ def print_episode_summary(
         row: Dict[str, Any],
 ) -> None:
     """
-    打印 H-MASAC 双层训练摘要。
+    打印 双层训练摘要。
 
     System / Routing / Host / Causal 分行显示，
     不再沿用单 MASAC 混合输出格式。
@@ -5820,7 +5822,7 @@ def train(
     pending_trace_store = PendingJobTraceStore()
 
     # ==============================================================
-    # H-MASAC Training Reward Model
+    # Training Reward Model
     #
     # Reward Model 属于 Trainer，
     # Environment 只提供物理事实。
@@ -5964,7 +5966,7 @@ def train(
         # ==========================================================
         # Routing MASAC fallback configuration
         #
-        # config.py 是 H-MASAC 实验的统一参数入口。
+        # config.py 是  实验的统一参数入口。
         # 即使 train() 被直接调用，
         # Routing 也必须继续使用 ROUTING_* 配置。
         # ==========================================================
@@ -6170,7 +6172,7 @@ def train(
     print(
         "\n"
         "============================================================\n"
-        "📊 H-MASAC 双层训练日志\n"
+        "📊 BGH-MASAC 双层训练日志\n"
         f"Episode CSV : "
         f"{episode_log_csv_path.resolve()}\n"
         f"DC CSV      : "
@@ -7595,17 +7597,17 @@ def main() -> None:
         log_interval=conf.Log_interval,
         checkpoint_interval=conf.Checkpoint_Interval,
         seed=conf.Seed,
-        checkpoint_dir=conf.Checkpoint_Dir,
+        checkpoint_dir=conf.BGH_MASAC_CHECKPOINT_DIR,
 
         episode_log_csv_path=(
-            conf.H_MASAC_EPISODE_LOG_CSV_PATH
+            conf.BGH_MASAC_EPISODE_LOG_CSV_PATH
         ),
 
         dc_log_csv_path=(
-            conf.H_MASAC_DC_LOG_CSV_PATH
+            conf.BGH_MASAC_DC_LOG_CSV_PATH
         ),
         old_env_path=conf.Old_Env_Path,
-        resume_checkpoint=conf.Resume_Checkpoint,
+        resume_checkpoint=conf.BGH_MASAC_RESUME_CHECKPOINT,
         vary_episode_seed=conf.Vary_Episode_Seed,
         # ==========================================================
         # Neighbor Historical Feedback
