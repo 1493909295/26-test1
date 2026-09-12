@@ -166,3 +166,6 @@ USE_NEIGHBOR_HISTORICAL_FEEDBACK = False    # 是否使用历史反馈影响决�
 NEIGHBOR_FEEDBACK_EWMA_ALPHA = 0.10     # 参数越大越重视最近成果，控制新结果对历史的影响性
 NEIGHBOR_FEEDBACK_AGE_SCALE_SAMPLES = 100.0 # 参数越大历史保留越久，判断历史多久没更新了
 NEIGHBOR_FEEDBACK_CONFIDENCE_SCALE_SAMPLES = 20.0   # 判断历史可信度
+
+BGH_ENABLE_BAYESIAN_GAME = False       # 控制是否启用贝叶斯博弈
+BGH_ENABLE_HEURISTIC_GUIDANCE = False       # 控制是否启用贝叶斯启发信息知道actor

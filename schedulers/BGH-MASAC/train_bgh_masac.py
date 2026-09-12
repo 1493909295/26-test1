@@ -112,6 +112,136 @@ class TrainConfig:
     neighbor_feedback_ewma_alpha: float = (conf.NEIGHBOR_FEEDBACK_EWMA_ALPHA)
     neighbor_feedback_age_scale_samples: float = (conf.NEIGHBOR_FEEDBACK_AGE_SCALE_SAMPLES)
     neighbor_feedback_confidence_scale_samples: float = (conf.NEIGHBOR_FEEDBACK_CONFIDENCE_SCALE_SAMPLES)
+    enable_bayesian_game: bool = (conf.BGH_ENABLE_BAYESIAN_GAME)
+    enable_heuristic_guidance: bool = (conf.BGH_ENABLE_HEURISTIC_GUIDANCE)
+
+# ==============================================================
+# BGH-MASAC Runtime Feature Mode
+#
+# 第三步的核心约束：
+#
+#   Bayesian Game = False
+#   Heuristic Guidance = False
+#
+# 时，BGH-MASAC 必须严格执行 H-MASAC-equivalent 路径。
+#
+# 注意：
+#   Zero-Diff Mode 是运行时派生状态，
+#   不是第三个人工配置开关。
+# ==============================================================
+
+
+def is_bgh_zero_diff_mode(
+        train_config: TrainConfig,
+) -> bool:
+    """
+    判断当前 BGH-MASAC 是否运行在 H-MASAC 等价模式。
+
+    Zero-Diff Mode：
+        Bayesian Game        = False
+        Heuristic Guidance   = False
+    """
+
+    return (
+        not bool(
+            train_config.enable_bayesian_game
+        )
+        and not bool(
+            train_config.enable_heuristic_guidance
+        )
+    )
+
+
+def get_bgh_runtime_mode(
+        train_config: TrainConfig,
+) -> str:
+    """
+    返回当前 BGH-MASAC 的实验模式名称。
+
+    这些名称提前固定下来，后续可直接用于消融实验：
+        H-MASAC-equivalent
+        Bayesian-only
+        Heuristic-only
+        Bayesian+Heuristic
+    """
+
+    bayesian_enabled = bool(
+        train_config.enable_bayesian_game
+    )
+
+    heuristic_enabled = bool(
+        train_config.enable_heuristic_guidance
+    )
+
+    if (
+        not bayesian_enabled
+        and not heuristic_enabled
+    ):
+        return "H-MASAC-equivalent"
+
+    if (
+        bayesian_enabled
+        and not heuristic_enabled
+    ):
+        return "Bayesian-only"
+
+    if (
+        not bayesian_enabled
+        and heuristic_enabled
+    ):
+        return "Heuristic-only"
+
+    return "Bayesian+Heuristic"
+
+
+def validate_bgh_feature_config(
+        train_config: TrainConfig,
+) -> None:
+    """
+    验证当前 BGH-MASAC Feature Gate 配置。
+
+    Step 3 目前只真正实现 Zero-Diff Mode。
+
+    因此：
+        1. 两个新机制关闭时，允许训练；
+        2. Zero-Diff 下禁止 Historical Feedback 直接进入
+           Routing Observation；
+        3. 如果用户提前打开尚未实现的新机制，则立即报错，
+           防止把普通 H-MASAC 错误标记成 Bayesian / Heuristic
+           实验。
+    """
+
+    if is_bgh_zero_diff_mode(
+        train_config
+    ):
+
+        if bool(
+            train_config
+                .use_neighbor_historical_feedback
+        ):
+            raise RuntimeError(
+                "BGH-MASAC Zero-Diff Mode 要求 "
+                "USE_NEIGHBOR_HISTORICAL_FEEDBACK=False。"
+                "Historical Feedback 可以继续收集，"
+                "但当前不能进入 Routing Observation。"
+            )
+
+        return
+
+    # ----------------------------------------------------------
+    # Step 3 尚未真正实现 Bayesian / Heuristic。
+    #
+    # 因此不能仅仅修改配置开关后继续运行，
+    # 否则会产生“日志显示 Bayesian 已启用，
+    # 实际算法仍然是 H-MASAC”的伪实验。
+    # ----------------------------------------------------------
+
+    raise NotImplementedError(
+        "当前代码仅完成 BGH-MASAC Step 3："
+        "H-MASAC-equivalent Zero-Diff Mode。"
+        "Bayesian Game 与 Heuristic Guidance "
+        "将在后续步骤正式实现后开放。"
+    )
 
 # Two-Level Scheduler 三阶段训练状态。
 class TrainingStage( str,Enum,):
@@ -4208,6 +4338,21 @@ def build_episode_log_row(
             str(
                 stats.training_stage
             ),
+        "bgh_bayesian_game_enabled":
+            bool(
+                conf.BGH_ENABLE_BAYESIAN_GAME
+            ),
+
+        "bgh_heuristic_guidance_enabled":
+            bool(
+                conf.BGH_ENABLE_HEURISTIC_GUIDANCE
+            ),
+
+        "bgh_zero_diff_mode":
+            bool(
+                not conf.BGH_ENABLE_BAYESIAN_GAME
+                and not conf.BGH_ENABLE_HEURISTIC_GUIDANCE
+            ),
 
         "cloud_enabled":
             bool(
@@ -5519,6 +5664,31 @@ def train(
         train_config
     )
 
+    validate_bgh_feature_config(
+        train_config
+    )
+
+    bgh_runtime_mode = (
+        get_bgh_runtime_mode(
+            train_config
+        )
+    )
+
+    print(
+        "\n"
+        "============================================================\n"
+        "🧭 BGH-MASAC Runtime Configuration\n"
+        f"Runtime mode              : {bgh_runtime_mode}\n"
+        f"Bayesian Game enabled     : "
+        f"{train_config.enable_bayesian_game}\n"
+        f"Heuristic Guidance enabled: "
+        f"{train_config.enable_heuristic_guidance}\n"
+        f"Zero-Diff Mode            : "
+        f"{is_bgh_zero_diff_mode(train_config)}\n"
+        "============================================================\n",
+        flush=True,
+    )
+
     set_global_random_seeds(train_config.seed)
 
     # 创建初始环境
@@ -5746,16 +5916,7 @@ def train(
     #   USE     = False
     # ==============================================================
 
-    if (
-            train_config
-                    .use_neighbor_historical_feedback
-    ):
-        raise RuntimeError(
-            "第二十九步仍处于 Neighbor Historical Feedback "
-            "collect-only 阶段，"
-            "USE_NEIGHBOR_HISTORICAL_FEEDBACK "
-            "必须保持 False。"
-        )
+
 
     neighbor_feedback_store = (
         NeighborHistoricalFeedbackStore(
@@ -7632,6 +7793,14 @@ def main() -> None:
         neighbor_feedback_confidence_scale_samples=(
             conf.NEIGHBOR_FEEDBACK_CONFIDENCE_SCALE_SAMPLES
         ),
+        enable_bayesian_game=(
+            conf.BGH_ENABLE_BAYESIAN_GAME
+        ),
+
+        enable_heuristic_guidance=(
+            conf.BGH_ENABLE_HEURISTIC_GUIDANCE
+        ),
+
     )
 
     host_sac_config = (
