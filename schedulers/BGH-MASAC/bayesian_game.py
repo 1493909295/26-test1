@@ -33,8 +33,172 @@ from typing import Any, Dict, Optional, Tuple
 # ==============================================================
 
 
-BAYESIAN_GAME_DEFINITION_VERSION = 1
+# BAYESIAN_GAME_DEFINITION_VERSION = 2
 
+@dataclass(frozen=True)
+class BayesianInformationPolicy:
+    """
+    Bayesian Game 的固定信息访问策略。
+
+    注意：
+        这不是可训练参数，也不应该放入 config.py。
+
+    它用于明确保证：
+
+        Remote Real-Time State
+            X
+            |
+        Bayesian Belief
+    """
+
+    # ----------------------------------------------------------
+    # Allowed information
+    # ----------------------------------------------------------
+
+    allow_static_routing_topology: bool = True
+
+    allow_finalized_historical_outcomes: bool = True
+
+    allow_neighbor_historical_feedback: bool = True
+
+    allow_current_job_context: bool = True
+
+    allow_source_local_information: bool = True
+
+    # ----------------------------------------------------------
+    # Forbidden Remote Real-Time information
+    # ----------------------------------------------------------
+
+    allow_remote_realtime_cpu: bool = False
+
+    allow_remote_realtime_gpu: bool = False
+
+    allow_remote_realtime_queue: bool = False
+
+    allow_remote_realtime_host_state: bool = False
+
+    allow_remote_available_resources: bool = False
+
+    allow_remote_raw_observation: bool = False
+
+    # Bayesian runtime core 不允许长期持有完整 Environment。
+    allow_raw_environment_reference: bool = False
+
+    def validate(self) -> None:
+        """
+        Fail-fast 验证 Bayesian Information Boundary。
+
+        任何 Remote Real-Time 信息一旦被允许，
+        都意味着当前算法已经破坏 Remote Edge
+        Partial Observability 的研究假设。
+        """
+
+        forbidden_flags = {
+            "allow_remote_realtime_cpu":
+                self.allow_remote_realtime_cpu,
+
+            "allow_remote_realtime_gpu":
+                self.allow_remote_realtime_gpu,
+
+            "allow_remote_realtime_queue":
+                self.allow_remote_realtime_queue,
+
+            "allow_remote_realtime_host_state":
+                self.allow_remote_realtime_host_state,
+
+            "allow_remote_available_resources":
+                self.allow_remote_available_resources,
+
+            "allow_remote_raw_observation":
+                self.allow_remote_raw_observation,
+
+            "allow_raw_environment_reference":
+                self.allow_raw_environment_reference,
+        }
+
+        enabled_forbidden_flags = [
+            flag_name
+            for flag_name, enabled
+            in forbidden_flags.items()
+            if bool(enabled)
+        ]
+
+        if enabled_forbidden_flags:
+            raise RuntimeError(
+                "Bayesian Information Boundary 被破坏："
+                "禁止 Bayesian Game 使用 Remote "
+                "Real-Time State。"
+                f" enabled={enabled_forbidden_flags}"
+            )
+
+    def to_metadata(
+            self,
+    ) -> Dict[str, bool]:
+        """
+        返回实验可记录的信息边界 metadata。
+        """
+
+        return {
+            "allow_static_routing_topology":
+                bool(
+                    self.allow_static_routing_topology
+                ),
+
+            "allow_finalized_historical_outcomes":
+                bool(
+                    self.allow_finalized_historical_outcomes
+                ),
+
+            "allow_neighbor_historical_feedback":
+                bool(
+                    self.allow_neighbor_historical_feedback
+                ),
+
+            "allow_current_job_context":
+                bool(
+                    self.allow_current_job_context
+                ),
+
+            "allow_source_local_information":
+                bool(
+                    self.allow_source_local_information
+                ),
+
+            "allow_remote_realtime_cpu":
+                bool(
+                    self.allow_remote_realtime_cpu
+                ),
+
+            "allow_remote_realtime_gpu":
+                bool(
+                    self.allow_remote_realtime_gpu
+                ),
+
+            "allow_remote_realtime_queue":
+                bool(
+                    self.allow_remote_realtime_queue
+                ),
+
+            "allow_remote_realtime_host_state":
+                bool(
+                    self.allow_remote_realtime_host_state
+                ),
+
+            "allow_remote_available_resources":
+                bool(
+                    self.allow_remote_available_resources
+                ),
+
+            "allow_remote_raw_observation":
+                bool(
+                    self.allow_remote_raw_observation
+                ),
+
+            "allow_raw_environment_reference":
+                bool(
+                    self.allow_raw_environment_reference
+                ),
+        }
 
 class BayesianRemoteType(str, Enum):
     """
@@ -90,6 +254,128 @@ class BayesianRoutingActionSemantic:
 
     has_hidden_remote_type: bool
 
+@dataclass(frozen=True)
+class BayesianStaticRoutingContext:
+    """
+    Bayesian Game 从 Environment 中允许获得的
+    唯一静态 Routing Context。
+
+    该对象刻意只保存 Routing identity / topology。
+
+    因此这里明确不存在：
+
+        CPU
+        GPU
+        Queue
+        Host
+        available resources
+        utilization
+        local observation
+        global state
+
+    完整 Environment 只允许在 whitelist adapter 中出现。
+    Bayesian Game Core 后续只能接收本 Context。
+    """
+
+    edge_dc_ids: Tuple[str, ...]
+
+    routing_action_target_dc_ids: Tuple[
+        str,
+        ...
+    ]
+
+    cloud_enabled: bool
+
+    cloud_id: Optional[str]
+
+def build_bayesian_static_routing_context(env: Any,) -> BayesianStaticRoutingContext:
+    """
+    从完整 Environment 中提取 Bayesian Game
+    唯一允许使用的静态 Routing 信息。
+
+    这是 Bayesian 子系统与完整 Environment 之间
+    唯一允许存在的 direct adapter。
+
+    白名单只允许读取：
+
+        edge_dc_ids
+        routing_action_target_dc_ids
+        enable_cloud_action
+        cloud_id
+
+    明确禁止未来在本函数中加入：
+
+        datacenters
+        host_list
+        CPU / GPU utilization
+        waiting queue
+        running queue
+        available resources
+        Remote observation
+        Remote load
+
+    如果以后 Bayesian 模块需要新的输入，
+    必须先判断它是否违反 Remote Partial Observability。
+    """
+
+    edge_dc_ids = tuple(
+        str(
+            dc_id
+        )
+        for dc_id
+        in env.edge_dc_ids
+    )
+
+    routing_action_target_dc_ids = tuple(
+        str(
+            dc_id
+        )
+        for dc_id
+        in env.routing_action_target_dc_ids
+    )
+
+    cloud_enabled = bool(
+        getattr(
+            env,
+            "enable_cloud_action",
+            False,
+        )
+    )
+
+    raw_cloud_id = getattr(
+        env,
+        "cloud_id",
+        None,
+    )
+
+    cloud_id = (
+        str(
+            raw_cloud_id
+        )
+        if (
+            cloud_enabled
+            and raw_cloud_id is not None
+        )
+        else None
+    )
+
+    return BayesianStaticRoutingContext(
+        edge_dc_ids=(
+            edge_dc_ids
+        ),
+
+        routing_action_target_dc_ids=(
+            routing_action_target_dc_ids
+        ),
+
+        cloud_enabled=(
+            cloud_enabled
+        ),
+
+        cloud_id=(
+            cloud_id
+        ),
+    )
 
 @dataclass(frozen=True)
 class BayesianRoutingGameDefinition:
@@ -143,6 +429,9 @@ class BayesianRoutingGameDefinition:
         ...
     ]
 
+    information_policy: (
+        BayesianInformationPolicy
+    )
     # ----------------------------------------------------------
     # 固定研究语义
     #
@@ -176,7 +465,7 @@ class BayesianRoutingGameDefinition:
     equilibrium_solver: str = "none"
 
     # Bayesian Game 禁止通过接口读取 Remote realtime state。
-    remote_realtime_state_allowed: bool = False
+    # remote_realtime_state_allowed: bool = False
 
     # ----------------------------------------------------------
     # Future Congestion Game extension point
@@ -329,10 +618,10 @@ class BayesianRoutingGameDefinition:
         """
 
         return {
-            "definition_version":
-                int(
-                    BAYESIAN_GAME_DEFINITION_VERSION
-                ),
+            # "definition_version":
+            #     int(
+            #         BAYESIAN_GAME_DEFINITION_VERSION
+            #     ),
 
             "player_ids":
                 list(
@@ -379,10 +668,12 @@ class BayesianRoutingGameDefinition:
             "equilibrium_solver":
                 self.equilibrium_solver,
 
-            "remote_realtime_state_allowed":
-                bool(
-                    self.remote_realtime_state_allowed
-                ),
+            # "remote_realtime_state_allowed":
+            #     bool(
+            #         self.remote_realtime_state_allowed
+            #     ),
+            "information_policy":
+                self.information_policy.to_metadata(),
 
             "externality_extension":
                 self.externality_extension,
@@ -395,37 +686,55 @@ class BayesianRoutingGameDefinition:
 
 
 def build_bayesian_routing_game_definition(
-        env: Any,
+        static_context:
+        BayesianStaticRoutingContext,
 ) -> BayesianRoutingGameDefinition:
     """
-    根据当前 Environment 的 Routing 结构生成静态 Game Definition。
+    根据已经脱敏的 BayesianStaticRoutingContext
+    构造 Bayesian Routing Game Definition。
 
-    本函数只读取：
+    重要：
+
+        本函数从 Step 5 开始不再接收完整 Environment。
+
+    因此本函数在接口层面无法读取：
+
+        Remote CPU
+        Remote GPU
+        Remote Queue
+        Remote Host
+        Remote available resources
+        Remote raw observation
+
+    本函数只处理：
 
         Edge DC identity
         Routing action target mapping
         Cloud ON/OFF
         Cloud ID
 
-    明确禁止读取：
-
-        Remote CPU
-        Remote GPU
-        Remote Queue
-        Remote Host
-        Neighbor Historical Feedback
-
-    同时本函数：
+    它：
 
         不调用随机数；
-        不维护 posterior；
-        不影响 Observation；
-        不影响 Reward；
-        不影响 Replay；
-        不影响 Actor / Critic。
-
-    因此 Step 4 不会破坏 Zero-Diff Mode。
+        不维护 Bayesian posterior；
+        不读取 Historical Feedback；
+        不修改 Observation；
+        不修改 Reward；
+        不修改 Replay；
+        不修改 Actor / Critic。
     """
+
+    # ==========================================================
+    # 0. Bayesian Information Boundary
+    #
+    # 研究约束固定在代码中，而不是由 config 动态开启。
+    # ==========================================================
+
+    information_policy = (
+        BayesianInformationPolicy()
+    )
+
+    information_policy.validate()
 
     # ==========================================================
     # 1. Players = Edge DC Routing Agents
@@ -436,7 +745,7 @@ def build_bayesian_routing_game_definition(
             dc_id
         )
         for dc_id
-        in env.edge_dc_ids
+        in static_context.edge_dc_ids
     )
 
     if not player_ids:
@@ -470,7 +779,7 @@ def build_bayesian_routing_game_definition(
             dc_id
         )
         for dc_id
-        in env.routing_action_target_dc_ids
+        in static_context.routing_action_target_dc_ids
     )
 
     if not action_target_dc_ids:
@@ -519,14 +828,14 @@ def build_bayesian_routing_game_definition(
 
     cloud_enabled = bool(
         getattr(
-            env,
+            static_context,
             "enable_cloud_action",
             False,
         )
     )
 
     raw_cloud_id = getattr(
-        env,
+        static_context,
         "cloud_id",
         None,
     )
@@ -601,6 +910,9 @@ def build_bayesian_routing_game_definition(
                 BayesianRemoteType.GOOD,
                 BayesianRemoteType.NORMAL,
                 BayesianRemoteType.RISKY,
+            ),
+            information_policy=(
+                information_policy
             ),
         )
     )

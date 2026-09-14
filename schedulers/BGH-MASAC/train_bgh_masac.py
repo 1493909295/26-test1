@@ -32,6 +32,8 @@ from neighbor_feedback import (
 )
 from bayesian_game import (
     BayesianRoutingGameDefinition,
+    BayesianStaticRoutingContext,
+    build_bayesian_static_routing_context,
     build_bayesian_routing_game_definition,
 )
 
@@ -206,16 +208,16 @@ def validate_bgh_feature_config(
     """
     验证当前 BGH-MASAC Feature Gate 配置。
 
-    Step 4 已经正式定义 Bayesian Routing Game 的：
+    Step 5 已完成：
 
-        Player
-        Action
-        Hidden Remote Type
-        Belief Scope
-        Evidence Scope
-        Utility Scope
+        Bayesian Routing Game Definition
+        Bayesian Information Boundary
+        Environment -> Safe Static Context
 
-    但是当前仍然尚未实现：
+    当前已经从接口层面禁止 Bayesian Core 读取
+    Remote DC Real-Time State。
+
+    但是仍然尚未实现：
 
         Bayesian Evidence
         Bayesian Posterior / Belief Store
@@ -246,16 +248,14 @@ def validate_bgh_feature_config(
         return
 
     # ----------------------------------------------------------
-    # Step 4 已完成 Bayesian Game 静态语义定义，
-    # 但还没有真正实现 Bayesian Evidence / Belief
-    # 与 Heuristic Guidance。
-    #
-    # 因此现在仍然禁止把 Feature Gate 打开。
+    # Step 5 已建立 Bayesian Information Boundary，
+    # 但 Bayesian Evidence / Belief / Expected Utility /
+    # Heuristic Guidance 仍未真正实现。
     # ----------------------------------------------------------
 
     raise NotImplementedError(
-        "BGH-MASAC 当前已经完成 Step 4："
-        "Bayesian Routing Game Definition。"
+        "BGH-MASAC 当前已经完成 Step 5："
+        "Bayesian Information Boundary。"
         "但 Bayesian Evidence、Bayesian Belief、"
         "Bayesian Expected Utility 与 "
         "Heuristic Guidance 尚未实现，"
@@ -5717,11 +5717,21 @@ def train(
         old_env_path=train_config.old_env_path,
     )
 
+    bayesian_static_context: (
+        BayesianStaticRoutingContext
+    ) = (
+        build_bayesian_static_routing_context(
+            env
+        )
+    )
+
     bayesian_game_definition: (
         BayesianRoutingGameDefinition
     ) = (
         build_bayesian_routing_game_definition(
-            env
+            static_context=(
+                bayesian_static_context
+            )
         )
     )
 
