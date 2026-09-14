@@ -30,6 +30,12 @@ from host_observation import (HostObservationBuilder,)
 from neighbor_feedback import (
     NeighborHistoricalFeedbackStore,
 )
+from bayesian_game import (
+    BayesianRoutingGameDefinition,
+    build_bayesian_routing_game_definition,
+)
+
+
 from training_reward import (
     TrainingRewardConfig,
     HMasacTrainingRewardModel,
@@ -200,15 +206,26 @@ def validate_bgh_feature_config(
     """
     验证当前 BGH-MASAC Feature Gate 配置。
 
-    Step 3 目前只真正实现 Zero-Diff Mode。
+    Step 4 已经正式定义 Bayesian Routing Game 的：
+
+        Player
+        Action
+        Hidden Remote Type
+        Belief Scope
+        Evidence Scope
+        Utility Scope
+
+    但是当前仍然尚未实现：
+
+        Bayesian Evidence
+        Bayesian Posterior / Belief Store
+        Bayesian Expected Utility
+        Heuristic Policy Guidance
 
     因此：
-        1. 两个新机制关闭时，允许训练；
-        2. Zero-Diff 下禁止 Historical Feedback 直接进入
-           Routing Observation；
-        3. 如果用户提前打开尚未实现的新机制，则立即报错，
-           防止把普通 H-MASAC 错误标记成 Bayesian / Heuristic
-           实验。
+        1. 两个新机制关闭时，继续允许 Zero-Diff 训练；
+        2. Historical Feedback 仍然只能 Collect-Only；
+        3. Bayesian / Heuristic 开关暂时仍禁止启用。
     """
 
     if is_bgh_zero_diff_mode(
@@ -229,18 +246,21 @@ def validate_bgh_feature_config(
         return
 
     # ----------------------------------------------------------
-    # Step 3 尚未真正实现 Bayesian / Heuristic。
+    # Step 4 已完成 Bayesian Game 静态语义定义，
+    # 但还没有真正实现 Bayesian Evidence / Belief
+    # 与 Heuristic Guidance。
     #
-    # 因此不能仅仅修改配置开关后继续运行，
-    # 否则会产生“日志显示 Bayesian 已启用，
-    # 实际算法仍然是 H-MASAC”的伪实验。
+    # 因此现在仍然禁止把 Feature Gate 打开。
     # ----------------------------------------------------------
 
     raise NotImplementedError(
-        "当前代码仅完成 BGH-MASAC Step 3："
-        "H-MASAC-equivalent Zero-Diff Mode。"
-        "Bayesian Game 与 Heuristic Guidance "
-        "将在后续步骤正式实现后开放。"
+        "BGH-MASAC 当前已经完成 Step 4："
+        "Bayesian Routing Game Definition。"
+        "但 Bayesian Evidence、Bayesian Belief、"
+        "Bayesian Expected Utility 与 "
+        "Heuristic Guidance 尚未实现，"
+        "因此当前仍只能运行 H-MASAC-equivalent "
+        "Zero-Diff Mode。"
     )
 
 # Two-Level Scheduler 三阶段训练状态。
@@ -5696,6 +5716,31 @@ def train(
         seed=train_config.seed,
         old_env_path=train_config.old_env_path,
     )
+
+    bayesian_game_definition: (
+        BayesianRoutingGameDefinition
+    ) = (
+        build_bayesian_routing_game_definition(
+            env
+        )
+    )
+
+
+    bayesian_game_metadata_json = json.dumps(
+        bayesian_game_definition.to_metadata(),
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+    print(
+        "\n"
+        "============================================================\n"
+        "🎲 BGH-MASAC Bayesian Routing Game Definition\n"
+        f"{bayesian_game_metadata_json}\n"
+        "============================================================\n",
+        flush=True,
+    )
+
     host_observation_builder = (
         HostObservationBuilder(
             env=env,
