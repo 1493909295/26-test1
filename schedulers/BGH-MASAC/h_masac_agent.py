@@ -1,7 +1,9 @@
 from __future__ import annotations
 from dataclasses import dataclass, asdict
 import math
+import os
 from pathlib import Path
+import time
 from typing import  Dict, Optional, Union
 import numpy as np
 import torch
@@ -20,6 +22,167 @@ __all__ = (
     "HostSACConfig",
     "LocalHostSAC",
 )
+
+
+_CHECKPOINT_RETRYABLE_WINDOWS_ERROR_CODES = {
+    5,     # 目标文件被映射/扫描时，Windows 也可能返回“拒绝访问”
+    32,    # 文件正被其他进程使用
+    33,    # 文件区域被锁定
+    1224,  # 文件存在打开的用户映射区段
+}
+
+
+def _is_retryable_checkpoint_error(
+        error: BaseException,
+) -> bool:
+    """判断 checkpoint 写入失败是否属于 Windows 瞬时文件占用。"""
+
+    winerror = getattr(error, "winerror", None)
+    if winerror in _CHECKPOINT_RETRYABLE_WINDOWS_ERROR_CODES:
+        return True
+
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "error code: 5",
+            "error code: 32",
+            "error code: 33",
+            "error code: 1224",
+            "errno 5",
+            "errno 32",
+            "errno 33",
+            "errno 1224",
+            "access is denied",
+            "access denied",
+            "being used by another process",
+            "user-mapped section open",
+        )
+    )
+
+
+def _atomic_torch_save(
+        checkpoint: Dict,
+        file_path: Union[str, Path],
+        max_attempts: int = 8,
+        retry_delay_seconds: float = 0.25,
+) -> None:
+    """
+    将 PyTorch checkpoint 原子写入目标路径。
+
+    先写同目录中的唯一临时文件，再使用 ``os.replace`` 替换目标文件。
+    Windows Defender、索引器或模型预览器短暂映射旧 checkpoint 时，
+    对错误码 5、32、33、1224 做有限重试，避免训练因瞬时文件锁中断。
+    """
+
+    target_path = Path(file_path)
+    target_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    max_attempts = max(int(max_attempts), 1)
+    retry_delay_seconds = max(float(retry_delay_seconds), 0.0)
+    last_error: Optional[BaseException] = None
+
+    def build_temporary_path(attempt_index: int) -> Path:
+        return target_path.with_name(
+            f".{target_path.name}."
+            f"{os.getpid()}."
+            f"{time.time_ns()}."
+            f"{attempt_index}.tmp"
+        )
+
+    temporary_path = build_temporary_path(0)
+
+    try:
+        # 唯一临时文件本身也可能被安全软件抢占；写入失败时换一个名字重试。
+        for attempt_index in range(max_attempts):
+            temporary_path = build_temporary_path(
+                attempt_index
+            )
+
+            try:
+                torch.save(
+                    checkpoint,
+                    temporary_path,
+                )
+                break
+
+            except (OSError, RuntimeError) as error:
+                last_error = error
+                try:
+                    temporary_path.unlink(
+                        missing_ok=True
+                    )
+                except OSError:
+                    pass
+
+                if (
+                        not _is_retryable_checkpoint_error(error)
+                        or attempt_index + 1 >= max_attempts
+                ):
+                    raise RuntimeError(
+                        "Checkpoint 临时文件写入失败："
+                        f"{target_path}"
+                    ) from error
+
+                time.sleep(
+                    retry_delay_seconds
+                    * float(attempt_index + 1)
+                )
+
+        # 临时文件已经完整落盘。目标被映射占用时只重试原子替换，
+        # 不重复序列化大型模型。
+        for attempt_index in range(max_attempts):
+            try:
+                os.replace(
+                    temporary_path,
+                    target_path,
+                )
+
+                if (
+                        not target_path.is_file()
+                        or target_path.stat().st_size <= 0
+                ):
+                    raise RuntimeError(
+                        "Checkpoint 原子写入后文件不存在或为空："
+                        f"{target_path}"
+                    )
+
+                return
+
+            except (OSError, RuntimeError) as error:
+                last_error = error
+
+                if (
+                        not _is_retryable_checkpoint_error(error)
+                        or attempt_index + 1 >= max_attempts
+                ):
+                    raise RuntimeError(
+                        "Checkpoint 原子替换失败："
+                        f"{target_path}"
+                    ) from error
+
+                time.sleep(
+                    retry_delay_seconds
+                    * float(attempt_index + 1)
+                )
+
+    finally:
+        try:
+            temporary_path.unlink(
+                missing_ok=True
+            )
+        except OSError:
+            # 临时文件也可能被安全软件短暂占用；它不会被当作正式
+            # checkpoint，后续启动不读取该文件。
+            pass
+
+    raise RuntimeError(
+        "Checkpoint 保存失败："
+        f"{target_path}"
+    ) from last_error
 
 
 # 超参数配置
@@ -461,7 +624,10 @@ class RoutingMASAC:
                 self.update_step,
         }
 
-        torch.save(checkpoint, file_path,)
+        _atomic_torch_save(
+            checkpoint,
+            file_path,
+        )
 
     # 从 checkpoint 恢复模型
     def load(self, file_path: Union[str, Path], load_optimizers: bool = True) -> None:
@@ -1615,7 +1781,7 @@ class LocalHostSAC:
                 ),
         }
 
-        torch.save(
+        _atomic_torch_save(
             checkpoint,
             file_path,
         )

@@ -234,33 +234,25 @@ def validate_bgh_feature_config(
         train_config: TrainConfig,
 ) -> None:
     """
-    验证当前 BGH-MASAC Feature Gate 配置。
+    验证 BGH-MASAC 运行模式的依赖关系。
 
-    Step 5 已完成：
-
-        Bayesian Routing Game Definition
-        Bayesian Information Boundary
-        Environment -> Safe Static Context
-
-    当前已经从接口层面禁止 Bayesian Core 读取
-    Remote DC Real-Time State。
-
-    当前已经完成：
-
-        Bayesian Evidence 的终止任务转换链
-        Bayesian Posterior / Belief Store 的基础更新
-        Pressure / Utility / Bias 数学层
-        Guided Policy 与历史反馈上下文接口
-
-    但是仍然尚未实现：
-
-        Bayesian / Heuristic 实验模式的正式放行
-
-    因此：
-        1. 两个新机制关闭时，继续允许 Zero-Diff 训练；
-        2. Historical Feedback 仍然只能 Collect-Only；
-        3. Bayesian / Heuristic 开关暂时仍禁止启用。
+    Bayesian Game 负责维护终止任务 Evidence、Pair Posterior 和
+    历史拥塞压力；Heuristic Guidance 在此状态之上生成 Actor Bias，
+    因而不能脱离 Bayesian Game 单独启用。
     """
+
+    bayesian_enabled = bool(
+        train_config.enable_bayesian_game
+    )
+    heuristic_enabled = bool(
+        train_config.enable_heuristic_guidance
+    )
+
+    if heuristic_enabled and not bayesian_enabled:
+        raise RuntimeError(
+            "BGH_ENABLE_HEURISTIC_GUIDANCE=True 要求同时启用 "
+            "BGH_ENABLE_BAYESIAN_GAME；启发式偏置依赖贝叶斯-拥塞状态。"
+        )
 
     if is_bgh_zero_diff_mode(
         train_config
@@ -279,22 +271,8 @@ def validate_bgh_feature_config(
 
         return
 
-    # ----------------------------------------------------------
-    # Step 5 已建立 Bayesian Information Boundary，
-    # Step 2/3/4/5 已完成 Evidence、Belief、Pressure、
-    # Utility / Bias 数学层、Guided Policy 适配器和动作上下文构造已经完成，
-    # 但正式实验模式的启用门控仍保持关闭，避免未经完整实验验证就改变基线。
-    # ----------------------------------------------------------
-
-    raise NotImplementedError(
-        "BGH-MASAC 当前已经完成 Step 5："
-        "Bayesian Information Boundary，以及 Step 2/3 的 "
-        "Evidence / Belief / Pressure / Utility / Bias 数学层，"
-        "以及 Guided Policy 和动作上下文适配器。"
-        "但 Bayesian / Heuristic 正式实验模式尚未放行，"
-        "因此当前仍只能运行 H-MASAC-equivalent "
-        "Zero-Diff Mode。"
-    )
+    # Bayesian-only 与 Bayesian+Heuristic 均为已接通的正式模式。
+    return
 
 # Two-Level Scheduler 三阶段训练状态。
 class TrainingStage( str,Enum,):
@@ -5793,8 +5771,12 @@ def train(
         f"Runtime mode              : {bgh_runtime_mode}\n"
         f"Bayesian Game enabled     : "
         f"{train_config.enable_bayesian_game}\n"
+        f"Congestion Game enabled   : "
+        f"{train_config.enable_bayesian_game}\n"
         f"Heuristic Guidance enabled: "
         f"{train_config.enable_heuristic_guidance}\n"
+        f"Cloud Action enabled      : "
+        f"{bool(conf.ENABLE_CLOUD_ACTION)}\n"
         f"Zero-Diff Mode            : "
         f"{is_bgh_zero_diff_mode(train_config)}\n"
         "============================================================\n",
@@ -5827,10 +5809,8 @@ def train(
         )
     )
 
-    # 第 3 步：为未来 Bayesian 模式准备正式 Evidence 接收端。
-    # 当前 Feature Gate 仍禁止启用该模式，因此 Zero-Diff 训练不会创建
-    # 或更新 Belief Store；这只是把 terminal conversion 的生命周期接口
-    # 固定在训练入口，避免后续再次从 Environment 直接读取实时状态。
+    # Bayesian 模式开启时创建正式 Evidence / Belief / Pressure 状态；
+    # 关闭时保持 H-MASAC-equivalent Zero-Diff 路径。
     bayesian_game: Optional[BayesianCongestionGame] = None
     if train_config.enable_bayesian_game:
         bayesian_game = BayesianCongestionGame(

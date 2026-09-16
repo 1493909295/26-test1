@@ -1160,11 +1160,7 @@ def build_bayesian_routing_game_definition(
     # ==========================================================
 
     cloud_enabled = bool(
-        getattr(
-            static_context,
-            "enable_cloud_action",
-            False,
-        )
+        static_context.cloud_enabled
     )
 
     raw_cloud_id = getattr(
