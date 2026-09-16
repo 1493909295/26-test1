@@ -512,7 +512,7 @@ def classify_historical_outcome(
         and normalized_latency_score >= 0.8
     ):
         return (
-            BayesianRemoteType
+            BayesianHiddenState
             .GOOD
             .value
         )
@@ -523,41 +523,65 @@ def classify_historical_outcome(
         and sla_satisfied
     ):
         return (
-            BayesianRemoteType
+            BayesianHiddenState
             .NORMAL
             .value
         )
 
 
     return (
-        BayesianRemoteType
+        BayesianHiddenState
         .RISKY
         .value
     )
 
-class BayesianRemoteType(str, Enum):
+# ============================================================
+# Bayesian Hidden State
+#
+# Step 1.1:
+#
+# 定义 Remote DC 的不可直接观测状态 θ
+#
+# 注意：
+#
+# θ 不是:
+#   CPU
+#   GPU
+#   Queue
+#   Host utilization
+#
+# θ 表示:
+#
+#   source DC 对 target DC 服务能力的隐含评价状态
+#
+# 该状态只能通过历史反馈推断。
+#
+# ============================================================
+
+
+class BayesianHiddenState(str, Enum):
+
     """
-    Remote Edge DC 的隐藏服务类型。
+    Remote Service Hidden State θ
 
-    注意：
-        这里不是 Remote DC 的真实 CPU/GPU/Queue 状态。
+    表示:
 
-    它表示：
-
-        对于 source DC -> target DC 这一有向调度关系，
-        根据历史结果推断出的 Remote Service Suitability。
-
-    后续 Bayesian Belief 将维护：
-
-        P(
-            theta_{source->target}
+        source DC
             |
-            historical evidence
-        )
+            |
+            v
+
+        target DC
+
+    在长期运行过程中的服务可靠性状态。
+
+
     """
 
     GOOD = "good"
+
     NORMAL = "normal"
+
     RISKY = "risky"
 
 
@@ -760,7 +784,7 @@ class BayesianRoutingGameDefinition:
     # ----------------------------------------------------------
 
     remote_type_space: Tuple[
-        BayesianRemoteType,
+        BayesianHiddenState,
         ...
     ]
 
@@ -1242,9 +1266,9 @@ def build_bayesian_routing_game_definition(
             ),
 
             remote_type_space=(
-                BayesianRemoteType.GOOD,
-                BayesianRemoteType.NORMAL,
-                BayesianRemoteType.RISKY,
+                BayesianHiddenState.GOOD,
+                BayesianHiddenState.NORMAL,
+                BayesianHiddenState.RISKY,
             ),
             information_policy=(
                 information_policy
