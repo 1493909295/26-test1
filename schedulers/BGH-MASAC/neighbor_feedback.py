@@ -6,7 +6,10 @@ from typing import Any, Dict, Mapping, Optional
 import numpy as np
 
 from pending_job_trace import FinalizedJobTrace
-
+from .bayesian_game import (
+    BayesianHistoricalEvidence,
+    classify_historical_outcome
+)
 
 @dataclass
 class NeighborPairFeedbackState:
