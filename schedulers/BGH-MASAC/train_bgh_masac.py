@@ -18,6 +18,10 @@ from h_masac_agent import (
     LocalHostSAC,
     HostSACConfig,
 )
+from neighbor_feedback import (
+    NeighborHistoricalFeedbackStore,
+    BayesianEvidenceCollector,
+)
 from routing_replay_buffer import (RoutingReplayBuffer,)
 from host_replay_buffer import (HostReplayBuffer,)
 from pending_job_trace import (PendingJobTraceStore, FinalizedJobTrace,)

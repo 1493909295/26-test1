@@ -1233,3 +1233,79 @@ class NeighborHistoricalFeedbackStore:
                     ._episode_pair_samples
                 ),
         }
+
+
+class BayesianEvidenceCollector:
+    """
+    Historical Feedback -> Bayesian Evidence
+
+    只消费：
+
+        finalized historical outcome
+
+
+    不允许消费：
+
+        raw trace
+        observation
+        remote state
+    """
+
+
+    def __init__(self):
+
+        self.evidence_buffer = []
+
+
+    def add_feedback(
+            self,
+            feedback,
+    ):
+
+        evidence = (
+            BayesianHistoricalEvidence(
+                source_dc_id=
+                    feedback.source_dc_id,
+
+                target_dc_id=
+                    feedback.target_dc_id,
+
+                outcome_type=
+                    classify_historical_outcome(
+                        success=
+                            feedback.success,
+
+                        sla_satisfied=
+                            feedback.sla_satisfied,
+
+                        normalized_latency_score=
+                            feedback.latency_score,
+                    ),
+
+                success=
+                    feedback.success,
+
+                sla_satisfied=
+                    feedback.sla_satisfied,
+
+                normalized_latency_score=
+                    feedback.latency_score,
+            )
+        )
+
+
+        evidence.validate_information_boundary()
+
+
+        self.evidence_buffer.append(
+            evidence
+        )
+
+
+    def get_all_evidence(self):
+
+        return tuple(
+            self.evidence_buffer
+        )
+
+

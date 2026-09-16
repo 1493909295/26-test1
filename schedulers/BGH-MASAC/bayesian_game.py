@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple,List
 
 
 # ==============================================================
@@ -199,6 +199,199 @@ class BayesianInformationPolicy:
                     self.allow_raw_environment_reference
                 ),
         }
+
+@dataclass(frozen=True)
+class BayesianHistoricalEvidence:
+    """
+    Bayesian Evidence。
+
+    表示：
+
+        source DC
+            |
+            |
+            v
+        target DC
+
+    历史调度结果对于 Remote Service Suitability
+    的一次观测证据。
+
+
+    注意：
+
+    Evidence 不是 Remote State。
+
+    禁止包含：
+
+        CPU
+        GPU
+        Queue
+        Host state
+        utilization
+        resource availability
+        raw observation
+
+
+    只允许包含：
+
+        历史动作结果
+        SLA outcome
+        completion outcome
+        latency outcome
+        energy outcome
+    """
+
+    source_dc_id: str
+
+    target_dc_id: str
+
+
+    # --------------------------------------------------
+    # 调度结果类别
+    #
+    # 用于未来映射：
+    #
+    # GOOD/NORMAL/RISKY
+    #
+    # --------------------------------------------------
+
+    outcome_type: str
+
+
+    # --------------------------------------------------
+    # 是否成功完成
+    # --------------------------------------------------
+
+    success: bool
+
+
+    # --------------------------------------------------
+    # SLA 是否满足
+    # --------------------------------------------------
+
+    sla_satisfied: bool
+
+
+    # --------------------------------------------------
+    # 归一化后的历史质量指标
+    #
+    # 当前只保存结果，
+    # 不参与 Bayesian 更新。
+    #
+    # --------------------------------------------------
+
+    normalized_latency_score: float = 0.0
+
+    normalized_energy_score: float = 0.0
+
+
+
+    # --------------------------------------------------
+    # 时间信息
+    #
+    # 用于未来 EWMA / decay
+    # --------------------------------------------------
+
+    timestamp: Optional[int] = None
+
+
+
+    def validate_information_boundary(
+        self,
+    ) -> None:
+        """
+        防止 Evidence 演化成 Remote State。
+
+        当前 Evidence 必须满足：
+
+            Historical Outcome only
+
+        """
+
+        forbidden_fields = [
+
+            "cpu",
+
+            "gpu",
+
+            "queue",
+
+            "host_state",
+
+            "available_resource",
+
+            "raw_observation",
+
+        ]
+
+
+        for field_name in forbidden_fields:
+
+            if hasattr(
+                self,
+                field_name,
+            ):
+
+                raise RuntimeError(
+                    "Bayesian Evidence "
+                    "禁止包含 Remote Real-Time State:"
+                    f"{field_name}"
+                )
+
+def classify_historical_outcome(
+        *,
+        success: bool,
+        sla_satisfied: bool,
+        normalized_latency_score: float,
+) -> str:
+    """
+    根据历史结果生成 Remote Hidden Type Evidence。
+
+    注意：
+
+    这里不是 Bayesian posterior。
+
+    只是：
+
+        outcome
+          |
+          v
+        evidence label
+
+
+    后续由 Bayesian Belief 模块学习：
+
+        P(type | evidence)
+    """
+
+    if (
+        success
+        and sla_satisfied
+        and normalized_latency_score >= 0.8
+    ):
+        return (
+            BayesianRemoteType
+            .GOOD
+            .value
+        )
+
+
+    if (
+        success
+        and sla_satisfied
+    ):
+        return (
+            BayesianRemoteType
+            .NORMAL
+            .value
+        )
+
+
+    return (
+        BayesianRemoteType
+        .RISKY
+        .value
+    )
 
 class BayesianRemoteType(str, Enum):
     """
