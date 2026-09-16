@@ -191,3 +191,9 @@ BGH_BENEFIT_SLA_WEIGHT = 0.4         # SLA 满足质量权重
 BGH_BENEFIT_DELAY_WEIGHT = 0.2       # 历史延迟质量权重
 BGH_RISK_CONGESTION_COST_WEIGHT = 1.0  # C_j 在 Risk 中的权重
 BGH_GUIDANCE_SCALE = 0.3             # Utility 转换为 logit bias 的尺度
+
+# 第 8 步：三阶段 Guidance λ 调度系数。
+# 实际 Bias = BGH_GUIDANCE_SCALE × λ × centered_utility_bias。
+BGH_GUIDANCE_LAMBDA_STAGE2_START = 0.0  # Routing Train 起始引导强度
+BGH_GUIDANCE_LAMBDA_STAGE2_PEAK = 1.0   # Routing Train 结束/Joint 起始
+BGH_GUIDANCE_LAMBDA_STAGE3_END = 0.0    # Joint Finetune 结束引导强度

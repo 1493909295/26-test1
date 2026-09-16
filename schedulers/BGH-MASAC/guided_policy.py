@@ -157,9 +157,15 @@ class GuidedRoutingPolicy:
             local_obs: np.ndarray,
             agent_index: int,
             action_bias: Mapping[Any, float],
+            guidance_lambda: float,
             deterministic: bool,
     ) -> int:
-        """仅在需要指导时执行 logits + bias 的动作采样。"""
+        """仅在需要指导时执行 ``logits + λ × bias`` 的动作采样。
+
+        ``guidance_lambda`` 是调度器给出的归一化强度；具体 Bias 尺度仍由
+        Bayesian Game 的 ``BGH_GUIDANCE_SCALE`` 控制，避免把训练阶段调度
+        与效用量纲耦合在一起。
+        """
 
         local_obs_array = np.asarray(
             local_obs,
@@ -176,13 +182,17 @@ class GuidedRoutingPolicy:
             device=self.base_policy.device,
         )
 
+        guidance_lambda = float(guidance_lambda)
+        if not math.isfinite(guidance_lambda) or not 0.0 <= guidance_lambda <= 1.0:
+            raise ValueError("guidance_lambda 必须位于 [0, 1]。")
+
         with torch.no_grad():
             # 只在本适配层加 Bias；基础 Actor 参数和输入保持不变。
             logits = self.base_policy.actor.forward(
                 local_obs=local_obs_tensor,
                 agent_indices=agent_index_tensor,
             )
-            guided_logits = logits + self._bias_vector(
+            guided_logits = logits + guidance_lambda * self._bias_vector(
                 action_bias
             ).unsqueeze(0)
             action_probs = F.softmax(
@@ -210,13 +220,15 @@ class GuidedRoutingPolicy:
             *,
             action_context: Optional[Mapping[str, Any]] = None,
             action_bias: Optional[Mapping[Any, float]] = None,
+            guidance_lambda: float = 1.0,
             deterministic: bool = False,
     ) -> int:
         """统一选择 Routing Action。
 
         ``action_bias`` 优先级高于 ``bayesian_game`` 自动计算结果，便于
         测试和未来接入其他启发式提供者。默认关闭时直接调用基础策略，
-        不改变原有采样实现。
+        不改变原有采样实现。``guidance_lambda`` 只影响启用指导时的
+        action-level Bias，不进入 Observation、Replay 或 Actor 参数更新。
         """
 
         if not self.enabled and action_bias is None:
@@ -244,5 +256,6 @@ class GuidedRoutingPolicy:
             local_obs=local_obs,
             agent_index=agent_index,
             action_bias=action_bias,
+            guidance_lambda=guidance_lambda,
             deterministic=deterministic,
         )

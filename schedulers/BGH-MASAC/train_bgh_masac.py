@@ -41,6 +41,7 @@ from bayesian_evidence import (
     build_bayesian_evidence_from_finalized_trace,
 )
 from guided_policy import GuidedRoutingPolicy
+from guidance_schedule import GuidanceLambdaSchedule
 
 
 from training_reward import (
@@ -140,6 +141,15 @@ class TrainConfig:
         conf.BGH_RISK_CONGESTION_COST_WEIGHT
     )
     guidance_scale: float = (conf.BGH_GUIDANCE_SCALE)
+    guidance_lambda_stage2_start: float = (
+        conf.BGH_GUIDANCE_LAMBDA_STAGE2_START
+    )
+    guidance_lambda_stage2_peak: float = (
+        conf.BGH_GUIDANCE_LAMBDA_STAGE2_PEAK
+    )
+    guidance_lambda_stage3_end: float = (
+        conf.BGH_GUIDANCE_LAMBDA_STAGE3_END
+    )
 
 # ==============================================================
 # BGH-MASAC Runtime Feature Mode
@@ -354,6 +364,9 @@ class EpisodeStatistics:
     max_routing_hops: int = 0
     routing_layer_reward_sum: float = 0.0
     host_layer_reward_sum: float = 0.0
+
+    # 当前 Episode 的 Guided Policy λ；仅记录强度，不改变 Replay。
+    guidance_lambda: float = 0.0
 
     def _inc_dc(self,dc_id: str, metric_name: str,delta: int = 1,) -> None:
         dc_id = str(dc_id)
@@ -4440,6 +4453,13 @@ def build_episode_log_row(
                 conf.BGH_ENABLE_HEURISTIC_GUIDANCE
             ),
 
+        # 第 8 步：记录当前 Episode 实际使用的 Guidance λ，
+        # 便于核对三阶段边界和复现实验。
+        "bgh_guidance_lambda":
+            float(
+                stats.guidance_lambda
+            ),
+
         "bgh_zero_diff_mode":
             bool(
                 not conf.BGH_ENABLE_BAYESIAN_GAME
@@ -6383,6 +6403,14 @@ def train(
         bayesian_game=bayesian_game,
     )
 
+    # 第 8 步：Guidance λ 调度器与训练生命周期同范围创建，
+    # 但不会修改网络参数；每个 Episode 开始时只读取一次 λ。
+    guidance_lambda_schedule = GuidanceLambdaSchedule(
+        stage2_start=train_config.guidance_lambda_stage2_start,
+        stage2_peak=train_config.guidance_lambda_stage2_peak,
+        stage3_end=train_config.guidance_lambda_stage3_end,
+    )
+
     action_rng = np.random.default_rng(int(train_config.seed))
 
     (
@@ -6538,6 +6566,28 @@ def train(
                 )
             )
 
+            # 第 8 步：按现有三阶段边界计算当前 Episode 的 λ。
+            # Stage 1 恒为 0；Stage 2 线性 warm-up；Stage 3 线性 decay。
+            scheduled_guidance_lambda = (
+                guidance_lambda_schedule.lambda_for_episode(
+                    stage=training_stage.value,
+                    episode=episode,
+                    stage_start_episode=training_stage_start_episode(
+                        stage=training_stage,
+                        train_config=train_config,
+                    ),
+                    stage_end_episode=training_stage_end_episode(
+                        stage=training_stage,
+                        train_config=train_config,
+                    ),
+                )
+            )
+            guidance_lambda = float(
+                scheduled_guidance_lambda
+                if guided_policy.enabled
+                else 0.0
+            )
+
             if (
                     episode
                     == training_stage_start_episode(
@@ -6595,6 +6645,8 @@ def train(
                 training_stage=(
                     training_stage.value
                 ),
+
+                guidance_lambda=float(guidance_lambda),
             )
 
             # 记录episode开始的时间
@@ -7142,6 +7194,8 @@ def train(
                             # Guided Policy 只接收归一化历史特征，
                             # 不把实时远端资源写入 Observation。
                             action_context=action_context,
+
+                            guidance_lambda=guidance_lambda,
 
                             deterministic=False,
                         )
