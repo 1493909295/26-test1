@@ -26,12 +26,14 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import math
-from typing import Any, Deque, Dict, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, Mapping, Optional, Sequence, Tuple
 
 from bayesian_game import BayesianHistoricalEvidence
 
 __all__ = (
     "BayesianCongestionPairKey",
+    "RoutingActionFeatures",
+    "ActionUtilityBreakdown",
     "BetaBeliefState",
     "BayesianBeliefStore",
     "HistoricalPressureState",
@@ -49,6 +51,39 @@ class BayesianCongestionPairKey:
 
     source_dc_id: str
     target_dc_id: str
+
+
+@dataclass(frozen=True)
+class RoutingActionFeatures:
+    """一个候选 Routing Action 的历史/任务质量特征。
+
+    三个分数都必须位于 [0, 1]，且只表示可供启发式层使用的质量：
+
+    * success_score：历史成功质量；
+    * sla_score：SLA 满足质量；
+    * delay_score：延迟质量，越快越接近 1。
+
+    这些字段不是远端实时资源，也不会写入 Routing Observation。
+    """
+
+    target_dc_id: str
+    success_score: float = 0.0
+    sla_score: float = 0.0
+    delay_score: float = 0.0
+
+
+@dataclass(frozen=True)
+class ActionUtilityBreakdown:
+    """保存一个候选动作的 Benefit / Risk / Utility / Bias 分解。"""
+
+    target_dc_id: str
+    benefit: float
+    congestion_probability: float
+    congestion_cost: float
+    risk: float
+    utility: float
+    confidence: float
+    bias: float
 
 
 @dataclass
@@ -332,9 +367,10 @@ class HistoricalPressureStore:
 
 
 class BayesianCongestionGame:
-    """Bayesian-Congestion Game 的状态化计算器骨架。
+    """Bayesian-Congestion Game 的状态化计算器。
 
-    注意：第 2/4 步实现 posterior 和历史 pressure；utility 或 bias 仍未实现。
+    第 2/4/5 步实现 posterior、历史 pressure 以及
+    Benefit / Risk / Utility / Bias 数学层；不直接采样或决定动作。
     保留明确的入口和职责边界，避免后续把计算逻辑重新塞回
     ``train_bgh_masac.py`` 或 ``bayesian_game.py``。
     """
@@ -349,6 +385,11 @@ class BayesianCongestionGame:
             pressure_window_size: int = 100,
             linear_cost_weight: float = 1.0,
             quadratic_cost_weight: float = 1.0,
+            benefit_success_weight: float = 0.4,
+            benefit_sla_weight: float = 0.4,
+            benefit_delay_weight: float = 0.2,
+            risk_congestion_cost_weight: float = 1.0,
+            guidance_scale: float = 0.3,
     ) -> None:
         # 只保存已经脱敏的静态 Game Definition。
         # 不保存完整 Environment，也不保存远端实时资源引用。
@@ -365,6 +406,33 @@ class BayesianCongestionGame:
             linear_cost_weight=linear_cost_weight,
             quadratic_cost_weight=quadratic_cost_weight,
         )
+        benefit_weights = (
+            benefit_success_weight,
+            benefit_sla_weight,
+            benefit_delay_weight,
+        )
+        if any(
+            not math.isfinite(weight) or weight < 0.0
+            for weight in benefit_weights
+        ) or sum(benefit_weights) <= 0.0:
+            raise ValueError(
+                "Benefit 权重必须是非负有限数，且总和必须大于 0。"
+            )
+        if (
+            not math.isfinite(risk_congestion_cost_weight)
+            or risk_congestion_cost_weight < 0.0
+        ):
+            raise ValueError("risk_congestion_cost_weight 必须是非负有限数。")
+        if not math.isfinite(guidance_scale) or guidance_scale < 0.0:
+            raise ValueError("guidance_scale 必须是非负有限数。")
+
+        self.benefit_success_weight = float(benefit_success_weight)
+        self.benefit_sla_weight = float(benefit_sla_weight)
+        self.benefit_delay_weight = float(benefit_delay_weight)
+        self.risk_congestion_cost_weight = float(
+            risk_congestion_cost_weight
+        )
+        self.guidance_scale = float(guidance_scale)
 
     def update_belief(
             self,
@@ -419,9 +487,245 @@ class BayesianCongestionGame:
 
         return self.pressure_store.get_congestion_cost(target_dc_id)
 
-    def get_action_bias(self, source_dc_id: str, job_context: Any) -> Any:
-        """预留：根据历史状态生成 action-level logit bias。"""
+    @staticmethod
+    def _validate_quality_score(
+            score_name: str,
+            score: float,
+    ) -> float:
+        score = float(score)
+        if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+            raise ValueError(
+                f"{score_name} 必须是 [0, 1] 内的有限数。"
+            )
+        return score
 
-        raise NotImplementedError(
-            "后续步骤才实现 Utility 到 Actor logit bias 的转换。"
+    def calculate_benefit(
+            self,
+            action_features: RoutingActionFeatures,
+    ) -> float:
+        """按成功、SLA、延迟质量计算候选动作 Benefit。"""
+
+        success_score = self._validate_quality_score(
+            "success_score",
+            action_features.success_score,
         )
+        sla_score = self._validate_quality_score(
+            "sla_score",
+            action_features.sla_score,
+        )
+        delay_score = self._validate_quality_score(
+            "delay_score",
+            action_features.delay_score,
+        )
+        return float(
+            self.benefit_success_weight * success_score
+            + self.benefit_sla_weight * sla_score
+            + self.benefit_delay_weight * delay_score
+        )
+
+    def calculate_risk(
+            self,
+            source_dc_id: str,
+            target_dc_id: str,
+    ) -> Tuple[float, float, float]:
+        """返回 (Risk, congestion_probability, congestion_cost)。"""
+
+        target_dc_id = str(target_dc_id)
+        source_dc_id = str(source_dc_id)
+
+        # Self / Cloud 不建立 Remote Edge Pair，因此没有 Bayesian
+        # remote congestion risk；其 Benefit 仍可参与候选动作比较。
+        if (
+            target_dc_id not in self.pressure_store.edge_dc_ids
+            or target_dc_id == source_dc_id
+        ):
+            return (0.0, 0.0, 0.0)
+
+        congestion_probability = (
+            self.get_congestion_probability(
+                source_dc_id,
+                target_dc_id,
+            )
+        )
+        congestion_cost = self.get_congestion_cost(target_dc_id)
+        risk = float(
+            congestion_probability
+            + self.risk_congestion_cost_weight * congestion_cost
+        )
+        return (
+            risk,
+            congestion_probability,
+            congestion_cost,
+        )
+
+    @staticmethod
+    def _coerce_action_features(
+            target_dc_id: str,
+            raw_features: Any,
+    ) -> RoutingActionFeatures:
+        if isinstance(raw_features, RoutingActionFeatures):
+            if str(raw_features.target_dc_id) != str(target_dc_id):
+                raise ValueError(
+                    "Action features 的 target_dc_id 与候选动作键不一致。"
+                )
+            return raw_features
+
+        if isinstance(raw_features, Mapping):
+            features_target_dc_id = str(
+                raw_features.get(
+                    "target_dc_id",
+                    target_dc_id,
+                )
+            )
+            if features_target_dc_id != str(target_dc_id):
+                raise ValueError(
+                    "Action features 的 target_dc_id 与候选动作键不一致。"
+                )
+            return RoutingActionFeatures(
+                target_dc_id=features_target_dc_id,
+                success_score=float(
+                    raw_features.get("success_score", 0.0)
+                ),
+                sla_score=float(
+                    raw_features.get("sla_score", 0.0)
+                ),
+                delay_score=float(
+                    raw_features.get("delay_score", 0.0)
+                ),
+            )
+
+        raise TypeError(
+            "job_context 必须是 RoutingActionFeatures 或字段映射。"
+        )
+
+    def evaluate_actions(
+            self,
+            source_dc_id: str,
+            job_context: Mapping[str, Any],
+    ) -> Tuple[ActionUtilityBreakdown, ...]:
+        """计算候选动作的 Benefit、Risk、Utility 和中心化 Bias。"""
+
+        if not isinstance(job_context, Mapping) or not job_context:
+            raise ValueError(
+                "job_context 必须是非空的 target_dc_id -> action features 映射。"
+            )
+
+        candidates = tuple(
+            self._coerce_action_features(target_dc_id, raw_features)
+            for target_dc_id, raw_features in job_context.items()
+        )
+        target_ids = tuple(
+            str(action.target_dc_id)
+            for action in candidates
+        )
+        if len(set(target_ids)) != len(target_ids):
+            raise ValueError("候选动作不能包含重复 target_dc_id。")
+
+        preliminary = []
+        for action_features in candidates:
+            benefit = self.calculate_benefit(action_features)
+            (
+                risk,
+                congestion_probability,
+                congestion_cost,
+            ) = self.calculate_risk(
+                source_dc_id,
+                action_features.target_dc_id,
+            )
+            preliminary.append(
+                (
+                    action_features,
+                    benefit,
+                    risk,
+                    congestion_probability,
+                    congestion_cost,
+                    benefit - risk,
+                )
+            )
+
+        utility_mean = sum(
+            item[-1]
+            for item in preliminary
+        ) / len(preliminary)
+        confidence_by_target = {}
+        raw_bias_by_target = {}
+        for (
+                action_features,
+                _benefit,
+                _risk,
+                _congestion_probability,
+                _congestion_cost,
+                utility,
+        ) in preliminary:
+            is_remote_pair = (
+                str(action_features.target_dc_id)
+                in self.pressure_store.edge_dc_ids
+                and str(action_features.target_dc_id)
+                != str(source_dc_id)
+            )
+            confidence = (
+                self.belief_store.get_confidence(
+                    source_dc_id,
+                    action_features.target_dc_id,
+                )
+                if is_remote_pair
+                else 1.0
+            )
+            target_dc_id = str(action_features.target_dc_id)
+            confidence_by_target[target_dc_id] = confidence
+            raw_bias_by_target[target_dc_id] = (
+                confidence * (utility - utility_mean)
+            )
+
+        raw_bias_mean = sum(
+            raw_bias_by_target.values()
+        ) / len(raw_bias_by_target)
+
+        breakdowns = []
+        for (
+                action_features,
+                benefit,
+                risk,
+                congestion_probability,
+                congestion_cost,
+                utility,
+        ) in preliminary:
+            target_dc_id = str(action_features.target_dc_id)
+            confidence = confidence_by_target[target_dc_id]
+
+            # 置信度先抑制不确定 Pair，再做一次中心化；共同平移不会改变 softmax。
+            bias = float(
+                self.guidance_scale
+                * (raw_bias_by_target[target_dc_id] - raw_bias_mean)
+            )
+            breakdowns.append(
+                ActionUtilityBreakdown(
+                    target_dc_id=str(action_features.target_dc_id),
+                    benefit=float(benefit),
+                    congestion_probability=float(
+                        congestion_probability
+                    ),
+                    congestion_cost=float(congestion_cost),
+                    risk=float(risk),
+                    utility=float(utility),
+                    confidence=float(confidence),
+                    bias=bias,
+                )
+            )
+
+        return tuple(breakdowns)
+
+    def get_action_bias(
+            self,
+            source_dc_id: str,
+            job_context: Mapping[str, Any],
+    ) -> Dict[str, float]:
+        """返回 target_dc_id -> action-level logit bias。"""
+
+        return {
+            item.target_dc_id: item.bias
+            for item in self.evaluate_actions(
+                source_dc_id,
+                job_context,
+            )
+        }

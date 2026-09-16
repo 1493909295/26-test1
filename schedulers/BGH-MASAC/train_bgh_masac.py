@@ -40,6 +40,7 @@ from bayesian_congestion_game import BayesianCongestionGame
 from bayesian_evidence import (
     build_bayesian_evidence_from_finalized_trace,
 )
+from guided_policy import GuidedRoutingPolicy
 
 
 from training_reward import (
@@ -132,6 +133,13 @@ class TrainConfig:
     pressure_window_size: int = (conf.BGH_PRESSURE_WINDOW_SIZE)
     pressure_linear_cost_weight: float = (conf.BGH_PRESSURE_LINEAR_WEIGHT)
     pressure_quadratic_cost_weight: float = (conf.BGH_PRESSURE_QUADRATIC_WEIGHT)
+    benefit_success_weight: float = (conf.BGH_BENEFIT_SUCCESS_WEIGHT)
+    benefit_sla_weight: float = (conf.BGH_BENEFIT_SLA_WEIGHT)
+    benefit_delay_weight: float = (conf.BGH_BENEFIT_DELAY_WEIGHT)
+    risk_congestion_cost_weight: float = (
+        conf.BGH_RISK_CONGESTION_COST_WEIGHT
+    )
+    guidance_scale: float = (conf.BGH_GUIDANCE_SCALE)
 
 # ==============================================================
 # BGH-MASAC Runtime Feature Mode
@@ -231,11 +239,12 @@ def validate_bgh_feature_config(
 
         Bayesian Evidence 的终止任务转换链
         Bayesian Posterior / Belief Store 的基础更新
+        Pressure / Utility / Bias 数学层
+        Guided Policy 与历史反馈上下文接口
 
     但是仍然尚未实现：
 
-        Bayesian Expected Utility
-        Heuristic Policy Guidance
+        Bayesian / Heuristic 实验模式的正式放行
 
     因此：
         1. 两个新机制关闭时，继续允许 Zero-Diff 训练；
@@ -262,16 +271,17 @@ def validate_bgh_feature_config(
 
     # ----------------------------------------------------------
     # Step 5 已建立 Bayesian Information Boundary，
-    # Step 2/3 已完成 Evidence / Belief 基础链路，
-    # 但 Expected Utility / Heuristic Guidance 仍未实现。
+    # Step 2/3/4/5 已完成 Evidence、Belief、Pressure、
+    # Utility / Bias 数学层、Guided Policy 适配器和动作上下文构造已经完成，
+    # 但正式实验模式的启用门控仍保持关闭，避免未经完整实验验证就改变基线。
     # ----------------------------------------------------------
 
     raise NotImplementedError(
         "BGH-MASAC 当前已经完成 Step 5："
         "Bayesian Information Boundary，以及 Step 2/3 的 "
-        "Evidence / Bayesian Belief 基础链路。"
-        "但 Bayesian Expected Utility 与 "
-        "Heuristic Guidance 尚未实现，"
+        "Evidence / Belief / Pressure / Utility / Bias 数学层，"
+        "以及 Guided Policy 和动作上下文适配器。"
+        "但 Bayesian / Heuristic 正式实验模式尚未放行，"
         "因此当前仍只能运行 H-MASAC-equivalent "
         "Zero-Diff Mode。"
     )
@@ -5813,6 +5823,13 @@ def train(
             quadratic_cost_weight=(
                 train_config.pressure_quadratic_cost_weight
             ),
+            benefit_success_weight=train_config.benefit_success_weight,
+            benefit_sla_weight=train_config.benefit_sla_weight,
+            benefit_delay_weight=train_config.benefit_delay_weight,
+            risk_congestion_cost_weight=(
+                train_config.risk_congestion_cost_weight
+            ),
+            guidance_scale=train_config.guidance_scale,
         )
 
 
@@ -6355,6 +6372,16 @@ def train(
     )
 
     routing_masac.train_mode()
+
+    # 第 6 步：统一 Guided Policy 入口。
+    # enabled=False 时内部严格委托 RoutingMASAC.select_action()，
+    # 因而当前 H-MASAC-equivalent 路径的 logits、采样和 Replay 语义不变。
+    guided_policy = GuidedRoutingPolicy(
+        base_policy=routing_masac,
+        action_target_dc_ids=env.routing_action_target_dc_ids,
+        enabled=train_config.enable_heuristic_guidance,
+        bayesian_game=bayesian_game,
+    )
 
     action_rng = np.random.default_rng(int(train_config.seed))
 
@@ -7086,8 +7113,19 @@ def train(
 
                 else:
 
+                    # 第 7 步：动作执行前生成当前 source DC 的候选动作上下文。
+                    # 默认 Guidance 关闭时不查询历史 Provider，直接保持原策略路径。
+                    action_context = None
+                    if guided_policy.enabled:
+                        action_context = guided_policy.build_action_context(
+                            source_dc_id=decision.agent_id,
+                            historical_feedback_provider=(
+                                neighbor_feedback_store
+                            ),
+                        )
+
                     action = (
-                        routing_masac
+                        guided_policy
                             .select_action(
                             local_obs=(
                                 decision.local_obs
@@ -7096,6 +7134,14 @@ def train(
                             agent_index=(
                                 decision.agent_index
                             ),
+
+                            source_dc_id=(
+                                decision.agent_id
+                            ),
+
+                            # Guided Policy 只接收归一化历史特征，
+                            # 不把实时远端资源写入 Observation。
+                            action_context=action_context,
 
                             deterministic=False,
                         )

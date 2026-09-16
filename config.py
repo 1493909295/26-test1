@@ -184,3 +184,10 @@ BGH_BAYESIAN_CONFIDENCE_SCALE = 20.0  # 有效历史样本量映射到置信度�
 BGH_PRESSURE_WINDOW_SIZE = 100       # 最近多少次已完成 Edge-to-Edge 选择
 BGH_PRESSURE_LINEAR_WEIGHT = 1.0     # 拥塞成本的一阶项权重
 BGH_PRESSURE_QUADRATIC_WEIGHT = 1.0  # 拥塞成本的二阶项权重
+
+# 第 5 步：Benefit / Risk / Utility / Bias 参数。
+BGH_BENEFIT_SUCCESS_WEIGHT = 0.4     # 历史成功质量权重
+BGH_BENEFIT_SLA_WEIGHT = 0.4         # SLA 满足质量权重
+BGH_BENEFIT_DELAY_WEIGHT = 0.2       # 历史延迟质量权重
+BGH_RISK_CONGESTION_COST_WEIGHT = 1.0  # C_j 在 Risk 中的权重
+BGH_GUIDANCE_SCALE = 0.3             # Utility 转换为 logit bias 的尺度
