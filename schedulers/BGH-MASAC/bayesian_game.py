@@ -1,152 +1,3 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
-from enum import Enum
-from typing import Any, Dict, Optional, Tuple,List
-from dataclasses import dataclass
-from collections import defaultdict
-
-
-# ============================================================
-# Bayesian Historical Evidence
-#
-# 职责：
-# 保存一次 DC 间任务转移后的历史结果
-#
-# 注意：
-# 这里只描述历史证据，
-# 不参与动作选择。
-# ============================================================
-
-
-@dataclass
-class BayesianHistoricalEvidence:
-
-
-    # 原始调度节点
-    source_dc_id: int
-
-
-    # 被转发节点
-    target_dc_id: int
-
-
-    # 历史结果类别
-    outcome_type: str
-
-
-    # 延迟归一化评分
-    normalized_latency_score: float
-
-# ============================================================
-# Historical outcome classifier
-#
-# 将任务最终反馈转换为Bayesian evidence
-#
-# SUCCESS:
-#   调度目标DC成功执行并满足SLA
-#
-# SLA_VIOLATION:
-#   执行成功但是违反SLA
-#
-# FAILURE:
-#   调度失败
-# ============================================================
-
-
-def classify_historical_outcome(
-        success: bool,
-        sla_satisfied: bool
-):
-
-
-    if success and sla_satisfied:
-
-        return "SUCCESS"
-
-
-    elif success and not sla_satisfied:
-
-        return "SLA_VIOLATION"
-
-
-    else:
-
-        return "FAILURE"
-
-# ============================================================
-# Bayesian Belief Table
-#
-# 保存:
-#
-# P(target DC能够成功处理任务 | source DC观察)
-#
-# 后续 Congestion Game 会读取这里的信息
-# ============================================================
-
-
-class BayesianBeliefTable:
-
-
-    def __init__(self):
-
-        self.belief_table = defaultdict(
-            lambda:{
-                "alpha":1.0,
-                "beta":1.0
-            }
-        )
-
-
-
-    def update(
-            self,
-            evidence: BayesianHistoricalEvidence
-    ):
-
-
-        key = (
-            evidence.source_dc_id,
-            evidence.target_dc_id
-        )
-
-
-        if evidence.outcome_type=="SUCCESS":
-
-            self.belief_table[key]["alpha"] += 1
-
-
-        else:
-
-            self.belief_table[key]["beta"] += 1
-
-
-
-
-    def get_belief(
-            self,
-            source_dc,
-            target_dc
-    ):
-
-
-        key=(source_dc,target_dc)
-
-
-        item=self.belief_table[key]
-
-
-        return (
-            item["alpha"]
-            /
-            (
-                item["alpha"]
-                +
-                item["beta"]
-            )
-        )
-
-
 # ==============================================================
 # BGH-MASAC Bayesian Routing Game Definition
 #
@@ -173,6 +24,43 @@ class BayesianBeliefTable:
 #
 # 因此本文件不会改变 H-MASAC-equivalent Zero-Diff 行为。
 # ==============================================================
+"""BGH-MASAC 的静态博弈契约层。
+
+本文件只负责定义：
+
+* Routing Player、Action Domain 和 Remote Hidden Type；
+* Bayesian 子系统允许读取/禁止读取的信息边界；
+* Environment 到静态 Routing Context 的白名单适配器；
+* 可写入 checkpoint / 日志的 Game Definition 元数据。
+
+本文件不负责：
+
+* Bayesian posterior、拥塞压力、拥塞成本和启发式效用计算；
+* Actor logits、动作采样或 MASAC 更新；
+* Bayesian Nash Equilibrium 求解。
+
+后续的状态化数学计算统一放入同目录的
+``bayesian_congestion_game.py``，避免把静态契约和运行时状态混在一起。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Dict, Optional, Tuple
+
+__all__ = (
+    "BayesianInformationPolicy",
+    "BayesianHistoricalEvidence",
+    "BayesianHiddenState",
+    "BayesianRoutingActionKind",
+    "BayesianRoutingActionSemantic",
+    "BayesianStaticRoutingContext",
+    "BayesianRoutingGameDefinition",
+    "build_bayesian_static_routing_context",
+    "build_bayesian_routing_game_definition",
+    "classify_historical_outcome",
+)
 
 
 # BAYESIAN_GAME_DEFINITION_VERSION = 2

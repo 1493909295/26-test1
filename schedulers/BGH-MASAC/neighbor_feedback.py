@@ -1,3 +1,15 @@
+"""BGH-MASAC 的历史反馈统计层。
+
+第 1 步职责边界：
+
+* 只从已经 Finalize 的任务因果链维护 source -> target 历史统计；
+* 不保存或读取远端 DC 的实时 CPU、GPU、Queue、Host 状态；
+* 不负责 Bayesian Posterior、拥塞压力或 Actor 引导。
+
+下一步的 Evidence Adapter 应在明确的终止任务接口上接入，
+不能再通过一个与本 Store 数据结构不一致的临时 Collector 传递。
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,9 +18,14 @@ from typing import Any, Dict, Mapping, Optional
 import numpy as np
 
 from pending_job_trace import FinalizedJobTrace
-from .bayesian_game import (
-    BayesianHistoricalEvidence,
-    classify_historical_outcome
+
+# 第 1 步：BGH 当前采用“训练脚本目录直接加入 sys.path”的入口方式。
+# 因此这里必须使用脚本式顶层导入，不能与 train_bgh_masac.py 混用相对导入。
+# Bayesian Evidence 的正式转换将在下一步接入；本模块当前只维护历史反馈统计。
+
+__all__ = (
+    "NeighborPairFeedbackState",
+    "NeighborHistoricalFeedbackStore",
 )
 
 @dataclass
@@ -1236,79 +1253,5 @@ class NeighborHistoricalFeedbackStore:
                     ._episode_pair_samples
                 ),
         }
-
-
-class BayesianEvidenceCollector:
-    """
-    Historical Feedback -> Bayesian Evidence
-
-    只消费：
-
-        finalized historical outcome
-
-
-    不允许消费：
-
-        raw trace
-        observation
-        remote state
-    """
-
-
-    def __init__(self):
-
-        self.evidence_buffer = []
-
-
-    def add_feedback(
-            self,
-            feedback,
-    ):
-
-        evidence = (
-            BayesianHistoricalEvidence(
-                source_dc_id=
-                    feedback.source_dc_id,
-
-                target_dc_id=
-                    feedback.target_dc_id,
-
-                outcome_type=
-                    classify_historical_outcome(
-                        success=
-                            feedback.success,
-
-                        sla_satisfied=
-                            feedback.sla_satisfied,
-
-                        normalized_latency_score=
-                            feedback.latency_score,
-                    ),
-
-                success=
-                    feedback.success,
-
-                sla_satisfied=
-                    feedback.sla_satisfied,
-
-                normalized_latency_score=
-                    feedback.latency_score,
-            )
-        )
-
-
-        evidence.validate_information_boundary()
-
-
-        self.evidence_buffer.append(
-            evidence
-        )
-
-
-    def get_all_evidence(self):
-
-        return tuple(
-            self.evidence_buffer
-        )
 
 
