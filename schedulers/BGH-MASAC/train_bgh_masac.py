@@ -36,6 +36,10 @@ from bayesian_game import (
     build_bayesian_static_routing_context,
     build_bayesian_routing_game_definition,
 )
+from bayesian_congestion_game import BayesianCongestionGame
+from bayesian_evidence import (
+    build_bayesian_evidence_from_finalized_trace,
+)
 
 
 from training_reward import (
@@ -122,6 +126,12 @@ class TrainConfig:
     neighbor_feedback_confidence_scale_samples: float = (conf.NEIGHBOR_FEEDBACK_CONFIDENCE_SCALE_SAMPLES)
     enable_bayesian_game: bool = (conf.BGH_ENABLE_BAYESIAN_GAME)
     enable_heuristic_guidance: bool = (conf.BGH_ENABLE_HEURISTIC_GUIDANCE)
+    bayesian_prior_alpha: float = (conf.BGH_BAYESIAN_PRIOR_ALPHA)
+    bayesian_prior_beta: float = (conf.BGH_BAYESIAN_PRIOR_BETA)
+    bayesian_confidence_scale: float = (conf.BGH_BAYESIAN_CONFIDENCE_SCALE)
+    pressure_window_size: int = (conf.BGH_PRESSURE_WINDOW_SIZE)
+    pressure_linear_cost_weight: float = (conf.BGH_PRESSURE_LINEAR_WEIGHT)
+    pressure_quadratic_cost_weight: float = (conf.BGH_PRESSURE_QUADRATIC_WEIGHT)
 
 # ==============================================================
 # BGH-MASAC Runtime Feature Mode
@@ -217,10 +227,13 @@ def validate_bgh_feature_config(
     当前已经从接口层面禁止 Bayesian Core 读取
     Remote DC Real-Time State。
 
+    当前已经完成：
+
+        Bayesian Evidence 的终止任务转换链
+        Bayesian Posterior / Belief Store 的基础更新
+
     但是仍然尚未实现：
 
-        Bayesian Evidence
-        Bayesian Posterior / Belief Store
         Bayesian Expected Utility
         Heuristic Policy Guidance
 
@@ -249,15 +262,15 @@ def validate_bgh_feature_config(
 
     # ----------------------------------------------------------
     # Step 5 已建立 Bayesian Information Boundary，
-    # 但 Bayesian Evidence / Belief / Expected Utility /
-    # Heuristic Guidance 仍未真正实现。
+    # Step 2/3 已完成 Evidence / Belief 基础链路，
+    # 但 Expected Utility / Heuristic Guidance 仍未实现。
     # ----------------------------------------------------------
 
     raise NotImplementedError(
         "BGH-MASAC 当前已经完成 Step 5："
-        "Bayesian Information Boundary。"
-        "但 Bayesian Evidence、Bayesian Belief、"
-        "Bayesian Expected Utility 与 "
+        "Bayesian Information Boundary，以及 Step 2/3 的 "
+        "Evidence / Bayesian Belief 基础链路。"
+        "但 Bayesian Expected Utility 与 "
         "Heuristic Guidance 尚未实现，"
         "因此当前仍只能运行 H-MASAC-equivalent "
         "Zero-Diff Mode。"
@@ -1315,6 +1328,10 @@ def flush_finalized_trace_to_replay(
 
         collect_neighbor_historical_feedback:
         bool,
+
+        bayesian_game: Optional[BayesianCongestionGame] = None,
+
+        env: Optional[CloudEdgeEnv] = None,
 ) -> None:
     """
     把一个已经完整 Finalize 的 Job
@@ -1334,8 +1351,18 @@ def flush_finalized_trace_to_replay(
             ↓
         对应 DC 的 HostReplayBuffer
 
-    Cloud / Drop：
+        Cloud / Drop：
         不产生 HostTransition。
+
+    Bayesian Evidence（可选接入）：
+        FinalizedJobTrace
+            ↓
+        BayesianHistoricalEvidence
+            ↓
+        BayesianBeliefStore
+
+    ``bayesian_game`` 默认保持 None，确保当前 H-MASAC-equivalent
+    Zero-Diff 路径不会额外启用 Bayesian 状态更新。
     """
 
     # ==========================================================
@@ -1371,6 +1398,21 @@ def flush_finalized_trace_to_replay(
                 f"job={finalized_trace.job_id}, "
                 f"dc={host_dc_id}"
             )
+
+    # Evidence 先完成转换和边界校验，再写 Replay，避免转换失败时出现
+    # Replay 已写入但 Bayesian 链未完成的半成功状态。
+    bayesian_evidences = tuple()
+    if bayesian_game is not None:
+        if env is None:
+            raise RuntimeError(
+                "启用 Bayesian Evidence 转换时必须提供 Environment。"
+            )
+        bayesian_evidences = (
+            build_bayesian_evidence_from_finalized_trace(
+                finalized_trace,
+                env,
+            )
+        )
 
     # ==========================================================
     # Routing Replay
@@ -1420,6 +1462,21 @@ def flush_finalized_trace_to_replay(
             finalized_trace
         )
 
+    # 第 3 步：正式建立 terminal trace -> Evidence -> Belief 的入口。
+    # 只有未来显式创建 bayesian_game 时才更新 posterior；本步不打开
+    # BGH feature gate，也不把 Evidence 放入 Observation 或 Replay。
+    if bayesian_game is not None:
+        for evidence in bayesian_evidences:
+            bayesian_game.update_belief(
+                evidence,
+                update_clock=int(stats.episode),
+            )
+            bayesian_game.update_pressure(
+                evidence.source_dc_id,
+                evidence.target_dc_id,
+                update_clock=int(stats.episode),
+            )
+
 def consume_environment_outcome_events(
         env: CloudEdgeEnv,
 
@@ -1442,6 +1499,8 @@ def consume_environment_outcome_events(
 
         training_reward_model:
         HMasacTrainingRewardModel,
+
+        bayesian_game: Optional[BayesianCongestionGame] = None,
 ) -> None:
     """
     第十九步以后：
@@ -1583,6 +1642,9 @@ def consume_environment_outcome_events(
                 collect_neighbor_historical_feedback=(
                     collect_neighbor_historical_feedback
                 ),
+
+                bayesian_game=bayesian_game,
+                env=env,
             )
 
             # ==================================================
@@ -5735,6 +5797,24 @@ def train(
         )
     )
 
+    # 第 3 步：为未来 Bayesian 模式准备正式 Evidence 接收端。
+    # 当前 Feature Gate 仍禁止启用该模式，因此 Zero-Diff 训练不会创建
+    # 或更新 Belief Store；这只是把 terminal conversion 的生命周期接口
+    # 固定在训练入口，避免后续再次从 Environment 直接读取实时状态。
+    bayesian_game: Optional[BayesianCongestionGame] = None
+    if train_config.enable_bayesian_game:
+        bayesian_game = BayesianCongestionGame(
+            bayesian_game_definition,
+            prior_alpha=train_config.bayesian_prior_alpha,
+            prior_beta=train_config.bayesian_prior_beta,
+            confidence_scale=train_config.bayesian_confidence_scale,
+            pressure_window_size=train_config.pressure_window_size,
+            linear_cost_weight=train_config.pressure_linear_cost_weight,
+            quadratic_cost_weight=(
+                train_config.pressure_quadratic_cost_weight
+            ),
+        )
+
 
     bayesian_game_metadata_json = json.dumps(
         bayesian_game_definition.to_metadata(),
@@ -6828,6 +6908,8 @@ def train(
                                 .collect_neighbor_historical_feedback
                         ),
 
+                        bayesian_game=bayesian_game,
+
 
                     )
                     # ==========================================================
@@ -7133,6 +7215,9 @@ def train(
                             train_config
                                 .collect_neighbor_historical_feedback
                         ),
+
+                        bayesian_game=bayesian_game,
+                        env=env,
                     )
 
                     pending_trace_store.pop_finalized_trace(
@@ -7169,6 +7254,8 @@ def train(
                             .collect_neighbor_historical_feedback
                     ),
 
+
+                    bayesian_game=bayesian_game,
 
                 )
 
@@ -7299,6 +7386,7 @@ def train(
                     train_config
                         .collect_neighbor_historical_feedback
                 ),
+                bayesian_game=bayesian_game,
             )
             pending_trace_store.assert_no_open_trace()
             pending_trace_store.assert_no_unflushed_finalized_trace()

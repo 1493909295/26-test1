@@ -176,3 +176,11 @@ BGH_ENABLE_HEURISTIC_GUIDANCE = False       # 控制是否启用贝叶斯启发�
 BGH_BAYESIAN_PRIOR_ALPHA = 1.0        # alpha_congested 的初始值
 BGH_BAYESIAN_PRIOR_BETA = 1.0         # beta_non_congested 的初始值
 BGH_BAYESIAN_CONFIDENCE_SCALE = 20.0  # 有效历史样本量映射到置信度的尺度
+
+# 第 4 步：历史竞争压力窗口与拥塞成本参数。
+# pressure_j = 最近窗口内指向 DC-j 的 Edge-to-Edge 选择占比。
+# congestion_cost_j = linear_weight * pressure_j
+#                    + quadratic_weight * pressure_j^2
+BGH_PRESSURE_WINDOW_SIZE = 100       # 最近多少次已完成 Edge-to-Edge 选择
+BGH_PRESSURE_LINEAR_WEIGHT = 1.0     # 拥塞成本的一阶项权重
+BGH_PRESSURE_QUADRATIC_WEIGHT = 1.0  # 拥塞成本的二阶项权重

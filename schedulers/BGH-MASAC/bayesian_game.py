@@ -353,6 +353,9 @@ class BayesianHistoricalEvidence:
 
     normalized_energy_score: float = 0.0
 
+    # 任务终止时的真实完成耗时；失败任务保持 None，避免把超时冒充完成样本。
+    completion_time_s: Optional[float] = None
+
 
 
     # --------------------------------------------------

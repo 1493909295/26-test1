@@ -6,8 +6,8 @@
 * 不保存或读取远端 DC 的实时 CPU、GPU、Queue、Host 状态；
 * 不负责 Bayesian Posterior、拥塞压力或 Actor 引导。
 
-下一步的 Evidence Adapter 应在明确的终止任务接口上接入，
-不能再通过一个与本 Store 数据结构不一致的临时 Collector 传递。
+第 3 步新增的 Evidence Adapter 独立负责 Bayesian 路径；
+本 Store 保留原有 EWMA 统计接口，确保历史反馈兼容性和 Zero-Diff。
 """
 
 from __future__ import annotations
@@ -21,7 +21,8 @@ from pending_job_trace import FinalizedJobTrace
 
 # 第 1 步：BGH 当前采用“训练脚本目录直接加入 sys.path”的入口方式。
 # 因此这里必须使用脚本式顶层导入，不能与 train_bgh_masac.py 混用相对导入。
-# Bayesian Evidence 的正式转换将在下一步接入；本模块当前只维护历史反馈统计。
+# Bayesian Evidence 的正式转换由 bayesian_evidence.py 统一负责；
+# 本文件的旧 EWMA 统计链保持独立，避免改变已有反馈结果。
 
 __all__ = (
     "NeighborPairFeedbackState",
