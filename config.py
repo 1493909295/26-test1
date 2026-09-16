@@ -169,3 +169,10 @@ NEIGHBOR_FEEDBACK_CONFIDENCE_SCALE_SAMPLES = 20.0   # 判断历史可信度
 
 BGH_ENABLE_BAYESIAN_GAME = False       # 控制是否启用贝叶斯博弈
 BGH_ENABLE_HEURISTIC_GUIDANCE = False       # 控制是否启用贝叶斯启发信息知道actor
+
+# 第 2 步：统一 Bayesian Congestion Belief 语义。
+# alpha 表示拥塞证据，beta 表示非拥塞证据；当前使用无信息先验 Beta(1, 1)。
+# 这些参数仅定义模型契约，本步尚未接入训练循环或 Actor 引导。
+BGH_BAYESIAN_PRIOR_ALPHA = 1.0        # alpha_congested 的初始值
+BGH_BAYESIAN_PRIOR_BETA = 1.0         # beta_non_congested 的初始值
+BGH_BAYESIAN_CONFIDENCE_SCALE = 20.0  # 有效历史样本量映射到置信度的尺度

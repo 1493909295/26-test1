@@ -14,8 +14,7 @@
 #
 # 当前明确“不负责”：
 #
-#   - Bayesian Evidence；
-#   - Bayesian Posterior；
+#   - Bayesian Posterior 的状态存储与更新；
 #   - Dirichlet / Beta 更新；
 #   - Heuristic Utility 数值；
 #   - Actor Guidance；
@@ -47,6 +46,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 from typing import Any, Dict, Optional, Tuple
 
 __all__ = (
@@ -59,6 +59,7 @@ __all__ = (
     "BayesianRoutingGameDefinition",
     "build_bayesian_static_routing_context",
     "build_bayesian_routing_game_definition",
+    "congestion_observed_from_outcome",
     "classify_historical_outcome",
 )
 
@@ -230,6 +231,30 @@ class BayesianInformationPolicy:
                 ),
         }
 
+def congestion_observed_from_outcome(
+        *,
+        success: bool,
+        sla_satisfied: bool,
+        reforwarded: bool,
+) -> bool:
+    """将终止任务的历史结果统一映射为拥塞 Bernoulli 样本。
+
+    第 2 步的唯一观测语义是：
+
+    * ``True``  ：观测到拥塞证据，更新 ``alpha_congested``；
+    * ``False`` ：观测到非拥塞证据，更新 ``beta_non_congested``。
+
+    失败、SLA 违约或发生再转发，任一项都视为拥塞侧证据。
+    该映射只使用已完成任务的历史结果，不读取远端实时状态。
+    """
+
+    return bool(
+        reforwarded
+        or (not success)
+        or (not sla_satisfied)
+    )
+
+
 @dataclass(frozen=True)
 class BayesianHistoricalEvidence:
     """
@@ -279,7 +304,7 @@ class BayesianHistoricalEvidence:
     # --------------------------------------------------
     # 调度结果类别
     #
-    # 用于未来映射：
+    # 仅用于诊断与日志标签：
     #
     # GOOD/NORMAL/RISKY
     #
@@ -303,10 +328,24 @@ class BayesianHistoricalEvidence:
 
 
     # --------------------------------------------------
+    # 拥塞证据来源
+    #
+    # ``reforwarded`` 记录该 source -> target 历史选择之后，
+    # 任务是否又被转发；它是结果证据，不是 target 的实时队列状态。
+    # ``congestion_observed`` 由统一映射函数派生，禁止调用方自行
+    # 用相反的 alpha / beta 语义更新 posterior。
+    # --------------------------------------------------
+
+    reforwarded: bool = False
+
+    evidence_weight: float = 1.0
+
+
+    # --------------------------------------------------
     # 归一化后的历史质量指标
     #
     # 当前只保存结果，
-    # 不参与 Bayesian 更新。
+    # 不直接替代 congestion_observed 的 Bernoulli 语义。
     #
     # --------------------------------------------------
 
@@ -323,6 +362,17 @@ class BayesianHistoricalEvidence:
     # --------------------------------------------------
 
     timestamp: Optional[int] = None
+
+
+    @property
+    def congestion_observed(self) -> bool:
+        """返回本条 Evidence 是否属于拥塞侧 Bernoulli 样本。"""
+
+        return congestion_observed_from_outcome(
+            success=self.success,
+            sla_satisfied=self.sla_satisfied,
+            reforwarded=self.reforwarded,
+        )
 
 
 
@@ -368,14 +418,44 @@ class BayesianHistoricalEvidence:
                     f"{field_name}"
                 )
 
+        if not self.source_dc_id or not self.target_dc_id:
+            raise ValueError(
+                "Bayesian Evidence 的 source_dc_id / target_dc_id 不能为空。"
+            )
+
+        if self.source_dc_id == self.target_dc_id:
+            raise ValueError(
+                "Bayesian Evidence 必须表示有向 source -> target DC 对，不能是自环。"
+            )
+
+        if self.outcome_type not in {
+            BayesianHiddenState.GOOD.value,
+            BayesianHiddenState.NORMAL.value,
+            BayesianHiddenState.RISKY.value,
+        }:
+            raise ValueError(
+                "outcome_type 必须是 GOOD、NORMAL 或 RISKY；该标签仅用于诊断。"
+            )
+
+        if not math.isfinite(self.evidence_weight) or self.evidence_weight <= 0.0:
+            raise ValueError("evidence_weight 必须大于 0。")
+
+        for score_name, score in (
+            ("normalized_latency_score", self.normalized_latency_score),
+            ("normalized_energy_score", self.normalized_energy_score),
+        ):
+            if not math.isfinite(score) or not 0.0 <= score <= 1.0:
+                raise ValueError(f"{score_name} 必须位于 [0, 1]。")
+
 def classify_historical_outcome(
         *,
         success: bool,
         sla_satisfied: bool,
         normalized_latency_score: float,
+        reforwarded: bool = False,
 ) -> str:
     """
-    根据历史结果生成 Remote Hidden Type Evidence。
+    根据历史结果生成 Remote Hidden Type 的诊断标签。
 
     注意：
 
@@ -389,10 +469,13 @@ def classify_historical_outcome(
         evidence label
 
 
-    后续由 Bayesian Belief 模块学习：
-
-        P(type | evidence)
+    注意：GOOD/NORMAL/RISKY 不是 ``alpha`` / ``beta`` 的直接值，
+    也不是 posterior。拥塞 posterior 统一由
+    ``congestion_observed_from_outcome`` 生成 Bernoulli 样本。
     """
+
+    if reforwarded:
+        return BayesianHiddenState.RISKY.value
 
     if (
         success
