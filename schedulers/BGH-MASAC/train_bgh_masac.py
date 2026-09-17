@@ -9,6 +9,22 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
+
+# The BGH-MASAC modules use script-style imports (for example,
+# ``from h_masac_agent import ...``).  When this entry point is launched with
+# ``python -m schedulers.BGH-MASAC.train_bgh_masac``, Python only puts the
+# project root on sys.path, not this file's directory.  Add both locations
+# before importing any project modules so the command works consistently on
+# the server and when the file is executed directly.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+BGH_MASAC_DIR = Path(__file__).resolve().parent
+
+if str(BGH_MASAC_DIR) not in sys.path:
+    sys.path.insert(0, str(BGH_MASAC_DIR))
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
 import torch
 from datetime import datetime
@@ -50,10 +66,6 @@ from training_reward import (
     HMasacTrainingRewardModel,
 )
 
-# 找根目录
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-BGH_MASAC_DIR = Path(__file__).resolve().parent
-
 CHECKPOINT_SCHEMA_VERSION = 2
 
 CHECKPOINT_ARCHITECTURE = (
@@ -82,11 +94,6 @@ UPDATE_TENSOR_METRIC_NAMES = ("critic_loss",
 
 # 找环境代码
 ENVIRONMENT_DIR = PROJECT_ROOT / "environment"
-if str(BGH_MASAC_DIR) not in sys.path:
-    sys.path.insert(0, str(BGH_MASAC_DIR))
-
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 @dataclass(frozen=True)
 class TrainConfig:

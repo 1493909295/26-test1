@@ -175,17 +175,17 @@
   },
   "trainer_state": {
     "next_episode": 1001,
-    "global_decision_steps": 1097519,
-    "routing_normal_action_steps": 897492,
-    "routing_global_steps": 897492,
+    "global_decision_steps": 1094899,
+    "routing_normal_action_steps": 894867,
+    "routing_global_steps": 894867,
     "host_training_action_steps": {
-      "DC-1": 99389,
-      "DC-2": 103113,
-      "DC-3": 92732,
-      "DC-4": 97919,
-      "DC-5": 106842
+      "DC-1": 99088,
+      "DC-2": 102326,
+      "DC-3": 92332,
+      "DC-4": 99326,
+      "DC-5": 106919
     },
-    "host_global_steps": 499995,
-    "best_episode_return": 2309.561680871727
+    "host_global_steps": 499991,
+    "best_episode_return": 2304.5190992556995
   }
 }

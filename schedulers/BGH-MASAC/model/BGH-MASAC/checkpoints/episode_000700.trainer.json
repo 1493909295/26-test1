@@ -175,9 +175,9 @@
   },
   "trainer_state": {
     "next_episode": 701,
-    "global_decision_steps": 762264,
-    "routing_normal_action_steps": 562242,
-    "routing_global_steps": 562242,
+    "global_decision_steps": 759868,
+    "routing_normal_action_steps": 559844,
+    "routing_global_steps": 559844,
     "host_training_action_steps": {
       "DC-1": 40182,
       "DC-2": 39620,
@@ -186,6 +186,6 @@
       "DC-5": 39854
     },
     "host_global_steps": 200000,
-    "best_episode_return": 2309.350910104958
+    "best_episode_return": 2313.353652028122
   }
 }
