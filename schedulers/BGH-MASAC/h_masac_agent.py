@@ -21,6 +21,7 @@ __all__ = (
     # Independent Local Host SAC
     "HostSACConfig",
     "LocalHostSAC",
+    "atomic_checkpoint_text_write",
 )
 
 
@@ -28,7 +29,13 @@ _CHECKPOINT_RETRYABLE_WINDOWS_ERROR_CODES = {
     5,     # 目标文件被映射/扫描时，Windows 也可能返回“拒绝访问”
     32,    # 文件正被其他进程使用
     33,    # 文件区域被锁定
+    87,    # Windows ERROR_INVALID_PARAMETER
     1224,  # 文件存在打开的用户映射区段
+}
+
+_CHECKPOINT_RETRYABLE_ERRNOS = {
+    13,  # EACCES
+    22,  # EINVAL；部分 Windows 文件占用会被 Python 映射到此错误
 }
 
 
@@ -41,6 +48,10 @@ def _is_retryable_checkpoint_error(
     if winerror in _CHECKPOINT_RETRYABLE_WINDOWS_ERROR_CODES:
         return True
 
+    errno_value = getattr(error, "errno", None)
+    if errno_value in _CHECKPOINT_RETRYABLE_ERRNOS:
+        return True
+
     message = str(error).lower()
     return any(
         marker in message
@@ -48,13 +59,17 @@ def _is_retryable_checkpoint_error(
             "error code: 5",
             "error code: 32",
             "error code: 33",
+            "error code: 87",
             "error code: 1224",
+            "errno 13",
+            "errno 22",
             "errno 5",
             "errno 32",
             "errno 33",
             "errno 1224",
             "access is denied",
             "access denied",
+            "invalid argument",
             "being used by another process",
             "user-mapped section open",
         )
@@ -181,6 +196,146 @@ def _atomic_torch_save(
 
     raise RuntimeError(
         "Checkpoint 保存失败："
+        f"{target_path}"
+    ) from last_error
+
+
+def atomic_checkpoint_text_write(
+        text: str,
+        file_path: Union[str, Path],
+        *,
+        encoding: str = "utf-8",
+        max_attempts: int = 8,
+        retry_delay_seconds: float = 0.25,
+) -> None:
+    """原子写入 checkpoint 配套文本，并重试 Windows 瞬时占用。"""
+
+    if not isinstance(text, str):
+        raise TypeError("Checkpoint 文本内容必须是 str。")
+    if not text:
+        raise ValueError("Checkpoint 文本内容不能为空。")
+
+    target_path = Path(file_path).resolve()
+    target_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    max_attempts = max(int(max_attempts), 1)
+    retry_delay_seconds = max(float(retry_delay_seconds), 0.0)
+    temporary_paths = []
+    temporary_path: Optional[Path] = None
+    last_error: Optional[BaseException] = None
+
+    def build_temporary_path(attempt_index: int) -> Path:
+        return target_path.with_name(
+            f".{target_path.name}."
+            f"{os.getpid()}."
+            f"{time.time_ns()}."
+            f"{attempt_index}.tmp"
+        )
+
+    try:
+        # 先完整写入同目录唯一文件，避免直接截断仍被映射的正式 JSON。
+        for attempt_index in range(max_attempts):
+            temporary_path = build_temporary_path(
+                attempt_index
+            )
+            temporary_paths.append(temporary_path)
+
+            try:
+                with temporary_path.open(
+                        mode="x",
+                        encoding=encoding,
+                        newline="\n",
+                ) as file_handle:
+                    written_character_count = (
+                        file_handle.write(text)
+                    )
+                    file_handle.flush()
+                    os.fsync(file_handle.fileno())
+
+                if written_character_count != len(text):
+                    raise OSError(
+                        "Checkpoint 文本未完整写入临时文件。"
+                    )
+                break
+
+            except OSError as error:
+                last_error = error
+                try:
+                    temporary_path.unlink(
+                        missing_ok=True
+                    )
+                except OSError:
+                    pass
+
+                if (
+                        not _is_retryable_checkpoint_error(error)
+                        or attempt_index + 1 >= max_attempts
+                ):
+                    raise RuntimeError(
+                        "Checkpoint 文本临时文件写入失败："
+                        f"{target_path}"
+                    ) from error
+
+                time.sleep(
+                    retry_delay_seconds
+                    * float(attempt_index + 1)
+                )
+
+        if temporary_path is None:
+            raise RuntimeError(
+                "Checkpoint 文本临时文件未创建："
+                f"{target_path}"
+            )
+
+        # 目标 JSON 被 PyCharm、索引器或安全软件占用时，只重试替换。
+        for attempt_index in range(max_attempts):
+            try:
+                os.replace(
+                    temporary_path,
+                    target_path,
+                )
+
+                if (
+                        not target_path.is_file()
+                        or target_path.stat().st_size <= 0
+                ):
+                    raise RuntimeError(
+                        "Checkpoint 文本原子写入后文件不存在或为空："
+                        f"{target_path}"
+                    )
+                return
+
+            except (OSError, RuntimeError) as error:
+                last_error = error
+
+                if (
+                        not _is_retryable_checkpoint_error(error)
+                        or attempt_index + 1 >= max_attempts
+                ):
+                    raise RuntimeError(
+                        "Checkpoint 文本原子替换失败："
+                        f"{target_path}"
+                    ) from error
+
+                time.sleep(
+                    retry_delay_seconds
+                    * float(attempt_index + 1)
+                )
+
+    finally:
+        for candidate_path in temporary_paths:
+            try:
+                candidate_path.unlink(
+                    missing_ok=True
+                )
+            except OSError:
+                pass
+
+    raise RuntimeError(
+        "Checkpoint 文本保存失败："
         f"{target_path}"
     ) from last_error
 

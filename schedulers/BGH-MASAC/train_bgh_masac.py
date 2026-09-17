@@ -17,6 +17,7 @@ from h_masac_agent import (
     RoutingMASACConfig,
     LocalHostSAC,
     HostSACConfig,
+    atomic_checkpoint_text_write,
 )
 from neighbor_feedback import (
     NeighborHistoricalFeedbackStore,
@@ -3407,13 +3408,13 @@ def save_two_layer_checkpoint(
         )
     )
 
-    state_path.write_text(
+    atomic_checkpoint_text_write(
         json.dumps(
             checkpoint_metadata,
             ensure_ascii=False,
             indent=2,
         ),
-        encoding="utf-8",
+        state_path,
     )
 
 def load_two_layer_checkpoint_if_needed(
@@ -6480,11 +6481,11 @@ def train(
             / "current_train_log.txt"
     )
 
-    current_log_pointer_path.write_text(
+    atomic_checkpoint_text_write(
         str(
             episode_log_csv_path.resolve()
         ),
-        encoding="utf-8",
+        current_log_pointer_path,
     )
 
     # 新增 DC 日志 pointer。
@@ -6493,11 +6494,11 @@ def train(
             / "current_dc_log.txt"
     )
 
-    current_dc_log_pointer_path.write_text(
+    atomic_checkpoint_text_write(
         str(
             dc_log_csv_path.resolve()
         ),
-        encoding="utf-8",
+        current_dc_log_pointer_path,
     )
 
     print(
